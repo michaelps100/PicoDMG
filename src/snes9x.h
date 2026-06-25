@@ -53,7 +53,14 @@
 #define STREAM memstream_t *
 #define READ_STREAM(p, l, s)     memstream_read(s, p, l)
 #define WRITE_STREAM(p, l, s)    memstream_write(s, p, l)
-#define OPEN_STREAM(m)           memstream_open(0)
+/* memstream_open() now takes the backing buffer and size up front
+ * (upstream libretro-common removed memstream_set_buffer). The buffer
+ * for the active operation is published by libretro.c via
+ * S9xSetStreamBuffer(); OPEN_STREAM/s_open consume it here. */
+extern unsigned char *s9x_stream_buffer;
+extern unsigned long long s9x_stream_buffer_size;
+void S9xSetStreamBuffer(unsigned char *buffer, unsigned long long size);
+#define OPEN_STREAM(m)           memstream_open(s9x_stream_buffer, s9x_stream_buffer_size, 0)
 #define CLOSE_STREAM(s)          memstream_close(s)
 #define SEEK_STREAM(p,r,s)       memstream_seek(p,r,s)
 

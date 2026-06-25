@@ -123,6 +123,19 @@ static bool update_audio_latency                 = false;
 
 static memstream_t *s_stream                     = NULL;
 
+/* Backing buffer for the in-memory STREAM abstraction (see snes9x.h).
+ * Upstream libretro-common dropped memstream_set_buffer and now requires
+ * the buffer at memstream_open() time, so we publish it here for the
+ * OPEN_STREAM() macro and the s_open() statef callback to pick up. */
+unsigned char     *s9x_stream_buffer      = NULL;
+unsigned long long s9x_stream_buffer_size = 0;
+
+void S9xSetStreamBuffer(unsigned char *buffer, unsigned long long size)
+{
+   s9x_stream_buffer      = buffer;
+   s9x_stream_buffer_size = size;
+}
+
 static int s_open(const char *fname, const char *mode)
 {
    unsigned writing = 0;
@@ -131,7 +144,8 @@ static int s_open(const char *fname, const char *mode)
       if (strcmp(mode, "wb") == 0)
          writing = 1;
 
-   s_stream = memstream_open(writing);
+   s_stream = memstream_open((uint8_t*)s9x_stream_buffer,
+         (uint64_t)s9x_stream_buffer_size, writing);
    return TRUE;
 }
 
@@ -752,7 +766,7 @@ size_t retro_serialize_size (void)
 
 bool retro_serialize(void *data, size_t size)
 {
-   memstream_set_buffer((uint8_t*)data, size);
+   S9xSetStreamBuffer((unsigned char*)data, size);
    if (S9xFreezeGame("") == FALSE)
       return FALSE;
 
@@ -761,7 +775,7 @@ bool retro_serialize(void *data, size_t size)
 
 bool retro_unserialize(const void * data, size_t size)
 {
-   memstream_set_buffer((uint8_t*)data, size);
+   S9xSetStreamBuffer((unsigned char*)data, size);
    if (S9xUnfreezeGame("") == FALSE)
       return FALSE;
 
@@ -903,7 +917,7 @@ bool retro_load_game(const struct retro_game_info *game)
    set_input_descriptors();
 
    /* Hack. S9x cannot do stuff from RAM. <_< */
-   memstream_set_buffer((uint8_t*)game->data, game->size);
+   S9xSetStreamBuffer((unsigned char*)game->data, game->size);
 
    if (!(loaded = LoadROM()))
       return false;

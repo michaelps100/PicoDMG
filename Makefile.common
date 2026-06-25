@@ -30,8 +30,14 @@ SOURCES := 	$(CORE_DIR)/apu.c \
 
 ifeq ($(STATIC_LINKING), 1)
 else
-SOURCES += $(LIBRETRO_COMM_DIR)/streams/memory_stream.c
 endif
+
+# memory_stream is consumed directly by the core's savestate / ROM-load
+# code (snapshot.c, memmap.c, libretro.c via the STREAM macros / statef_*
+# callbacks) and must be linked into the core itself even on statically-
+# linked platforms, where the frontend does not export libretro-common
+# symbols.
+SOURCES += $(LIBRETRO_COMM_DIR)/streams/memory_stream.c
 
 ifeq ($(ARM_ASM), 1)
 SOURCES += $(CORE_DIR)/ppu.c
