@@ -67,9 +67,12 @@ void ws_patchRom(void)
 
 	ws_cyclesByLine = 256;
     s_is_klonoa = false;
+	ws_game_vertical = 0;
 
 	if (!rom || romSize < 10) return;
 	ws_romHeaderStruct *hdr = ws_rom_getHeader(rom, romSize);
+	/* Cached for the keypad port, which runs on every read and must not touch the ROM */
+	ws_game_vertical = hdr->flags & 1;
 
 	if (hdr->developerId == 0x01 && hdr->cartId == 0x27) // Detective Conan
 	{

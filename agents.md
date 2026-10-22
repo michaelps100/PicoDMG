@@ -717,3 +717,60 @@ No hardware (ares, `Bus::read`/`Bus::write`): no modelo mono, RAM interna `0x400
 - A correção vale para todos os jogos mono: alinha com o hardware, mas convém um teste rápido em outros `.ws`.
 - O emulador roda o WS a 60 quadros/s em vez de 75,47 (`BASE_FRAME_US`): a voz sai a ~9,5 kHz em vez de 12 kHz e a música fica 20% mais lenta. Limitação global, não relacionada a este bug.
 - O trace mostrou ~6 interrupções de HBlank perdidas por quadro durante a voz (pendentes enquanto a ISR de VBlank roda); inaudível, mas registrado.
+
+---
+
+## 31. Controles: Digimon (Direita = A) e Tetris (A e B Ignorados) (22/10/2026)
+
+### Sintomas
+- **Digimon Adventure 02 - Tag Tamers (English v1.4.5)**: D-pad Direita agia como A na horizontal; girado com SELECT, Cima agia como A. No Klonoa tudo funcionava.
+- **Tetris (Japan)**: os botões físicos A e B não faziam nada.
+
+### Premissa
+O aparelho **nunca é girado**: SELECT gira só a imagem. O controle físico é sempre D-pad = direções, A = A, B = B, START = START. Por isso o mapeamento passa a seguir a **orientação do jogo (header)**, não a da tela. Os itens 12–18 descrevem o mapeamento antigo, que decidia pela tela (`ili9341_get_ws_vertical()`).
+
+### Causas (confirmadas na ROM)
+O WonderSwan tem dois direcionais: o **X-pad** (direções dos jogos horizontais) e o **Y-pad** (4 botões separados, usados como ação pelos jogos horizontais e como direção pelos verticais). A porta `0xB5` seleciona a linha (0x10 = Y, 0x20 = X, 0x40 = botões).
+
+**Digimon** (header horizontal): o patch de tradução lê as três linhas separadamente (`ROM 0x1D00E0` e a versão por interrupção de linha `0x1D03AD`) e monta `[0x600]` = Y | X<<4 | botões<<8. O jogo usa **Y2 como confirmar**.
+- Horizontal: o emulador copiava o D-pad também para o Y-pad (ajuste antigo para o Tetris). Direita gerava X2 **e Y2**.
+- Girado: o D-pad ia só para o Y-pad. Cima virava Y2.
+
+**Tetris** (header vertical, bit de rotação = 1): o laço `0x4A32C` monta `[0x1B6]` = Y | X<<4 | botões<<8 e `[0x1B8]`/`[0x1BA]` (recém-apertadas). No jogo (`0x42110`): **X3 (`0x40`) gira +1, X4 (`0x80`) gira −1**, X2 (`0x20`) é uma terceira ação; nos menus o confirmar é X3. **X1 nunca é testado.** O mapeamento antigo (A → X2, B → X1) caía numa função secundária e em nada.
+
+### Mapeamento novo (`src/oswan/io.c`, `cpu_readport`, porta `0xB5`)
+
+**Jogo horizontal** (tela horizontal ou girada, igual):
+
+| Botão físico | O jogo recebe |
+| :--- | :--- |
+| D-pad Cima / Direita / Baixo / Esquerda | X1 / X2 / X3 / X4 |
+| A / B / START | A / B / START |
+| — | Y-pad nunca acionado (como no aparelho sem tocar nesses botões) |
+
+**Jogo vertical** (header):
+
+| Botão físico | O jogo recebe | No Tetris |
+| :--- | :--- | :--- |
+| D-pad Esquerda / Cima / Direita / Baixo | Y1 / Y2 / Y3 / Y4 | mover / queda rápida / mover / descer |
+| A | X3 + A | girar +1; confirmar nos menus |
+| B | X4 + B | girar −1 |
+| START | START | pausa |
+
+Sem botão físico: X2 nos jogos verticais (a terceira ação do Tetris).
+
+### Implementação
+- `ws_game_vertical` (`io.c`, `extern` em `io.h`): bit de rotação do header, guardado em `ws_patchRom()` (`ws.c`). `cpu_readport` roda em SRAM em toda leitura e não pode ler a ROM.
+- `cpu_readport` deixou de usar `ili9341_get_ws_vertical()`. A orientação inicial da **tela** continua vindo de `ws_rotated()` em `main.cpp`.
+
+### Binários
+| Alvo | Arquivo | Tamanho | Validação |
+| :--- | :--- | ---: | :--- |
+| **Core2350B (HW16)** | `PicoWS_hw16.uf2` | 832.000 B | compila limpo; [PENDENTE] hardware |
+| **RP2350 Plus (HW15)** | `PicoWS.uf2` | 775.168 B | compila limpo; [PENDENTE] hardware |
+
+### Pendente de validação em hardware
+1. Digimon horizontal: Direita move e não confirma; A confirma; B cancela.
+2. Digimon girado com SELECT: mesmos controles do item 1.
+3. Klonoa horizontal e girado: igual à horizontal de antes.
+4. Tetris: A e B giram a peça em sentidos opostos; A confirma nos menus; D-pad como antes.

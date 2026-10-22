@@ -25,9 +25,9 @@
 
 extern uint32 externalEepromAddressMask;
 extern uint32 romAddressMask;
-extern bool ili9341_get_ws_vertical(void);
-
 __aligned(4) uint8 ws_ioRam[0x100];
+
+uint8 ws_game_vertical;     /* ROM header orientation bit, set by ws_patchRom() */
 
 uint8 ws_key_start;
 uint8 ws_key_left;
@@ -180,16 +180,20 @@ uint8_t __not_in_flash_func(cpu_readport)(uint8_t port) {
                 if (ws_key_button_1) w2 |= (1 << 2);
                 if (ws_key_button_2) w2 |= (1 << 3);
             }
+            /* The console is never turned: SELECT only rotates the picture, so the mapping
+             * follows the game's own orientation (ROM header), not the screen's.
+             * Horizontal game: D-pad = X-pad and the Y-pad stays released. The Y-pad is a
+             * separate set of buttons on the real WonderSwan, and games read it as actions:
+             * Digimon Tag Tamers confirms with Y2, so mirroring the D-pad there made Right
+             * (and Up, once rotated) act as A.
+             * Vertical game: D-pad = Y-pad, and A/B go to the X-pad buttons the game uses as
+             * actions. Tetris rotates with X3 (+1) / X4 (-1) and confirms with X3; X1 is
+             * never read, so the old A->X2 / B->X1 left A and B dead. */
             if (w1 & 0x20) {
                 /* Row 0x20: X-pad */
-                if (ili9341_get_ws_vertical()) {
-                    /* In Tate mode: physical A/B map to X-pad for actions / rotation.
-                     * X1 (bit 0) = Jump (Button B).
-                     * X2 (bit 1) = Action / Wind Ring (Button A).
-                     * Never send opposing bits simultaneously (X1|X3 or X2|X4) as games cancel them.
-                     */
-                    if (ws_key_button_1) w2 |= (1 << 1); /* X2 = Button A */
-                    if (ws_key_button_2) w2 |= (1 << 0); /* X1 = Button B */
+                if (ws_game_vertical) {
+                    if (ws_key_button_1) w2 |= (1 << 2); /* X3 = Button A */
+                    if (ws_key_button_2) w2 |= (1 << 3); /* X4 = Button B */
                 } else {
                     if (ws_key_up)    w2 |= (1 << 0);
                     if (ws_key_right) w2 |= (1 << 1);
@@ -198,18 +202,12 @@ uint8_t __not_in_flash_func(cpu_readport)(uint8_t port) {
                 }
             }
             if (w1 & 0x10) {
-                /* Row 0x10: Y-pad */
-                if (ili9341_get_ws_vertical()) {
-                    /* In Tate mode: physical D-pad maps to Y-pad for directional movement */
+                /* Row 0x10: Y-pad, vertical games only */
+                if (ws_game_vertical) {
                     if (ws_key_left)  w2 |= (1 << 0); /* Y1 = Left */
                     if (ws_key_up)    w2 |= (1 << 1); /* Y2 = Up */
                     if (ws_key_right) w2 |= (1 << 2); /* Y3 = Right */
                     if (ws_key_down)  w2 |= (1 << 3); /* Y4 = Down */
-                } else {
-                    if (ws_key_up)    w2 |= (1 << 0);
-                    if (ws_key_right) w2 |= (1 << 1);
-                    if (ws_key_down)  w2 |= (1 << 2);
-                    if (ws_key_left)  w2 |= (1 << 3);
                 }
             }
             return (uint8)((w1 & 0xf0) | (w2 & 0x0f));

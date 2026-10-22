@@ -23,6 +23,7 @@ extern	uint8	ws_key_up;
 extern	uint8	ws_key_down;
 extern	uint8	ws_key_button_1;
 extern	uint8	ws_key_button_2;
+extern	uint8	ws_game_vertical;
 
 void ws_io_init(void);
 void ws_io_reset(void);
