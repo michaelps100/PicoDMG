@@ -18,10 +18,12 @@
 
 extern	uint8	ws_gpu_scanline;
 extern	uint8	ws_gpu_operatingInColor;
+extern	uint8	ws_gpu_colorActive;
 extern	uint8	ws_videoMode;
 extern	int16	ws_palette[16*4];
 extern	int8	ws_paletteColors[8];
 extern	int16	wsc_palette[16*16];
+extern  uint16_t wsc_palette_rgb565[256];
 extern  unsigned int ws_gpu_unknownPort;
 
 

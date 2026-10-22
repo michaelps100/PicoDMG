@@ -63,5 +63,6 @@ int nec_execute(int cycles);
 unsigned nec_get_reg(int regnum);
 void nec_reset (void *param);
 void nec_int(uint32_t wektor);
+void ws_check_interrupts(void);
 
 #endif

@@ -39,6 +39,16 @@
 #define INT32 signed int
 
 #include "nec.h"
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN
+/* Console build: SRAM is not scarce (the vertical frame lives in PSRAM), so every
+ * memory access of the core is inlined against the page table. */
+#undef cpu_readop
+#undef cpu_readop_arg
+#define cpu_readop ws_read20
+#define cpu_readop_arg ws_read20
+#define cpu_readmem20 ws_read20
+#define cpu_writemem20 ws_write20
+#endif
 #include "necintrf.h"
 
 typedef union
@@ -69,11 +79,91 @@ typedef struct
 /***************************************************************************/
 
 int nec_ICount;
+unsigned ws_prof_instr;
 #if 1
 int nec_TotalClock = 0;
 #endif
 
 static nec_Regs I;
+
+/* ------------------------------------------------------------------------- */
+/* Idle detection                                                             */
+/*                                                                            */
+/* Digimon Tamers runs a cooperative scheduler (ROM 0x3A3460: a yield routine  */
+/* that saves registers and the stack pointer, walks 4 task slots and switches */
+/* stacks). When every task is just waiting, they yield to each other forever, */
+/* ~700 times per frame, each switch ~65 instructions. Nothing in that ping-   */
+/* pong changes memory after the first round (it rewrites the same values),    */
+/* and the registers go round in a cycle -- so the machine state (registers + */
+/* all of memory) repeats exactly.                                             */
+/*                                                                            */
+/* ws_mc counts writes that actually CHANGE memory (and every port write).    */
+/* While it stays put, every backward branch records a hash of the CPU state   */
+/* (registers, flags, CS:IP). Seeing a state a second time with ws_mc still    */
+/* unchanged means a closed cycle: everything it reads (memory, ports, timers, */
+/* scanline) only changes between chunks, so the rest of this chunk would just */
+/* repeat the same cycle. It is skipped; interrupts are still taken at the    */
+/* start of the next chunk, exactly as before.                                 */
+/* Busy code changes memory constantly, so hashing never even starts there.    */
+/* ------------------------------------------------------------------------- */
+uint32_t ws_mc;
+static uint32_t lp_seen_mc, lp_epoch = 1, lp_run;
+static struct { uint32_t h, ep; } lp_tab[128];
+
+static inline uint32_t nec_state_hash(void)
+{
+	const uint32_t *r = (const uint32_t *)&I.regs;
+	const uint32_t *s = (const uint32_t *)I.sregs;
+	uint32_t h = r[0];
+	h = (h * 0x9E3779B1u) ^ r[1];
+	h = (h * 0x9E3779B1u) ^ r[2];
+	h = (h * 0x9E3779B1u) ^ r[3];
+	h = (h * 0x9E3779B1u) ^ s[0];
+	h = (h * 0x9E3779B1u) ^ s[1];
+	h = (h * 0x9E3779B1u) ^ (uint32_t)I.SignVal;
+	h = (h * 0x9E3779B1u) ^ I.AuxVal;
+	h = (h * 0x9E3779B1u) ^ I.OverVal;
+	h = (h * 0x9E3779B1u) ^ I.ZeroVal;
+	h = (h * 0x9E3779B1u) ^ I.CarryVal;
+	h = (h * 0x9E3779B1u) ^ I.ParityVal;
+	h = (h * 0x9E3779B1u) ^ (uint32_t)(I.TF | (I.IF << 8) | (I.DF << 16) | (I.MF << 24));
+	h = (h * 0x9E3779B1u) ^ (((uint32_t)I.sregs[CS] << 4) + I.ip);
+	return h;
+}
+
+static inline void nec_backjump(void)
+{
+#ifdef WS_NO_IDLE_SKIP
+	return;
+#endif
+	if (ws_mc != lp_seen_mc) {
+		/* memory changed: every remembered state is stale */
+		lp_seen_mc = ws_mc;
+		lp_epoch++;
+		lp_run = 0;
+		return;
+	}
+	/* only start hashing once memory has been quiet for a few branches */
+	if (++lp_run < 4) return;
+
+	const uint32_t h = nec_state_hash();
+	uint32_t k = h & 127u;
+	for (int i = 0; i < 4; i++, k = (k + 1) & 127u) {
+		if (lp_tab[k].ep != lp_epoch) {
+			lp_tab[k].h = h;
+			lp_tab[k].ep = lp_epoch;
+			return;
+		}
+		if (lp_tab[k].h == h) {
+			nec_ICount = 0;		/* closed cycle: nothing left to compute this chunk */
+			lp_epoch++;
+			lp_run = 0;
+			return;
+		}
+	}
+	lp_tab[h & 127u].h = h;
+	lp_tab[h & 127u].ep = lp_epoch;
+}
 
 static UINT32 cpu_type;
 static UINT32 prefix_base;	/* base address of the latest prefix segment */
@@ -722,9 +812,9 @@ OP( 0xd6, i_setalc ) { I.regs.b[AL] = (CF)?0xff:0x00; CLK(3);  } /* nop at V30MZ
 OP( 0xd7, i_trans  ) { UINT32 dest = (I.regs.w[BW]+I.regs.b[AL])&0xffff; I.regs.b[AL] = GetMemB(DS, dest); CLK(5); }
 OP( 0xd8, i_fpo    ) { GetModRM; CLK(3);	 } /* nop at V30MZ? */
 
-OP( 0xe0, i_loopne ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if (!ZF && I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(6); } else CLK(3); }
-OP( 0xe1, i_loope  ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if ( ZF && I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(6); } else CLK(3); }
-OP( 0xe2, i_loop   ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if (I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(5); } else CLK(2); }
+OP( 0xe0, i_loopne ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if (!ZF && I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(6); if (disp < 0) nec_backjump(); } else CLK(3); }
+OP( 0xe1, i_loope  ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if ( ZF && I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(6); if (disp < 0) nec_backjump(); } else CLK(3); }
+OP( 0xe2, i_loop   ) { INT8 disp = (INT8)FETCH; I.regs.w[CW]--; if (I.regs.w[CW]) { I.ip = (uint16_t)(I.ip+disp);  CLK(5); if (disp < 0) nec_backjump(); } else CLK(2); }
 OP( 0xe3, i_jcxz   ) { INT8 disp = (INT8)FETCH; if (I.regs.w[CW] == 0) { I.ip = (uint16_t)(I.ip+disp);  CLK(4); } else CLK(1); }
 OP( 0xe4, i_inal   ) { UINT8 port = FETCH; I.regs.b[AL] = read_port(port); CLK(6);	}
 OP( 0xe5, i_inax   ) { UINT8 port = FETCH; I.regs.b[AL] = read_port(port); I.regs.b[AH] = read_port(port+1); CLK(6); }
@@ -732,11 +822,12 @@ OP( 0xe6, i_outal  ) { UINT8 port = FETCH; write_port(port, I.regs.b[AL]); CLK(6
 OP( 0xe7, i_outax  ) { UINT8 port = FETCH; write_port(port, I.regs.b[AL]); write_port(port+1, I.regs.b[AH]); CLK(6);	}
 
 OP( 0xe8, i_call_d16 ) { UINT32 tmp; FETCHWORD(tmp); PUSH(I.ip); I.ip = (uint16_t)(I.ip+(INT16)tmp); CLK(5); }
-OP( 0xe9, i_jmp_d16  ) { UINT32 tmp; FETCHWORD(tmp); I.ip = (uint16_t)(I.ip+(INT16)tmp); CLK(4); }
+OP( 0xe9, i_jmp_d16  ) { UINT32 tmp; FETCHWORD(tmp); I.ip = (uint16_t)(I.ip+(INT16)tmp); CLK(4); if ((INT16)tmp < 0) nec_backjump(); }
 OP( 0xea, i_jmp_far  ) { UINT32 tmp,tmp1; FETCHWORD(tmp); FETCHWORD(tmp1); I.sregs[CS] = (uint16_t)tmp1; 	I.ip = (uint16_t)tmp; CLK(7);  }
 OP( 0xeb, i_jmp_d8   ) { int tmp = (int)((INT8)FETCH); CLK(4);
 	if (tmp==-2 && no_interrupt==0 && nec_ICount>0) nec_ICount%=12; /* cycle skip */
 	I.ip = (uint16_t)(I.ip+tmp);
+	if (tmp < 0) nec_backjump();
 }
 OP( 0xec, i_inaldx   ) { I.regs.b[AL] = read_port(I.regs.w[DW]); CLK(6);}
 OP( 0xed, i_inaxdx   ) { UINT32 port = I.regs.w[DW];	I.regs.b[AL] = read_port(port);	I.regs.b[AH] = read_port(port+1); CLK(6); }
@@ -925,16 +1016,33 @@ void nec_set_reg(int regnum, unsigned val)
     }
 }
 
+extern uint8_t ws_ioRam[0x100];
+
+void ws_check_interrupts(void)
+{
+	if (!I.IF) return;
+
+	uint8_t pending = ws_ioRam[0xb6] & ws_ioRam[0xb2];
+	if (!pending) return;
+
+	for (int i = 0; i < 8; i++) {
+		if (pending & (1 << i)) {
+			uint32_t wektor = ((uint32_t)ws_ioRam[0xb0] + i) * 4;
+			nec_int(wektor);
+			break;
+		}
+	}
+}
+
 int nec_execute(int cycles)
 {
-	
 	nec_ICount=cycles;
-//	cpu_type=V30;
 
 	while(nec_ICount>0) {
-
+		if (I.IF && (ws_ioRam[0xb6] & ws_ioRam[0xb2])) {
+			ws_check_interrupts();
+		}
 		nec_instruction[FETCHOP]();
-//		nec_ICount++;
     }
 
 	return cycles - nec_ICount;

@@ -121,36 +121,31 @@ ws_romHeaderStruct		*ws_rom_getHeader(uint8 *wsrom, uint32 wsromSize)
 ////////////////////////////////////////////////////////////////////////////////
 uint32				ws_rom_sramSize(uint8 *wsrom, uint32 wsromSize)
 {
-	ws_romHeaderStruct		*romHeader=ws_rom_getHeader(wsrom,wsromSize);
-	switch (romHeader->eepromSize&0xf0)
+	if (!wsrom || wsromSize < 10) return 0;
+	ws_romHeaderStruct *romHeader = ws_rom_getHeader(wsrom, wsromSize);
+	uint8 save = romHeader->saveType;
+	switch (save)
 	{
-	case WS_SRAM_SIZE_NONE:		return(0);
-	case WS_SRAM_SIZE_1k:		return(0x400);
-	case WS_SRAM_SIZE_16k:		return(0x4000);
-	case WS_SRAM_SIZE_8k:		return(0x2000);
+	case 0x01: return 0x2000;   /* 64 Kbit = 8 KB */
+	case 0x02: return 0x8000;   /* 256 Kbit = 32 KB */
+	case 0x03: return 0x20000;  /* 1 Mbit = 128 KB */
+	case 0x04: return 0x40000;  /* 2 Mbit = 256 KB */
+	case 0x05: return 0x80000;  /* 4 Mbit = 512 KB */
+	default:   return 0;        /* None or EEPROM */
 	}
-	return(0);
 }
-////////////////////////////////////////////////////////////////////////////////
-//
-////////////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//
-//
-//
-////////////////////////////////////////////////////////////////////////////////
+
 uint32				ws_rom_eepromSize(uint8 *wsrom, uint32 wsromSize)
 {
-	ws_romHeaderStruct		*romHeader=ws_rom_getHeader(wsrom,wsromSize);
-	switch (romHeader->eepromSize&0xf)
+	if (!wsrom || wsromSize < 10) return 0;
+	ws_romHeaderStruct *romHeader = ws_rom_getHeader(wsrom, wsromSize);
+	uint8 save = romHeader->saveType;
+	switch (save)
 	{
-	case WS_EEPROM_SIZE_NONE:	return(0);
-	case WS_EEPROM_SIZE_64k:	return(0x10000);
-	case WS_EEPROM_SIZE_256k:	return(0x40000);
+	case 0x10: return 128;      /* 1 Kbit = 128 bytes (64x16) */
+	case 0x20: return 2048;     /* 16 Kbit = 2048 bytes (1024x16) */
+	case 0x50: return 1024;     /* 8 Kbit = 1024 bytes (512x16) */
+	default:   return 0;        /* None or SRAM */
 	}
-	return(0);
 }
 

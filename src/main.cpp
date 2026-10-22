@@ -1,788 +1,1284 @@
-#include <cstdio>
-#include <cstring>
-#include <hardware/flash.h>
-#include <hardware/structs/vreg_and_chip_reset.h>
-#include <pico/multicore.h>
-#include <pico/stdlib.h>
+/**
+ * PicoWS — WonderSwan Emulator for RP2350 + ILI9341
+ *
+ * Waveshare RP2350 Plus 16MB | SPI0: ILI9341 | SPI1: SD Card
+ * GPIO pins (HW_CONFIG=15):
+ *   ILI9341: CS=17, SCK=18, MOSI=19, DC=20, RST=21, BL=22 (SPI0 → PLL_USB 70MHz)
+ *   SD Card: CS=13, SCK=14, MOSI=15, MISO=12 (SPI1)
+ *   I2S Audio: DATA=26, CLK=27
+ *   LED: GPIO 25
+ *
+ * ROM layout:
+ *   0x10000000 → firmware binary
+ *   0x10080000 → ROM cache start (512KB headroom after firmware)
+ *   0x10080000 - FLASH_SECTOR_SIZE → cache header
+ *
+ * SD card:
+ *   roms/ws/    — WonderSwan ROMs (.ws, .wsc)
+ *   saves/ws/   — Save states (_1.ss .. _4.ss), SRAM (.sav), config (picows.cfg)
+ */
 
-#include <graphics.h>
-#include "audio.h"
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 
-#include "nespad.h"
+#include "pico/stdlib.h"
+#include "hardware/structs/xip.h"
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "hardware/pwm.h"
+#include "hardware/pll.h"
+#include "hardware/pio.h"
+
 #include "ff.h"
-#include "ps2kbd_mrmltr.h"
-#include "psram_spi.h"
+#include "tf_card.h"
+#include "ili9341.h"
+#include "dmg_menu.h"
+#include "dmg_combo.h"
+#include "FrensHelpers.h"
+#include "external_audio.h"
 
 extern "C" {
-#include "ws.h"
+#include "oswan/ws.h"
+#include "oswan/gpu.h"
+#include "oswan/memory.h"
+#include "oswan/io.h"
+#include "oswan/rom.h"
+#include "oswan/ws_audio.h"
+}
+#include "ws_state_io.h"
+
+/* =========================================================================
+ * Build configuration
+ * ========================================================================= */
+#define APP_TITLE      "PicoWS"
+#define CONFIG_MAGIC   0x57535053u   /* "WSPS" */
+#define ROMS_DIR              "0:/roms/ws"
+#define ROMS_DIR_FALLBACK     "/roms/ws"
+#define SAVES_DIR             "0:/saves/ws"
+#define SAVES_DIR_FALLBACK    "/saves/ws"
+#define CONFIG_PATH           "0:/saves/ws/picows.cfg"
+#define CONFIG_PATH_FALLBACK  "/saves/ws/picows.cfg"
+
+#ifndef SDCARD_SPI
+#define SDCARD_SPI spi1
+#endif
+#ifndef SDCARD_PIN_MISO
+#define SDCARD_PIN_MISO 12
+#endif
+#ifndef SDCARD_PIN_CS
+#define SDCARD_PIN_CS 13
+#endif
+#ifndef SDCARD_PIN_SCK
+#define SDCARD_PIN_SCK 14
+#endif
+#ifndef SDCARD_PIN_MOSI
+#define SDCARD_PIN_MOSI 15
+#endif
+#ifndef SDCARD_PIO
+#define SDCARD_PIO pio1
+#endif
+
+/* Flash ROM cache: 1MB headroom after bootloader offset 0x10080000 */
+#define WS_ROM_CACHE_HEADROOM  0x100000u   /* 1 MB headroom beyond flash code */
+#define WS_ROM_CACHE_ABS       (0x10080000u + WS_ROM_CACHE_HEADROOM)
+#define WS_ROM_CACHE_OFF       (WS_ROM_CACHE_ABS - 0x10000000u)
+#define WS_ROM_CACHE_MAX       0x400000u   /* 4 MB max ROM size */
+#define WS_CACHE_MAGIC         0x57535043u /* "WSPC" */
+#define WS_CACHE_HDR_OFF       (WS_ROM_CACHE_OFF - FLASH_SECTOR_SIZE)
+#define WS_CACHE_HDR_ABS       (WS_ROM_CACHE_ABS - FLASH_SECTOR_SIZE)
+
+#if PICO_RP2350
+#define CPU_FREQ_KHZ  360000u
+#include "hardware/structs/qmi.h"
+
+static void __no_inline_not_in_flash_func(apply_safe_qmi_timing)(void) {
+    const uint32_t max_flash_khz = 94500;
+    uint32_t flash_div = (CPU_FREQ_KHZ + max_flash_khz - 1) / max_flash_khz;
+    if (flash_div < 4)
+        flash_div = 4;
+    uint32_t rxdelay = (3 * CPU_FREQ_KHZ + 189000) / 378000;
+    if (rxdelay > 7)
+        rxdelay = 7;
+    uint32_t ints = save_and_disable_interrupts();
+    qmi_hw->m[0].timing = 0x60000000u | (14u << 11) | (rxdelay << 8) | flash_div;
+    __asm volatile("nop\nnop\nnop\nnop");
+    restore_interrupts(ints);
 }
 
-#define HOME_DIR "\\WS"
-extern char __flash_binary_end;
-#define FLASH_TARGET_OFFSET (((((uintptr_t)&__flash_binary_end - XIP_BASE) / FLASH_SECTOR_SIZE) + 4) * FLASH_SECTOR_SIZE)
-static const uintptr_t rom = XIP_BASE + FLASH_TARGET_OFFSET;
+static void __no_inline_not_in_flash_func(safe_flash_range_erase)(uint32_t offset, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(offset, count);
+    apply_safe_qmi_timing();
+    restore_interrupts(ints);
+}
 
-#define AUDIO_SAMPLE_RATE 22050
-#define AUDIO_BUFFER_LENGTH (AUDIO_SAMPLE_RATE / 60 + 1)
+static void __no_inline_not_in_flash_func(safe_flash_range_program)(uint32_t offset, const uint8_t *data, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(offset, data, count);
+    apply_safe_qmi_timing();
+    restore_interrupts(ints);
+}
+#else
+#define CPU_FREQ_KHZ  252000u
+static inline void apply_safe_qmi_timing(void) {}
+static inline void safe_flash_range_erase(uint32_t offset, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(offset, count);
+    restore_interrupts(ints);
+}
+static inline void safe_flash_range_program(uint32_t offset, const uint8_t *data, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(offset, data, count);
+    restore_interrupts(ints);
+}
+#endif
 
+/* =========================================================================
+ * Cache header (packed into one flash page)
+ * ========================================================================= */
+typedef struct __attribute__((aligned(4))) {
+    uint32_t magic;
+    uint32_t rom_size;
+    uint32_t sample_crc;
+    char     filename[64];
+    uint8_t  padding[256 - 76];
+} PicoWS_Cache_Header_t;
+static_assert(sizeof(PicoWS_Cache_Header_t) == 256, "PicoWS_Cache_Header_t must be exactly 256 bytes");
 
-char __uninitialized_ram(filename[256]);
-static uint32_t __uninitialized_ram(rom_size);
+static uint32_t compute_ws_sample_hash(const uint8_t *base, uint32_t size) {
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 32; i++) {
+        uint32_t off = (size > 512) ? (uint32_t)(((uint64_t)i * (size - 512)) / 31) : 0;
+        off &= ~3u;
+        const uint32_t *p = (const uint32_t *)(base + off);
+        for (int w = 0; w < 128; w++) hash = (hash ^ p[w]) * 16777619u;
+    }
+    return hash;
+}
 
-static FATFS fs;
-bool reboot = false;
-semaphore vga_start_semaphore;
+/* =========================================================================
+ * Clean Light UI Common & Emulator Descriptor (shared_menu)
+ * ========================================================================= */
+static ili9341_scale_mode_t cfg_scale      = SCALE_FIT;
+static bool                 cfg_grid       = false;
+static bool                 cfg_shimmerless = true;
+static bool                 cfg_interleave = false;
+static bool                 cfg_turbo      = false;
+static bool                 cfg_fps        = false;
+static uint8_t              cfg_bright     = 5;
+static uint8_t              cfg_volume     = 3;
+static uint8_t              cfg_save_slot  = 1;
+static uint8_t              cfg_load_slot  = 1;
+static uint8_t              cfg_palette    = 0;    /* 0=Default,1=Amber,2=Green */
 
-alignas(4) uint8_t SCREEN[144][224];
-//alignas(4) int audio_buffer[AUDIO_BUFFER_LENGTH];
-extern uint32_t	ws_shades[16];
+/* Full frame capture for 90-degree rotated Vertical (Tate) display */
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN
+/* Tate-mode frame: 31 KB that only matters when the screen is rotated. On the
+ * console it lives in PSRAM (allocated on first use) so SRAM can go to the core. */
+static uint8_t *s_ws_vframe = nullptr;
+#else
+static uint8_t  s_ws_vframe[144 * 224];
+#endif
+static bool     s_ws_vertical = false;
 
-struct input_bits_t {
-    bool a: true;
-    bool b: true;
-    bool select: true;
-    bool start: true;
-    bool right: true;
-    bool left: true;
-    bool up: true;
-    bool down: true;
+static FATFS    s_fs;
+static FIL      s_fil;
+static char     s_selected_rom[FF_MAX_LFN];
+static uint32_t s_last_flashed_size = 0;
+
+/* Where the running cartridge lives.
+ *
+ * On the console build (PSRAM_CS_PIN != 0) the ROM is read straight from the SD
+ * card into PSRAM and s_rom_ptr points there; the HW15 build has no PSRAM and
+ * programs it into the flash XIP window at WS_ROM_CACHE_ABS instead, leaving
+ * s_rom_ptr NULL. A flag rather than an address-range test, because a PSRAM
+ * pointer is in the 0x11xxxxxx range and the XIP window is a perfectly
+ * legal-looking 0x1018.... */
+static uint8_t *s_rom_ptr = NULL;
+static bool s_rom_in_psram = false;
+static char     s_fps_str[40] = "60";
+static char     s_full_path[256];
+
+#define init_ui_buttons() dmg_init_ui_buttons()
+#define read_ui_buttons(u, d, l, r, a, b, sel, sta) dmg_read_ui_buttons(u, d, l, r, a, b, sel, sta)
+#define wait_buttons_released() dmg_wait_for_all_buttons_released()
+
+#define get_basename dmg_sanitize_basename
+#define ROM_NAME_LEN 80u
+#define get_saves_dir() "0:/saves/ws"
+
+#define UI_BG    DMG_RGB565_BG_COLOR
+#define UI_BAR   DMG_RGB565_BAR_COLOR
+#define UI_BDR   DMG_RGB565_BORDER_COLOR
+#define UI_TXT   DMG_RGB565_TEXT_COLOR
+#define UI_TBRT  DMG_RGB565_TEXT_BAR_COLOR
+#define UI_SEL   DMG_RGB565_SEL_COLOR
+#define UI_OK    DMG_RGB565_STATUS_OK
+#define UI_ERR   DMG_RGB565_STATUS_ERR
+
+static void set_sound_volume_level(uint8_t lv) {
+    if (lv > 5) lv = 5;
+    cfg_volume = lv;
+    ws_audio_set_volume(lv);
+}
+
+static void set_brightness(uint8_t lv) {
+    if (lv < 1) lv = 1;
+    if (lv > 5) lv = 5;
+    cfg_bright = lv;
+    if (lv >= 5) {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_SIO);
+        gpio_set_dir(ILI9341_PIN_BL, GPIO_OUT);
+        gpio_put(ILI9341_PIN_BL, 1);
+    } else {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_PWM);
+        uint s = pwm_gpio_to_slice_num(ILI9341_PIN_BL);
+        pwm_config c = pwm_get_default_config();
+        pwm_config_set_clkdiv(&c, 4.0f);
+        pwm_config_set_wrap(&c, 1000);
+        pwm_init(s, &c, true);
+        static const uint16_t dt[6] = {0, 200, 400, 600, 800, 1000};
+        pwm_set_gpio_level(ILI9341_PIN_BL, dt[lv]);
+    }
+}
+
+static void ensure_save_dirs(void) {
+    f_mkdir("0:/saves");
+    f_mkdir("0:/saves/ws");
+    f_mkdir("/saves");
+    f_mkdir("/saves/ws");
+    f_mkdir("saves");
+    f_mkdir("saves/ws");
+    f_mkdir("0:/roms");
+    f_mkdir("0:/roms/ws");
+    f_mkdir("/roms");
+    f_mkdir("/roms/ws");
+    f_mkdir("roms");
+    f_mkdir("roms/ws");
+}
+
+static bool ws_is_rom_file(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    return (strcasecmp(dot, ".ws") == 0 ||
+            strcasecmp(dot, ".wsc") == 0);
+}
+
+static bool ws_save_state(const char *game_name, uint8_t slot) {
+    char path[256];
+    ensure_save_dirs();
+    dmg_build_state_path("0:/saves/ws", game_name, slot, path, sizeof(path));
+    return ws_state_save(path);
+}
+
+static bool ws_load_state(const char *game_name, uint8_t slot) {
+    char path[256];
+    dmg_build_state_path("0:/saves/ws", game_name, slot, path, sizeof(path));
+    FILINFO fno;
+    bool exists = (f_stat(path, &fno) == FR_OK && fno.fsize > 0);
+    if (!exists) {
+        dmg_build_state_path("/saves/ws", game_name, slot, path, sizeof(path));
+        exists = (f_stat(path, &fno) == FR_OK && fno.fsize > 0);
+        if (!exists) return false;
+    }
+    return ws_state_load(path);
+}
+
+/* Slot probe for the shared menu's Load State row.
+ *
+ * ws_load_state() above tries the numbered file in "0:/saves/ws" and then in
+ * "/saves/ws", so the probe has to try both. The generic single-path probe would
+ * grey out a slot that loads, on a card whose root mounted without the volume
+ * prefix. */
+static bool ws_state_exists(const char *game_name, uint8_t slot) {
+    if (slot < 1 || slot > 4) return false;
+
+    char path[256];
+    dmg_build_state_path("0:/saves/ws", game_name, slot, path, sizeof(path));
+    if (dmg_state_file_present(path)) return true;
+
+    dmg_build_state_path("/saves/ws", game_name, slot, path, sizeof(path));
+    return dmg_state_file_present(path);
+}
+
+static void ws_apply_scale(dmg_scale_mode_t scale_mode) {
+    cfg_scale = (ili9341_scale_mode_t)scale_mode;
+    ili9341_set_scale_mode(cfg_scale);
+}
+
+static void ws_apply_effect(bool effect_on) {
+    cfg_grid = effect_on;
+    ili9341_set_grid_effect(cfg_grid);
+}
+
+static void ws_apply_interleave(bool interleave_on) {
+    cfg_interleave = interleave_on;
+    ili9341_set_interleave(cfg_interleave);
+}
+
+static void ws_apply_filter(bool shimmerless_on) {
+    cfg_shimmerless = shimmerless_on;
+    ili9341_set_shimmerless(cfg_shimmerless);
+}
+
+static void ws_apply_speed(bool turbo_on) {
+    cfg_turbo = turbo_on;
+}
+
+static void ws_apply_volume(uint8_t volume) {
+    cfg_volume = volume;
+    set_sound_volume_level(volume);
+}
+
+static void ws_apply_brightness(uint8_t brightness) {
+    cfg_bright = brightness;
+    set_brightness(brightness);
+}
+
+static void image_submenu(const char *game_name);
+
+/* All three are defined just after the descriptor that stores them, which is
+ * why they need forward declarations here. */
+static void save_config(void);
+static bool ws_get_fps(void);
+static void ws_apply_fps(bool on);
+
+static void ws_custom_submenu(const struct dmg_emulator_desc *desc, const char *game_name) {
+    (void)desc;
+    image_submenu(game_name);
+}
+
+static const char *s_ws_candidate_dirs[] = {
+    "0:/roms/ws",
+    "0:/roms/wonderswan",
+    "0:/roms",
+    "/roms/ws",
+    "/roms",
+    NULL
 };
 
-static input_bits_t keyboard_bits = { false, false, false, false, false, false, false, false };
-static input_bits_t gamepad1_bits = { false, false, false, false, false, false, false, false };
-static input_bits_t gamepad2_bits = { false, false, false, false, false, false, false, false };
+static const dmg_emulator_desc_t s_ws_desc = {
+    .app_title = "PicoWS",
+    .default_rom_dir = "0:/roms/ws",
+    .candidate_dirs = s_ws_candidate_dirs,
+    .config_path = "0:/saves/ws/picows.cfg",
+    .config_fallback = "/saves/ws/picows.cfg",
+    .saves_dir = "0:/saves/ws",
+    .config_magic = 0x57535053u, /* 'WSPS' */
+    .is_rgb555 = false,
+    .display = {
+        .fill_rect = ili9341_fill_rect,
+        .draw_text = ili9341_text,
+        .flush_rows = ili9341_flush_rows,
+        .fill_screen = ili9341_fill_screen,
+        .flush = ili9341_flush,
+        .stop_blitter = ili9341_blitter_stop,
+        .start_blitter = ili9341_blitter_start,
+    },
+    .is_rom_file = ws_is_rom_file,
+    .on_load_rom = NULL,
+    .save_state = ws_save_state,
+    .load_state = ws_load_state,
+    .apply_scale = ws_apply_scale,
+    .apply_effect = ws_apply_effect,
+    .apply_interleave = ws_apply_interleave,
+    .apply_speed = ws_apply_speed,
+    .apply_volume = ws_apply_volume,
+    .apply_brightness = ws_apply_brightness,
+    .apply_filter = ws_apply_filter,
+    .reset_game = NULL,
+    .exit_game = NULL,
+    .custom_submenu_title = "Image >",
+    .custom_submenu = ws_custom_submenu,
+    .save_config = save_config,
+    .get_fps = ws_get_fps,
+    .apply_fps = ws_apply_fps,
+    .state_exists = ws_state_exists,
+};
 
-static bool swap_ab = false;
-extern	uint8	ws_key_start;
-extern	uint8	ws_key_left;
-extern	uint8	ws_key_right;
-extern	uint8	ws_key_up;
-extern	uint8	ws_key_down;
-extern	uint8	ws_key_button_1;
-extern	uint8	ws_key_button_2;
-
-static void nespad_tick() {
-    nespad_read();
-
-    if (swap_ab) {
-        gamepad1_bits.b = (nespad_state & DPAD_A) != 0;
-        gamepad1_bits.a = (nespad_state & DPAD_B) != 0;
-    } else {
-        gamepad1_bits.a = (nespad_state & DPAD_A) != 0;
-        gamepad1_bits.b = (nespad_state & DPAD_B) != 0;
-
-    }
-
-    gamepad1_bits.select = (nespad_state & DPAD_SELECT) != 0;
-    gamepad1_bits.start = (nespad_state & DPAD_START) != 0;
-    gamepad1_bits.up = (nespad_state & DPAD_UP) != 0;
-    gamepad1_bits.down = (nespad_state & DPAD_DOWN) != 0;
-    gamepad1_bits.left = (nespad_state & DPAD_LEFT) != 0;
-    gamepad1_bits.right = (nespad_state & DPAD_RIGHT) != 0;
+static bool ws_get_fps(void) {
+    return cfg_fps;
 }
 
-static bool isInReport(hid_keyboard_report_t const* report, const unsigned char keycode) {
-    for (unsigned char i: report->keycode) {
-        if (i == keycode) {
-            return true;
-        }
-    }
-    return false;
+static void ws_apply_fps(bool on) {
+    cfg_fps = on;
+    ili9341_set_fps_overlay(cfg_fps, s_fps_str);
 }
 
-void process_kbd_report(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
-    /* printf("HID key report modifiers %2.2X report ", report->modifier);
-    for (unsigned char i: report->keycode)
-        printf("%2.2X", i);
-    printf("\r\n");
-     */
-    keyboard_bits.start = isInReport(report, HID_KEY_ENTER);
-    keyboard_bits.select = isInReport(report, HID_KEY_BACKSPACE) || isInReport(report, HID_KEY_ESCAPE);
-
-    keyboard_bits.a = isInReport(report, HID_KEY_Z) || isInReport(report, HID_KEY_O);
-    keyboard_bits.b = isInReport(report, HID_KEY_X) || isInReport(report, HID_KEY_P);
-
-    keyboard_bits.up = isInReport(report, HID_KEY_ARROW_UP) || isInReport(report, HID_KEY_W);
-    keyboard_bits.down = isInReport(report, HID_KEY_ARROW_DOWN) || isInReport(report, HID_KEY_S);
-    keyboard_bits.left = isInReport(report, HID_KEY_ARROW_LEFT) || isInReport(report, HID_KEY_A);
-    keyboard_bits.right = isInReport(report, HID_KEY_ARROW_RIGHT)  || isInReport(report, HID_KEY_D);
-    //-------------------------------------------------------------------------
-
-    ws_key_start = keyboard_bits.start;
-    ws_key_button_1 = keyboard_bits.a;
-    ws_key_button_2 = keyboard_bits.b;
-
-    ws_key_up = keyboard_bits.up;
-    ws_key_down = keyboard_bits.down;
-    ws_key_left = keyboard_bits.left;
-    ws_key_right = keyboard_bits.right;
+static void save_config(void) {
+    g_dmg_config.scale_mode = (uint32_t)cfg_scale;
+    g_dmg_config.grid_effect = cfg_grid ? 1u : 0u;
+    g_dmg_config.interleave = cfg_interleave ? 1u : 0u;
+    g_dmg_config.turbo_mode = cfg_turbo ? 1u : 0u;
+    g_dmg_config.volume_level = cfg_volume;
+    g_dmg_config.brightness_level = cfg_bright;
+    g_dmg_config.save_slot = cfg_save_slot;
+    g_dmg_config.load_slot = cfg_load_slot;
+    g_dmg_config.extra_opt1 = cfg_palette;
+    g_dmg_config.extra_opt2 = cfg_shimmerless ? 0u : 1u;
+    dmg_config_save(&s_ws_desc);
 }
 
-Ps2Kbd_Mrmltr ps2kbd(
-        pio1,
-        0,
-        process_kbd_report);
-
-
-
-i2s_config_t i2s_config;
-
-typedef struct __attribute__((__packed__)) {
-    bool is_directory;
-    bool is_executable;
-    size_t size;
-    char filename[79];
-} file_item_t;
-
-constexpr int max_files = 320;
-file_item_t *fileItems = (file_item_t *) (&SCREEN[0][0] + TEXTMODE_COLS * TEXTMODE_ROWS * 2);
-
-int compareFileItems(const void *a, const void *b) {
-    const auto *itemA = (file_item_t *) a;
-    const auto *itemB = (file_item_t *) b;
-    // Directories come first
-    if (itemA->is_directory && !itemB->is_directory)
-        return -1;
-    if (!itemA->is_directory && itemB->is_directory)
-        return 1;
-    // Sort files alphabetically
-    return strcmp(itemA->filename, itemB->filename);
+static void load_config(void) {
+    dmg_config_load(&s_ws_desc);
+    cfg_scale = (ili9341_scale_mode_t)g_dmg_config.scale_mode;
+    cfg_grid = g_dmg_config.grid_effect != 0;
+    cfg_interleave = g_dmg_config.interleave != 0;
+    cfg_turbo = g_dmg_config.turbo_mode != 0;
+    cfg_volume = (uint8_t)g_dmg_config.volume_level;
+    cfg_bright = (uint8_t)g_dmg_config.brightness_level;
+    cfg_save_slot = (uint8_t)g_dmg_config.save_slot;
+    cfg_load_slot = (uint8_t)g_dmg_config.load_slot;
+    cfg_palette = (uint8_t)g_dmg_config.extra_opt1;
+    cfg_shimmerless = (g_dmg_config.extra_opt2 != 1u);
 }
 
-bool isExecutable(const char pathname[255], const char *extensions) {
-    char *pathCopy = strdup(pathname);
-    const char *token = strrchr(pathCopy, '.');
+static bool rom_file_selector(char *out, size_t max) {
+    return dmg_rom_selector(&s_ws_desc, out, max);
+}
 
-    if (token == nullptr) {
+/* Reads the cartridge straight from the SD card into PSRAM.
+ *
+ * On the console build (PSRAM_CS_PIN != 0) this replaces the flash XIP path, and
+ * the reason is visible in the numbers rather than in principle:
+ *
+ *  - WonderSwan carts go up to 4 MB, and WS_ROM_CACHE_MAX is exactly 4 MB, so
+ *    the flash path erases and rewrites megabytes of QSPI on every load. That is
+ *    what the persistent cache header, the 32-block spot check and the
+ *    safe_flash_range_* wrappers all exist to make bearable, and it is the most
+ *    likely reason loading a large cart approaches the 6 s watchdog.
+ *  - The HW_CONFIG 15 build sits at 92% SRAM with ~37 KB of heap, because the
+ *    cart SRAM (64 KB), internal RAM (64 KB), external EEPROM (8 KB) and the
+ *    320x240 framebuffer (153 KB) are all in on-chip RAM. The ROM was never in
+ *    SRAM -- it was in flash -- so moving it to PSRAM does not free any of that,
+ *    but it does remove the 4 MB ceiling and the re-flash cost.
+ *
+ * The image is byte-identical to what the flash path held, and the core is
+ * read-only with respect to it: cpu_readmem20 is the only reader, cpu_writemem20
+ * drops every bank above 1, and the Detective Conan self-modifying patch is
+ * already virtualised into a 5-byte lookup table inside the read path
+ * (src/oswan/memory.c). So pointing ws_rom at a PSRAM block changes nothing
+ * about how the core sees the cartridge.
+ *
+ * Allocation goes through Frens::f_malloc (the allocator the PSRAM window was
+ * registered with) and release through Frens::f_free. Never free() on these
+ * blocks: plain free() comes from the SRAM heap, and handing it a lwmem block
+ * corrupts the heap and hangs the MCU on the way out of a game. */
+static bool ws_load_rom_to_psram(FIL *fil, uint32_t size, const char *filename) {
+    if (size == 0) {
+        printf("[E] Refusing to load a zero-byte ROM into PSRAM\n");
         return false;
     }
 
-    token++;
-
-    while (token != NULL) {
-        if (strstr(extensions, token) != NULL) {
-            free(pathCopy);
-            return true;
-        }
-        token = strtok(NULL, ",");
+    /* Release the previous game FIRST, before the space check below.
+     *
+     * The ordering matters and was the bug that made a second ROM impossible
+     * without rebooting: GetAvailableMemory() still counts the block that the
+     * previous game occupies, so checking the new size against it rejected a
+     * cartridge of exactly the size that had just loaded successfully -- and
+     * because the early return happened above this free, the block was never
+     * released either, so every later attempt failed the same way. Release
+     * first, then the allocator sees the real free total. */
+    if (s_rom_in_psram && s_rom_ptr) {
+        printf("[I] Freeing previous PSRAM ROM at 0x%08x\n",
+               (unsigned)(uintptr_t)s_rom_ptr);
+        Frens::f_free(s_rom_ptr);
+        s_rom_ptr = NULL;
+        s_rom_in_psram = false;
     }
-    free(pathCopy);
-    return false;
-}
 
-bool filebrowser_loadfile(const char pathname[256]) {
-    UINT bytes_read = 0;
-    FIL file;
-
-    constexpr int window_y = (TEXTMODE_ROWS - 5) / 2;
-    constexpr int window_x = (TEXTMODE_COLS - 43) / 2;
-
-    draw_window("Loading ROM", window_x, window_y, 43, 5);
-
-    FILINFO fileinfo;
-    f_stat(pathname, &fileinfo);
-    rom_size = fileinfo.fsize;
-    if ((16384 - 64) << 10 < fileinfo.fsize) {
-        draw_text("ERROR: ROM too large! Canceled!!", window_x + 1, window_y + 2, 13, 1);
-        sleep_ms(5000);
+    /* f_malloc panics on failure, so the size has to be checked up front rather
+     * than discovered by the allocator -- panic is an infinite loop, and it
+     * presents as a black screen after the ROM loads. The margin covers the
+     * menu's own scratch allocations plus lwmem bookkeeping. */
+    const uint32_t margin = 512u * 1024u;
+    const uint32_t avail = (uint32_t)Frens::GetAvailableMemory();
+    if (avail > margin && size > (avail - margin)) {
+        printf("[E] ROM needs %u bytes, only %u usable in PSRAM\n",
+               (unsigned)size, (unsigned)(avail - margin));
         return false;
     }
 
-
-    draw_text("Loading...", window_x + 1, window_y + 2, 10, 1);
-    sleep_ms(500);
-
-
-    multicore_lockout_start_blocking();
-    auto flash_target_offset = FLASH_TARGET_OFFSET;
-    const uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(flash_target_offset, fileinfo.fsize);
-    restore_interrupts(ints);
-
-    if (FR_OK == f_open(&file, pathname, FA_READ)) {
-        uint8_t buffer[FLASH_PAGE_SIZE];
-
-        do {
-            f_read(&file, &buffer, FLASH_PAGE_SIZE, &bytes_read);
-
-            if (bytes_read) {
-                const uint32_t ints = save_and_disable_interrupts();
-                flash_range_program(flash_target_offset, buffer, FLASH_PAGE_SIZE);
-                restore_interrupts(ints);
-
-                gpio_put(PICO_DEFAULT_LED_PIN, flash_target_offset >> 13 & 1);
-
-                flash_target_offset += FLASH_PAGE_SIZE;
-            }
-        } while (bytes_read != 0);
-
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
+    uint8_t *buf = (uint8_t *)Frens::f_malloc(size);
+    if (!buf) {
+        printf("[E] PSRAM allocation of %u bytes failed\n", (unsigned)size);
+        return false;
     }
-    f_close(&file);
-    multicore_lockout_end_blocking();
-    // restore_interrupts(ints);
 
-    strcpy(filename, fileinfo.fname);
+    /* Published before the read so a failed load is still recognisable. */
+    s_rom_ptr = buf;
+    s_rom_in_psram = true;
 
+    dmg_draw_loading_screen(&s_ws_desc, "CARREGANDO WS ROM", filename, size);
+    Frens::blinkLed(true);
+
+    /* Read in chunks so the progress bar reflects real progress, and so a short
+     * read stops the loop instead of leaving the tail of the buffer
+     * uninitialised -- the NEC V30 would then execute whatever was in PSRAM. */
+    const uint32_t PSRAM_READ_CHUNK = 16u * 1024u;
+    uint32_t bytes_loaded = 0;
+    bool ok = true;
+    f_lseek(fil, 0);
+
+    while (bytes_loaded < size) {
+        watchdog_update();
+        uint32_t want = size - bytes_loaded;
+        if (want > PSRAM_READ_CHUNK) want = PSRAM_READ_CHUNK;
+        UINT br = 0;
+        FRESULT r = f_read(fil, buf + bytes_loaded, want, &br);
+        if (r != FR_OK || br == 0) {
+            printf("[E] f_read failed at %u/%u: %d\n",
+                   (unsigned)bytes_loaded, (unsigned)size, (int)r);
+            ok = false;
+            break;
+        }
+        bytes_loaded += br;
+        dmg_update_loading_progress(&s_ws_desc, bytes_loaded, size);
+    }
+
+    Frens::blinkLed(false);
+    f_lseek(fil, 0);
+
+    if (!ok) {
+        Frens::f_free(buf);
+        s_rom_ptr = NULL;
+        s_rom_in_psram = false;
+        f_close(fil);
+        return false;
+    }
+
+    /* Same CRC the flash path records, so save states and the config file keep
+     * working across the two paths. */
+    uint32_t crc = 0;
+    for (uint32_t i = 0; i < bytes_loaded; i++) crc = (crc << 1) ^ buf[i];
+    Frens::setCrcOfLoadedRom(crc);
+
+    /* Close here rather than leaving s_fil open for the whole session. The
+     * flash path has always closed before returning (main.cpp:602); keeping it
+     * open across the game meant the same FIL object was handed to f_open()
+     * again on the next selection, with FatFs's per-file sector window still
+     * live. Nothing reads the file during play, so this is free. */
+    f_close(fil);
+
+    printf("[I] ROM in PSRAM at 0x%08x: %u bytes\n",
+           (unsigned)(uintptr_t)buf, (unsigned)bytes_loaded);
+    s_last_flashed_size = bytes_loaded;
     return true;
 }
 
-void filebrowser(const char pathname[256], const char executables[11]) {
-    bool debounce = true;
-    char basepath[256];
-    char tmp[TEXTMODE_COLS + 1];
-    strcpy(basepath, pathname);
-    constexpr int per_page = TEXTMODE_ROWS - 3;
-
-    DIR dir;
-    FILINFO fileInfo;
-
-    if (FR_OK != f_mount(&fs, "SD", 1)) {
-        draw_text("SD Card not inserted or SD Card error!", 0, 0, 12, 0);
-        while (true);
+static bool flash_load_rom(const char *filename) {
+    const char *rdir = dmg_get_current_rom_dir();
+    if (!rdir || rdir[0] == '\0') rdir = "0:/roms/ws";
+    snprintf(s_full_path, sizeof(s_full_path), "%s/%s", rdir, filename);
+    if (f_open(&s_fil, s_full_path, FA_READ) != FR_OK) {
+        snprintf(s_full_path, sizeof(s_full_path), "0:/roms/ws/%s", filename);
+        if (f_open(&s_fil, s_full_path, FA_READ) != FR_OK) return false;
     }
+
+    FSIZE_t fsz = f_size(&s_fil);
+    if (fsz < 512) { f_close(&s_fil); return false; }
+    uint32_t size = (uint32_t)fsz;
+
+    /* Console build: read the ROM straight into PSRAM. Placed before the cache
+     * header check because that header describes the flash window, which this
+     * path never writes. The 4 MB WS_ROM_CACHE_MAX ceiling applies only to the
+     * flash window, so it is not checked here. */
+    if (Frens::isPsramEnabled()) {
+        return ws_load_rom_to_psram(&s_fil, size, filename);
+    }
+
+    if (size > WS_ROM_CACHE_MAX) { f_close(&s_fil); return false; }
+
+    char clean[64];
+    dmg_sanitize_basename(filename, clean, sizeof(clean));
+
+    const PicoWS_Cache_Header_t *hdr = (const PicoWS_Cache_Header_t *)WS_CACHE_HDR_ABS;
+    bool flashed = false;
+    if (hdr->magic == WS_CACHE_MAGIC && hdr->rom_size == size &&
+        strncmp(hdr->filename, clean, sizeof(clean)) == 0) {
+        /* Spot-check 32 blocks */
+        static uint8_t sbuf[512];
+        bool ok = true;
+        uint32_t hash = 2166136261u;
+        for (int i = 0; i < 32 && ok; i++) {
+            uint32_t off = (size > 512) ? (uint32_t)(((uint64_t)i * (size-512))/31) : 0;
+            off &= ~3u;
+            if (f_lseek(&s_fil, off) != FR_OK) { ok=false; break; }
+            UINT br=0;
+            if (f_read(&s_fil, sbuf, 512, &br) != FR_OK || br != 512) { ok=false; break; }
+            if (memcmp((const void*)(WS_ROM_CACHE_ABS + off), sbuf, 512) != 0) { ok=false; break; }
+            const uint32_t *p = (const uint32_t *)sbuf;
+            for (int w=0;w<128;w++) hash = (hash ^ p[w]) * 16777619u;
+        }
+        if (ok && hash == hdr->sample_crc) flashed = true;
+    }
+    f_lseek(&s_fil, 0);
+
+    if (!flashed) {
+        dmg_draw_loading_screen(&s_ws_desc, "CARREGANDO FLASH", filename, size);
+
+        static uint8_t blk[4096];
+        uint32_t off = 0;
+        while (off < size) {
+            watchdog_update();
+            uint32_t chunk = (size - off > sizeof(blk)) ? sizeof(blk) : (size - off);
+            UINT rd = 0;
+            if (f_read(&s_fil, blk, chunk, &rd) != FR_OK || rd != chunk) {
+                f_close(&s_fil); return false;
+            }
+            uint32_t prog = (chunk + FLASH_PAGE_SIZE - 1u) & ~(FLASH_PAGE_SIZE - 1u);
+            if (prog > chunk) memset(blk + chunk, 0xFF, prog - chunk);
+
+            if ((off % FLASH_BLOCK_SIZE) == 0u) {
+                safe_flash_range_erase(WS_ROM_CACHE_OFF + off, FLASH_BLOCK_SIZE);
+            }
+            for (uint32_t p = 0; p < prog; p += FLASH_PAGE_SIZE) {
+                safe_flash_range_program(WS_ROM_CACHE_OFF + off + p, blk + p, FLASH_PAGE_SIZE);
+            }
+
+            if (memcmp((const void *)(WS_ROM_CACHE_ABS + off), blk, chunk) != 0) {
+                printf("[E] Flash verification failed at offset %u!\n", (unsigned)off);
+                f_close(&s_fil);
+                return false;
+            }
+
+            off += chunk;
+            dmg_update_loading_progress(&s_ws_desc, off, size);
+        }
+
+        uint32_t crc = compute_ws_sample_hash((const uint8_t *)WS_ROM_CACHE_ABS, size);
+        static PicoWS_Cache_Header_t nhdr __aligned(4);
+        memset(&nhdr, 0, sizeof(nhdr));
+        nhdr.magic      = WS_CACHE_MAGIC;
+        nhdr.rom_size   = size;
+        nhdr.sample_crc = crc;
+        strncpy(nhdr.filename, clean, sizeof(nhdr.filename)-1);
+        safe_flash_range_erase(WS_CACHE_HDR_OFF, FLASH_SECTOR_SIZE);
+        safe_flash_range_program(WS_CACHE_HDR_OFF, (const uint8_t *)&nhdr, FLASH_PAGE_SIZE);
+    } else {
+        dmg_draw_loading_screen(&s_ws_desc, "CARREGANDO FLASH", filename, size);
+        dmg_update_loading_progress(&s_ws_desc, size, size);
+        sleep_ms(150);
+    }
+
+    apply_safe_qmi_timing();
+    f_close(&s_fil);
+    s_last_flashed_size = size;
+    return true;
+}
+
+static void draw_image_row(uint8_t idx, bool selected, ili9341_scale_mode_t scale, bool vertical, bool grid, bool shimmerless, bool interleave, uint8_t palette) {
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
+    uint16_t y = (uint16_t)(DMG_UI_INGAME_LIST_START_Y + (uint16_t)idx * DMG_UI_ITEM_HEIGHT);
+    dmg_palette_t pal;
+    dmg_get_palette(&s_ws_desc, &pal);
+    uint16_t bg = selected ? pal.sel : pal.bg;
+
+    ili9341_fill_rect(wx, y, ww, DMG_UI_ITEM_HEIGHT, bg);
+
+    char buf[44];
+    buf[0] = '\0';
+
+    if (idx == 0) {
+        const char *scale_names[] = { "< Fit >", "< Stretch >", "< Integer >" };
+        snprintf(buf, sizeof(buf), "Scale:        %s", scale_names[scale]);
+    } else if (idx == 1) {
+        snprintf(buf, sizeof(buf), "Orientation:  %s", vertical ? "< Vertical >" : "< Horizontal >");
+    } else if (idx == 2) {
+        snprintf(buf, sizeof(buf), "Effect:       %s", grid ? "< Grid >" : "< None >");
+    } else if (idx == 3) {
+        snprintf(buf, sizeof(buf), "Filter:       %s", shimmerless ? "< Shimmerless >" : "< Sharp >");
+    } else if (idx == 4) {
+        snprintf(buf, sizeof(buf), "Screen:       %s", interleave ? "< Interleave >" : "< Progressive >");
+    } else if (idx == 5) {
+        if (ws_gpu_operatingInColor) {
+            snprintf(buf, sizeof(buf), "Palette:      < N/A (Color) >");
+        } else {
+            const char *pal_names[] = { "< Default >", "< Amber >", "< Green >" };
+            snprintf(buf, sizeof(buf), "Palette:      %s", pal_names[palette % 3]);
+        }
+    }
+
+    ili9341_text(buf, wx + 12, (uint16_t)(y + 7u), selected ? pal.text_sel : pal.text, bg);
+    ili9341_flush_rows(y, y + DMG_UI_ITEM_HEIGHT - 1);
+}
+
+static void image_submenu(const char *game_name) {
+    uint8_t cursor = 0;
+    bool prev_up = true, prev_down = true, prev_left = true, prev_right = true;
+    bool prev_a = true, prev_b = true;
+
+    ili9341_scale_mode_t sel_scale = cfg_scale;
+    bool sel_vertical = s_ws_vertical;
+    bool sel_grid = cfg_grid;
+    bool sel_shimmerless = cfg_shimmerless;
+    bool sel_interleave = cfg_interleave;
+    uint8_t sel_palette = cfg_palette;
+
+    dmg_palette_t pal;
+    dmg_get_palette(&s_ws_desc, &pal);
+
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
+
+    if (dmg_is_gb_mode()) {
+        ili9341_fill_screen(0x0000);
+        ili9341_fill_rect(wx, 0, ww, 240, pal.bg);
+    } else {
+        ili9341_fill_screen(pal.bg);
+    }
+    dmg_draw_top_bar(&s_ws_desc, APP_TITLE, "Image Settings");
+    dmg_draw_game_bar(&s_ws_desc, game_name);
+    dmg_draw_bottom_bar(&s_ws_desc, "L/R: Adjust", "B: Apply & Back");
+
+    for (uint8_t i = 0; i < 6; i++) {
+        draw_image_row(i, cursor == i, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+    }
+    ili9341_flush_rows(DMG_UI_INGAME_LIST_START_Y + 6 * DMG_UI_ITEM_HEIGHT, 218);
+
+    wait_buttons_released();
 
     while (true) {
-        memset(fileItems, 0, sizeof(file_item_t) * max_files);
-        int total_files = 0;
+        watchdog_update();
+        bool up, down, left, right, a, b, sel, start;
+        read_ui_buttons(&up, &down, &left, &right, &a, &b, &sel, &start);
 
-        snprintf(tmp, TEXTMODE_COLS, "SD:\\%s", basepath);
-        draw_window(tmp, 0, 0, TEXTMODE_COLS, TEXTMODE_ROWS - 1);
-        memset(tmp, ' ', TEXTMODE_COLS);
+        if (b && !prev_b) {
+            cfg_scale = sel_scale;
+            s_ws_vertical = sel_vertical;
+            cfg_grid = sel_grid;
+            cfg_shimmerless = sel_shimmerless;
+            cfg_interleave = sel_interleave;
+            cfg_palette = sel_palette;
+            ili9341_set_scale_mode(cfg_scale);
+            ili9341_set_ws_vertical(s_ws_vertical);
+            ili9341_set_grid_effect(cfg_grid);
+            ili9341_set_shimmerless(cfg_shimmerless);
+            ili9341_set_interleave(cfg_interleave);
+            if (!ws_gpu_operatingInColor) {
+                ws_set_colour_scheme(cfg_palette);
+            }
+            ili9341_invalidate_ws_palette();
+            save_config();
+            break;
+        }
 
+        if (up && !prev_up) {
+            if (cursor > 0) {
+                draw_image_row(cursor, false, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+                cursor--;
+                draw_image_row(cursor, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        }
+        if (down && !prev_down) {
+            if (cursor < 5) {
+                draw_image_row(cursor, false, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+                cursor++;
+                draw_image_row(cursor, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        }
 
-        draw_text(tmp, 0, 29, 0, 0);
-        auto off = 0;
-        draw_text("START", off, 29, 7, 0);
-        off += 5;
-        draw_text(" Run at cursor ", off, 29, 0, 3);
-        off += 16;
-        draw_text("SELECT", off, 29, 7, 0);
-        off += 6;
-        draw_text(" Run previous  ", off, 29, 0, 3);
-#ifndef TFT
-        off += 16;
-        draw_text("ARROWS", off, 29, 7, 0);
-        off += 6;
-        draw_text(" Navigation    ", off, 29, 0, 3);
-        off += 16;
-        draw_text("A/F10", off, 29, 7, 0);
-        off += 5;
-        draw_text(" USB DRV ", off, 29, 0, 3);
+        if (cursor == 0) {
+            if ((left && !prev_left) || (a && !prev_a)) {
+                sel_scale = (sel_scale == SCALE_FIT) ? SCALE_INTEGER : (ili9341_scale_mode_t)(sel_scale - 1);
+                draw_image_row(0, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            } else if (right && !prev_right) {
+                sel_scale = (sel_scale == SCALE_INTEGER) ? SCALE_FIT : (ili9341_scale_mode_t)(sel_scale + 1);
+                draw_image_row(0, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        } else if (cursor == 1) {
+            if ((left && !prev_left) || (right && !prev_right) || (a && !prev_a)) {
+                sel_vertical = !sel_vertical;
+                draw_image_row(1, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        } else if (cursor == 2) {
+            if ((left && !prev_left) || (right && !prev_right) || (a && !prev_a)) {
+                sel_grid = !sel_grid;
+                draw_image_row(2, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        } else if (cursor == 3) {
+            if ((left && !prev_left) || (right && !prev_right) || (a && !prev_a)) {
+                sel_shimmerless = !sel_shimmerless;
+                draw_image_row(3, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        } else if (cursor == 4) {
+            if ((left && !prev_left) || (right && !prev_right) || (a && !prev_a)) {
+                sel_interleave = !sel_interleave;
+                draw_image_row(4, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+            }
+        } else if (cursor == 5) {
+            if (!ws_gpu_operatingInColor) {
+                if ((left && !prev_left) || (right && !prev_right) || (a && !prev_a)) {
+                    sel_palette = (sel_palette + 1) % 3;
+                    draw_image_row(5, true, sel_scale, sel_vertical, sel_grid, sel_shimmerless, sel_interleave, sel_palette);
+                }
+            }
+        }
+
+        prev_up = up; prev_down = down; prev_left = left; prev_right = right;
+        prev_a = a; prev_b = b;
+        sleep_ms(20);
+    }
+    wait_buttons_released();
+}
+
+/* =========================================================================
+ * In-game pause menu (shared_menu wrapper)
+ * ========================================================================= */
+typedef enum {
+    INGAME_ACTION_RESUME = 0,
+    INGAME_ACTION_RESET,
+    INGAME_ACTION_EXIT
+} ingame_action_e;
+
+static ingame_action_e show_ingame_menu(const char *game_name) {
+    watchdog_disable();
+    dmg_action_t act = dmg_ingame_menu(&s_ws_desc, game_name);
+    if (act == DMG_ACTION_RESUME || act == DMG_ACTION_RESET) {
+        ili9341_clear_black();
+        ili9341_blitter_start();
+        watchdog_enable(6000, false);
+    }
+    return (ingame_action_e)act;
+}
+
+/* =========================================================================
+ * Game loop
+ * ========================================================================= */
+static volatile bool s_req_pause = false;
+static volatile bool s_req_exit  = false;
+
+/* Interpose ws_executeLine: stream each rendered scanline to ILI9341 */
+extern uint32_t ws_shades[16];
+
+static void run_game(void) {
+    apply_safe_qmi_timing();
+    /* The console build holds the ROM in PSRAM (s_rom_ptr); the HW15 build
+     * programs it into the flash XIP window. Same bytes, same contract:
+     * ws_memory_init() stores the pointer verbatim and the core only ever
+     * reads through it. */
+    uint8_t *rom_base = s_rom_in_psram ? s_rom_ptr : (uint8_t *)WS_ROM_CACHE_ABS;
+    ws_init(rom_base, s_last_flashed_size);
+    ws_reset();
+    ws_romHeaderStruct *hdr = ws_rom_getHeader(rom_base, s_last_flashed_size);
+    const char *ext = strrchr(s_selected_rom, '.');
+    if ((hdr && hdr->minimumSupportSystem == WS_SYSTEM_COLOR) || (ext && strcasecmp(ext, ".wsc") == 0))
+        ws_set_system(WS_SYSTEM_COLOR);
+    else
+        ws_set_system(WS_SYSTEM_MONO);
+    /* Also on a colour system: a game can run in the console's mono mode (port 0x60 bit 7
+     * clear) and then draws with the shade table. */
+    ws_set_colour_scheme(cfg_palette);
+    ili9341_invalidate_ws_palette();
+
+    char clean_name[64];
+    get_basename(s_selected_rom, clean_name, sizeof(clean_name));
+    char sav_path[ROM_NAME_LEN + 32];
+    snprintf(sav_path, sizeof(sav_path), "%s/%s.sav", get_saves_dir(), clean_name);
+    ws_sram_load(sav_path);
+
+    /* Auto-detect if game is vertically oriented from ROM header */
+    extern int ws_rotated(void);
+    s_ws_vertical = ws_rotated() ? true : false;
+
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN
+    if (s_ws_vframe == nullptr) {
+        s_ws_vframe = (uint8_t *)Frens::f_malloc(144 * 224);
+        if (s_ws_vframe) memset(s_ws_vframe, 0, 144 * 224);
+    }
 #endif
+    ili9341_clear_black();
+    ili9341_set_scale_mode(cfg_scale);
+    ili9341_set_ws_vertical(s_ws_vertical);
+    ili9341_set_grid_effect(cfg_grid);
+    ili9341_set_shimmerless(cfg_shimmerless);
+    ili9341_set_interleave(cfg_interleave);
+    ili9341_set_fps_overlay(cfg_fps, "60");
+    ili9341_blitter_start();
 
-        if (FR_OK != f_opendir(&dir, basepath)) {
-            draw_text("Failed to open directory", 1, 1, 4, 0);
-            while (true);
+    s_req_pause = false;
+    s_req_exit  = false;
+
+    uint32_t fps_timer   = time_us_32();
+    uint32_t frame_timer = time_us_32();
+    uint32_t frame_cnt   = 0;
+    int32_t  lag_us      = 0;   /* how far behind real time the last frame ended */
+    uint8_t  skipped_in_row = 0;
+    bool     audio_primed = false;  /* ring has reached its working level at least once */
+    /* Drop any half-finished SELECT+START hold or closed edge latch left over
+     * from the previous game. */
+    dmg_combo_reset();
+
+    /* 60 Hz frame pacing matching ILI9341 TFT refresh (~16680 us) */
+    const uint32_t BASE_FRAME_US = 16680u;
+
+    watchdog_enable(6000, false);
+
+    /* Framebuffer for scanline streaming */
+    /* WS renders into internalRam regions; we capture scanlines in a static buffer */
+    static uint8_t __aligned(4) s_scanline_buf[224];
+
+    while (!s_req_exit) {
+        watchdog_update();
+        dmg_pad_t pad_in;
+        read_ui_buttons(&pad_in.up, &pad_in.down, &pad_in.left, &pad_in.right,
+                        &pad_in.a, &pad_in.b, &pad_in.select, &pad_in.start);
+
+        /* Raw copies, read before the combo layer masks anything. The Tate
+         * rotation below has to know whether SELECT was pressed *together with*
+         * another button, and it is exactly those combinations the combo layer
+         * clears -- so the raw values are the only ones that still carry it.
+         * Reading the masked pad here would make SELECT+A rotate the screen
+         * when SELECT is released. */
+        const bool raw_sel   = pad_in.select;
+        const bool raw_start = pad_in.start;
+        const bool raw_a     = pad_in.a;
+        const bool raw_b     = pad_in.b;
+        const bool raw_up    = pad_in.up;
+        const bool raw_down  = pad_in.down;
+
+        /* Combos:
+         * START + B: In-game pause menu
+         * START + A: Toggle FPS overlay
+         * SELECT + START: Exit to ROM selector (held ~1 s)
+         * SELECT + A: Toggle 1x / 2x speed
+         * SELECT + UP / DOWN: Volume adjustment
+         * SELECT (single press): Toggle Horizontal / Vertical (Tate) orientation
+         */
+        dmg_combo_events_t ev;
+        dmg_combo_frame(&pad_in, &s_ws_desc, &ev);
+
+        if (ev.request_pause_menu) s_req_pause = true;
+        if (ev.request_exit_game)  s_req_exit = true;
+        if (ev.speed_toggled) {
+            printf("[I] Combo SELECT+A: speed = %s\n", cfg_turbo ? "2x" : "1x");
         }
 
-        if (strlen(basepath) > 0) {
-            strcpy(fileItems[total_files].filename, "..\0");
-            fileItems[total_files].is_directory = true;
-            fileItems[total_files].size = 0;
-            total_files++;
+        bool up = pad_in.up, down = pad_in.down;
+        bool left = pad_in.left, right = pad_in.right;
+        bool a = pad_in.a, b = pad_in.b;
+        bool sel = pad_in.select, start = pad_in.start;
+
+        /* Single SELECT press: Toggle Horizontal / Vertical orientation on release */
+        static bool s_sel_combo_active = false;
+        static bool s_last_sel = false;
+        if (raw_sel) {
+            if (raw_start || raw_up || raw_down || raw_a || raw_b) {
+                s_sel_combo_active = true;
+            }
+        } else {
+            if (s_last_sel && !s_sel_combo_active) {
+                s_ws_vertical = !s_ws_vertical;
+                ili9341_set_ws_vertical(s_ws_vertical);
+                ili9341_clear_black();
+            }
+            s_sel_combo_active = false;
+        }
+        s_last_sel = raw_sel;
+
+        if (s_req_pause && !s_req_exit) {
+            s_req_pause = false;
+            ingame_action_e action = show_ingame_menu(s_selected_rom);
+            if (action == INGAME_ACTION_EXIT)  { s_req_exit = true; break; }
+            if (action == INGAME_ACTION_RESET) {
+                ws_reset();
+                /* Reload the battery save, exactly as game entry does.
+                 *
+                 * ws_reset() itself does NOT clear ws_staticRam -- the memset on
+                 * that buffer in ws_memory_reset() is commented out in the Oswan
+                 * core -- so the cartridge SRAM survives in RAM. It does clear
+                 * internalRam, and the game re-probes its save locations from
+                 * power-on, so whatever the session had established in RAM was
+                 * not the state the game came up expecting.
+                 *
+                 * Reading the .sav back makes Reset deterministic and identical
+                 * to entering the game from the ROM selector, which is what
+                 * "restart with my progress" has to mean. This was the observed
+                 * symptom: the save loaded from the selector but not from the
+                 * menu's Reset.
+                 *
+                 * Note the .sav format (73728 B = ws_staticRam + externalEeprom)
+                 * does not include internalRam, and that is deliberate -- it
+                 * matches hardware, where work RAM is lost on reset and only the
+                 * cartridge-backed saves survive.
+                 *
+                 * Returns false when there is no .sav, which is correct: a game
+                 * played for the first time keeps the blank power-on state that
+                 * ws_reset() just produced. */
+                if (!ws_sram_load(sav_path)) {
+                    printf("[I] No battery save at %s (or unreadable) -- fresh game\n",
+                           sav_path);
+                }
+                frame_timer = time_us_32();
+                fps_timer = time_us_32();
+                frame_cnt = 0;
+            }
+            continue;
         }
 
-        while (f_readdir(&dir, &fileInfo) == FR_OK &&
-               fileInfo.fname[0] != '\0' &&
-               total_files < max_files
-                ) {
-            // Set the file item properties
-            fileItems[total_files].is_directory = fileInfo.fattrib & AM_DIR;
-            fileItems[total_files].size = fileInfo.fsize;
-            fileItems[total_files].is_executable = isExecutable(fileInfo.fname, executables);
-            strncpy(fileItems[total_files].filename, fileInfo.fname, 78);
-            total_files++;
-        }
-        f_closedir(&dir);
+        /* Feed input to WS */
+        extern uint8_t ws_key_up, ws_key_down, ws_key_left, ws_key_right;
+        extern uint8_t ws_key_button_1, ws_key_button_2, ws_key_start;
+        ws_key_up      = (uint8_t)up;
+        ws_key_down    = (uint8_t)down;
+        ws_key_left    = (uint8_t)left;
+        ws_key_right   = (uint8_t)right;
+        ws_key_button_1= (uint8_t)a;
+        ws_key_button_2= (uint8_t)b;
+        ws_key_start   = (uint8_t)start;
 
-        qsort(fileItems, total_files, sizeof(file_item_t), compareFileItems);
-
-        if (total_files > max_files) {
-            draw_text(" Too many files!! ", TEXTMODE_COLS - 17, 0, 12, 3);
-        }
-
-        int offset = 0;
-        int current_item = 0;
-
-        while (true) {
-            sleep_ms(100);
-
-            if (!debounce) {
-                debounce = !(nespad_state & DPAD_START || keyboard_bits.start);
-            }
-
-            // ESCAPE
-            if (nespad_state & DPAD_SELECT || keyboard_bits.select) {
-                return;
-            }
-
-            if (nespad_state & DPAD_DOWN || keyboard_bits.down) {
-                if (offset + (current_item + 1) < total_files) {
-                    if (current_item + 1 < per_page) {
-                        current_item++;
-                    } else {
-                        offset++;
-                    }
-                }
-            }
-
-            if (nespad_state & DPAD_UP || keyboard_bits.up) {
-                if (current_item > 0) {
-                    current_item--;
-                } else if (offset > 0) {
-                    offset--;
-                }
-            }
-
-            if (nespad_state & DPAD_RIGHT || keyboard_bits.right) {
-                offset += per_page;
-                if (offset + (current_item + 1) > total_files) {
-                    offset = total_files - (current_item + 1);
-                }
-            }
-
-            if (nespad_state & DPAD_LEFT || keyboard_bits.left) {
-                if (offset > per_page) {
-                    offset -= per_page;
-                } else {
-                    offset = 0;
-                    current_item = 0;
-                }
-            }
-
-            if (debounce && (nespad_state & DPAD_START || keyboard_bits.start)) {
-                auto file_at_cursor = fileItems[offset + current_item];
-
-                if (file_at_cursor.is_directory) {
-                    if (strcmp(file_at_cursor.filename, "..") == 0) {
-                        const char *lastBackslash = strrchr(basepath, '\\');
-                        if (lastBackslash != nullptr) {
-                            const size_t length = lastBackslash - basepath;
-                            basepath[length] = '\0';
-                        }
-                    } else {
-                        sprintf(basepath, "%s\\%s", basepath, file_at_cursor.filename);
-                    }
-                    debounce = false;
-                    break;
-                }
-
-                if (file_at_cursor.is_executable) {
-                    sprintf(tmp, "%s\\%s", basepath, file_at_cursor.filename);
-
-                    filebrowser_loadfile(tmp);
-                    return;
-                }
-            }
-
-            for (int i = 0; i < per_page; i++) {
-                uint8_t color = 11;
-                uint8_t bg_color = 1;
-
-                if (offset + i < max_files) {
-                    const auto item = fileItems[offset + i];
-
-
-                    if (i == current_item) {
-                        color = 0;
-                        bg_color = 3;
-                        memset(tmp, 0xCD, TEXTMODE_COLS - 2);
-                        tmp[TEXTMODE_COLS - 2] = '\0';
-                        draw_text(tmp, 1, per_page + 1, 11, 1);
-                        snprintf(tmp, TEXTMODE_COLS - 2, " Size: %iKb, File %lu of %i ", item.size / 1024,
-                                 offset + i + 1,
-                                 total_files);
-                        draw_text(tmp, 2, per_page + 1, 14, 3);
-                    }
-
-                    const auto len = strlen(item.filename);
-                    color = item.is_directory ? 15 : color;
-                    color = item.is_executable ? 10 : color;
-                    //color = strstr((char *)rom_filename, item.filename) != nullptr ? 13 : color;
-
-                    memset(tmp, ' ', TEXTMODE_COLS - 2);
-                    tmp[TEXTMODE_COLS - 2] = '\0';
-                    memcpy(&tmp, item.filename, len < TEXTMODE_COLS - 2 ? len : TEXTMODE_COLS - 2);
-                } else {
-                    memset(tmp, ' ', TEXTMODE_COLS - 2);
-                }
-                draw_text(tmp, 1, i + 1, color, bg_color);
-            }
-        }
-    }
-}
-
-enum menu_type_e {
-    NONE,
-    INT,
-    TEXT,
-    ARRAY,
-
-    SAVE,
-    LOAD,
-    ROM_SELECT,
-    RETURN,
-};
-
-typedef bool (*menu_callback_t)();
-
-typedef struct __attribute__((__packed__)) {
-    const char *text;
-    menu_type_e type;
-    const void *value;
-    menu_callback_t callback;
-    uint8_t max_value;
-    char value_list[15][10];
-} MenuItem;
-
-int save_slot = 0;
-uint16_t frequencies[] = { 378, 396, 404, 408, 412, 416, 420, 424, 432 };
-uint8_t frequency_index = 0;
-
-bool overclock() {
-    hw_set_bits(&vreg_and_chip_reset_hw->vreg, VREG_AND_CHIP_RESET_VREG_VSEL_BITS);
-    sleep_ms(10);
-    return set_sys_clock_khz(frequencies[frequency_index] * KHZ, true);
-}
-
-bool save() {
-    char pathname[255];
-//    const size_t size = supervision_save_state_buf_size();
-//    uint8_t data[size];
-
-    if (save_slot) {
-        sprintf(pathname, "%s\\%s_%d.save", HOME_DIR, filename, save_slot);
-    } else {
-        sprintf(pathname, "%s\\%s.save", HOME_DIR, filename);
-    }
-
-    FRESULT fr = f_mount(&fs, "", 1);
-    FIL fd;
-    fr = f_open(&fd, pathname, FA_CREATE_ALWAYS | FA_WRITE);
-    UINT bytes_writen;
-
-//    supervision_save_state_buf((uint8*)data, (uint32)size);
-//    f_write(&fd, data, size, &bytes_writen);
-    f_close(&fd);
-
-    return true;
-}
-
-bool load() {
-    char pathname[255];
-//    const size_t size = supervision_save_state_buf_size();
-//    auto * data = (uint8_t *)(malloc(size));
-
-    if (save_slot) {
-        sprintf(pathname, "%s\\%s_%d.save", HOME_DIR, filename, save_slot);
-    } else {
-        sprintf(pathname, "%s\\%s.save", HOME_DIR, filename);
-    }
-
-    FRESULT fr = f_mount(&fs, "", 1);
-    FIL fd;
-    fr = f_open(&fd, pathname, FA_READ);
-    UINT bytes_read;
-
-//    f_read(&fd, data, size, &bytes_read);
-//    supervision_load_state_buf((uint8*)data, (uint32)size);
-    f_close(&fd);
-
-//    free(data);
-    return true;
-}
-#if SOFTTV
-typedef struct tv_out_mode_t {
-    // double color_freq;
-    float color_index;
-    COLOR_FREQ_t c_freq;
-    enum graphics_mode_t mode_bpp;
-    g_out_TV_t tv_system;
-    NUM_TV_LINES_t N_lines;
-    bool cb_sync_PI_shift_lines;
-    bool cb_sync_PI_shift_half_frame;
-} tv_out_mode_t;
-extern tv_out_mode_t tv_out_mode;
-
-bool color_mode=true;
-bool toggle_color() {
-    color_mode=!color_mode;
-    if(color_mode) {
-        tv_out_mode.color_index= 1.0f;
-    } else {
-        tv_out_mode.color_index= 0.0f;
-    }
-
-    return true;
-}
+        /* Render-skip: when emulation has fallen behind real time, the next frame is
+         * emulated (so game speed and audio stay at 60 Hz) but not drawn; the panel just
+         * keeps the previous image. Never more than 2 in a row. */
+#if USE_I2S_AUDIO
+        /* With audio the DAC is the clock: skip drawing only when its buffer is running dry */
+        const bool behind = audio_primed && !cfg_turbo && audio_i2s_get_fill_permille() < 300;
+#else
+        const bool behind = lag_us > 2500;
 #endif
-int palette_index = 0;
-const MenuItem menu_items[] = {
-        { "Swap AB <> BA: %s", ARRAY, &swap_ab, nullptr, 1, { "NO ", "YES" }},
-        {},
-        //{ "Player 1: %s",        ARRAY, &player_1_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
-        //{ "Player 2: %s",        ARRAY, &player_2_input, 2, { "Keyboard ", "Gamepad 1", "Gamepad 2" }},
-//        {},
-//        { "Save state: %i", INT, &save_slot, &save, 5 },
-//        { "Load state: %i", INT, &save_slot, &load, 5 },
-        { "Palette: %s", ARRAY, &palette_index, nullptr, 2,
-          {
-                  "default",
-                  "amber  ",
-                  "green  "
-          }
-        },
-        {},
-#if SOFTTV
-        { "TV system %s", ARRAY, &tv_out_mode.tv_system, nullptr, 1, { "PAL ", "NTSC" } },
-        { "TV Lines %s", ARRAY, &tv_out_mode.N_lines, nullptr, 3, { "624", "625", "524", "525" } },
-        { "Freq %s", ARRAY, &tv_out_mode.c_freq, nullptr, 1, { "3.579545", "4.433619" } },
-        { "Colors: %s", ARRAY, &color_mode, &toggle_color, 1, { "NO ", "YES" } },
-        { "Shift lines %s", ARRAY, &tv_out_mode.cb_sync_PI_shift_lines, nullptr, 1, { "NO ", "YES" } },
-        { "Shift half frame %s", ARRAY, &tv_out_mode.cb_sync_PI_shift_half_frame, nullptr, 1, { "NO ", "YES" } },
+        const bool draw_frame = !(behind && skipped_in_row < 2);
+        skipped_in_row = draw_frame ? 0 : (uint8_t)(skipped_in_row + 1);
+
+        /* Emulate one frame: call ws_executeLine until VBL */
+        /* oswan renders 144 visible lines + 15 blank = 159 total */
+        int vbl = 0;
+        while (!vbl) {
+            vbl = ws_executeLine(s_scanline_buf, draw_frame ? 1 : 0);
+            extern uint8_t ws_gpu_scanline;
+            int line = (int)ws_gpu_scanline - 1;
+            if (line < 0) line = 143;
+            if (draw_frame && line < 144) {
+                if (!s_ws_vertical) {
+                    /* Horizontal mode: stream scanline directly */
+                    ili9341_stream_ws_line(line, s_scanline_buf, ws_shades);
+                } else {
+                    /* Vertical mode: cache line into full frame buffer */
+                    memcpy(s_ws_vframe + (size_t)line * 224, s_scanline_buf, 224);
+                }
+            }
+        }
+
+        if (draw_frame && s_ws_vertical) {
+            /* Vertical (Tate) mode: 224 display lines, each 144 pixels */
+            /* Rotated 90 degrees CCW: vx = 0..143, vy = 0..223 */
+            /* ox = 223 - vy, oy = vx */
+            static uint8_t __aligned(4) s_vline_buf[144];
+            for (int vy = 0; vy < 224; vy++) {
+                int ox = 223 - vy;
+                for (int vx = 0; vx < 144; vx++) {
+                    int oy = vx;
+                    s_vline_buf[vx] = s_ws_vframe[oy * 224 + ox];
+                }
+                ili9341_stream_ws_vline(vy, s_vline_buf, ws_shades);
+            }
+        }
+        if (draw_frame) ili9341_stream_ws_frame_end();
+        frame_cnt++;
+        uint32_t now = time_us_32();
+        if (now - fps_timer >= 1000000u) {
+            uint32_t fps_val = frame_cnt;
+            frame_cnt = 0;
+            fps_timer = now;
+            snprintf(s_fps_str, sizeof(s_fps_str), "%lu", (unsigned long)fps_val);
+            if (cfg_fps) ili9341_set_fps_overlay(true, s_fps_str);
+        }
+
+        /* Frame pacing (Turbo: half time) */
+        uint32_t frame_us = cfg_turbo ? (BASE_FRAME_US / 2) : BASE_FRAME_US;
+#if USE_I2S_AUDIO
+        if (!cfg_turbo) {
+            /* Audio-clock pacing. The I2S DAC consumes exactly 44100 samples/s and each
+             * frame produces 735, so holding its ring at ~half full locks the emulator to
+             * the DAC with no drift, and leaves ~1 frame of headroom to absorb a slow
+             * frame. Pacing by a wall-clock timer instead (16680 us vs the DAC's
+             * 16667 us) kept the ring nearly empty: any frame that ran long drained it
+             * and the DMA stalled -- the crackling heard on every frame-time wobble. */
+            const uint32_t t_wait = time_us_32();
+            int fill = audio_i2s_get_fill_permille();
+            while (fill > 550 && (time_us_32() - t_wait) < 40000u) {
+                watchdog_update();
+                busy_wait_us_32(100);
+                fill = audio_i2s_get_fill_permille();
+            }
+            if (fill >= 500) audio_primed = true;
+            lag_us = 0;
+            frame_timer = time_us_32();
+        } else
 #endif
         {
-                "Overclocking: %s MHz", ARRAY, &frequency_index, &overclock, count_of(frequencies) - 1,
-                { "378", "396", "404", "408", "412", "416", "420", "424", "432" }
-        },
-        { "Press START / Enter to apply", NONE },
-        { "Reset to ROM select", ROM_SELECT },
-        { "Return to game", RETURN }
-};
-#define MENU_ITEMS_NUMBER (sizeof(menu_items) / sizeof (MenuItem))
-
-void menu() {
-    bool exit = false;
-    graphics_set_mode(TEXTMODE_DEFAULT);
-    char footer[TEXTMODE_COLS];
-    snprintf(footer, TEXTMODE_COLS, ":: %s ::", PICO_PROGRAM_NAME);
-    draw_text(footer, TEXTMODE_COLS / 2 - strlen(footer) / 2, 0, 11, 1);
-    snprintf(footer, TEXTMODE_COLS, ":: %s build %s %s ::", PICO_PROGRAM_VERSION_STRING, __DATE__,
-             __TIME__);
-    draw_text(footer, TEXTMODE_COLS / 2 - strlen(footer) / 2, TEXTMODE_ROWS - 1, 11, 1);
-    uint current_item = 0;
-
-    while (!exit) {
-        for (int i = 0; i < MENU_ITEMS_NUMBER; i++) {
-            uint8_t y = i + (TEXTMODE_ROWS - MENU_ITEMS_NUMBER >> 1);
-            uint8_t x = TEXTMODE_COLS / 2 - 10;
-            uint8_t color = 0xFF;
-            uint8_t bg_color = 0x00;
-            if (current_item == i) {
-                color = 0x01;
-                bg_color = 0xFF;
-            }
-            const MenuItem *item = &menu_items[i];
-            if (i == current_item) {
-                switch (item->type) {
-                    case INT:
-                    case ARRAY:
-                        if (item->max_value != 0) {
-                            auto *value = (uint8_t *) item->value;
-                            if ((gamepad1_bits.right || keyboard_bits.right) && *value < item->max_value) {
-                                (*value)++;
-                            }
-                            if ((gamepad1_bits.left || keyboard_bits.left) && *value > 0) {
-                                (*value)--;
-                            }
-                        }
-                        break;
-                    case RETURN:
-                        if (gamepad1_bits.start || keyboard_bits.start)
-                            exit = true;
-                        break;
-
-                    case ROM_SELECT:
-                        if (gamepad1_bits.start || keyboard_bits.start) {
-                            reboot = true;
-                            return;
-                        }
-                        break;
-                    default:
-                        break;
-                }
-
-                if (nullptr != item->callback && (gamepad1_bits.start || keyboard_bits.start)) {
-                    exit = item->callback();
-                }
-            }
-            static char result[TEXTMODE_COLS];
-            switch (item->type) {
-                case INT:
-                    snprintf(result, TEXTMODE_COLS, item->text, *(uint8_t *) item->value);
-                    break;
-                case ARRAY:
-                    snprintf(result, TEXTMODE_COLS, item->text, item->value_list[*(uint8_t *) item->value]);
-                    break;
-                case TEXT:
-                    snprintf(result, TEXTMODE_COLS, item->text, item->value);
-                    break;
-                case NONE:
-                    color = 6;
-                default:
-                    snprintf(result, TEXTMODE_COLS, "%s", item->text);
-            }
-            draw_text(result, x, y, color, bg_color);
-        }
-
-        if (gamepad1_bits.down || keyboard_bits.down) {
-            current_item = (current_item + 1) % MENU_ITEMS_NUMBER;
-
-            if (menu_items[current_item].type == NONE)
-                current_item++;
-        }
-        if (gamepad1_bits.up || keyboard_bits.up) {
-            current_item = (current_item - 1 + MENU_ITEMS_NUMBER) % MENU_ITEMS_NUMBER;
-
-            if (menu_items[current_item].type == NONE)
-                current_item--;
-        }
-
-        sleep_ms(125);
-    }
-
-    ws_set_colour_scheme(palette_index);
-    for (int i = 0; i < 16; ++i) {
-        graphics_set_palette(i, ws_shades[i]);
-    }
-
-    graphics_set_mode(GRAPHICSMODE_DEFAULT);
-
-}
-
-/* Renderer loop on Pico's second core */
-void __time_critical_func(render_core)() {
-    multicore_lockout_victim_init();
-
-    i2s_config = i2s_get_default_config();
-    i2s_config.sample_freq = AUDIO_SAMPLE_RATE;
-    i2s_config.dma_trans_count = AUDIO_SAMPLE_RATE / 60;
-    i2s_volume(&i2s_config, 0);
-    i2s_init(&i2s_config);
-
-    ps2kbd.init_gpio();
-    nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
-
-    graphics_init();
-
-    const auto buffer = (uint8_t *) SCREEN;
-    graphics_set_buffer(buffer, 224, 144);
-    graphics_set_textbuffer(buffer);
-    graphics_set_bgcolor(0x000000);
-
-    graphics_set_offset(48,48);
-
-    graphics_set_flashmode(true, true);
-    sem_acquire_blocking(&vga_start_semaphore);
-
-    // 60 FPS loop
-#define frame_tick (16666)
-    uint64_t tick = time_us_64();
-    uint64_t last_frame_tick = tick;
-
-    while (true) {
-
-        if (tick >= last_frame_tick + frame_tick) {
-#ifdef TFT
-            refresh_lcd();
-#endif
-            ps2kbd.tick();
-            nespad_tick();
-
-            last_frame_tick = tick;
-        }
-
-        tick = time_us_64();
-
-        // tuh_task();
-        // hid_app_task();
-        tight_loop_contents();
-    }
-
-    __unreachable();
-}
-
-int frame, frame_cnt = 0;
-int frame_timer_start = 0;
-bool PSRAM_AVAILABLE = true;
-
-int main() {
-    overclock();
-
-//    stdio_init_all();
-
-    sem_init(&vga_start_semaphore, 0, 1);
-    multicore_launch_core1(render_core);
-    sem_release(&vga_start_semaphore);
-
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-
-    for (int i = 0; i < 6; i++) {
-        sleep_ms(33);
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
-        sleep_ms(33);
-        gpio_put(PICO_DEFAULT_LED_PIN, false);
-    }
-    init_psram();
-    if(!PSRAM_AVAILABLE) {
-        graphics_set_mode(TEXTMODE_DEFAULT);
-        draw_text("PSRAM ERROR", 0,0, 15,1);
-        while(1);
-    }
-    while (true) {
-        graphics_set_mode(TEXTMODE_DEFAULT);
-        filebrowser(HOME_DIR, "ws,wsc");
-
-        ws_init((uint8_t *)rom, rom_size);
-        if (filename[strlen(filename)-1]=='c'|| filename[strlen(filename)-1]=='C') {
-            ws_set_system(WS_SYSTEM_COLOR);
+        uint32_t target = frame_timer + frame_us;
+        uint32_t cur = time_us_32();
+        if ((int32_t)(target - cur) > 0) busy_wait_us_32(target - cur);
+        /* Being late is remembered (lag_us) instead of forgotten, so a frame that
+         * misses its slot is paid back by the next ones; beyond 3 frames behind we
+         * give up and resync (menu, SD hiccup...). */
+        const int32_t behind = (int32_t)(time_us_32() - target);
+        if (behind > 0) {
+            lag_us = behind;
+            frame_timer = (behind > (int32_t)(3 * frame_us)) ? time_us_32() : target;
+            if (behind > (int32_t)(3 * frame_us)) lag_us = 0;
         } else {
-            ws_set_system(WS_SYSTEM_MONO);
+            lag_us = 0;
+            frame_timer = target;
         }
-
-        ws_set_colour_scheme(0);
-        ws_reset();
-        for (int i = 0; i < 16; ++i) {
-            graphics_set_palette(i, ws_shades[i]);
         }
-
-        graphics_set_mode(GRAPHICSMODE_DEFAULT);
-
-        frame = 0;
-        while (!reboot) {
-            ws_key_start = gamepad1_bits.start;
-            ws_key_button_1 = gamepad1_bits.a;
-            ws_key_button_2 = gamepad1_bits.b;
-
-            ws_key_up = gamepad1_bits.up;
-            ws_key_down = gamepad1_bits.down;
-            ws_key_left = gamepad1_bits.left;
-            ws_key_right = gamepad1_bits.right;
-
-            if ((gamepad1_bits.start && gamepad1_bits.select) || (keyboard_bits.start && keyboard_bits.select)) {
-                menu();
-            }
-
-            while(!ws_executeLine((uint8_t *)SCREEN, frame % 2 == 0 ? 1 : 0 ));
-
-            frame++;
-            if (1) {
-
-                if (++frame_cnt == 6) {
-                    while (time_us_64() - frame_timer_start < 16666 * 6) {
-                        //busy_wait_at_least_cycles(10);
-                    }  // 60 Hz
-                    frame_timer_start = time_us_64();
-                    frame_cnt = 0;
-                }
-            }
-
-            tight_loop_contents();
-        }
-
-        reboot = false;
     }
-    __unreachable();
+
+    watchdog_disable();
+    ili9341_blitter_stop();
+    ws_sram_save(sav_path);
+    ws_done();
+    ili9341_clear_black();
+
+}
+
+/* =========================================================================
+ * Main
+ * ========================================================================= */
+int main(void) {
+    vreg_set_voltage(VREG_VOLTAGE_1_30);
+    set_sys_clock_khz(CPU_FREQ_KHZ, true);
+    apply_safe_qmi_timing();
+
+    /* Decouple SPI clock from CPU: PLL_USB → 140 MHz, SPI divisor 2 = 70 MHz */
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+    pll_init(pll_usb, 1, 840 * MHZ, 6, 1);
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                    140 * MHZ, 140 * MHZ);
+
+    stdio_init_all();
+
+#ifndef LED_GPIO_PIN
+#define LED_GPIO_PIN 25
+#endif
+    /* LED */
+    gpio_init(LED_GPIO_PIN);
+    gpio_set_dir(LED_GPIO_PIN, GPIO_OUT);
+    gpio_put(LED_GPIO_PIN, 1);
+
+    /* Hardware Buttons (GPIO 2..9) */
+    init_ui_buttons();
+
+    /* Configure SD card on SPI1 (HW_CONFIG 15/16: MISO=12, CS=13, SCK=14, MOSI=15)
+     *
+     * This is now BEFORE ili9341_init(), which inverts the order task 8 of
+     * AGENTS.md chose. That task moved the display up so an SD failure would be
+     * visible instead of a silently blinking LED -- which was right then, but
+     * ili9341_init() now calls dmg_panel_config_init() to read ST7789= from
+     * /boot.txt, and that needs the card mounted. Both are satisfied by mounting
+     * first and displaying the failure afterwards: the error screen below is
+     * unchanged, it is just drawn after the panel is known. */
+    static pico_fatfs_spi_config_t sd_config = {
+        SDCARD_SPI,
+        CLK_SLOW_DEFAULT,
+        CLK_FAST_DEFAULT_PIO,
+        SDCARD_PIN_MISO,
+        SDCARD_PIN_CS,
+        SDCARD_PIN_SCK,
+        SDCARD_PIN_MOSI,
+        true // use internal pullup
+    };
+    bool spi_configured = pico_fatfs_set_config(&sd_config);
+    if (!spi_configured) {
+        pico_fatfs_config_spi_pio(SDCARD_PIO, pio_claim_unused_sm(SDCARD_PIO, true));
+    }
+
+    /* Mount SD Card with retry */
+    FRESULT fr = f_mount(&s_fs, "", 1);
+    if (fr != FR_OK) {
+        sleep_ms(200);
+        fr = f_mount(&s_fs, "", 1);
+    }
+
+    /* Detect the PSRAM now that the card is mounted and the SD is quiescent.
+     * Frens::initAll() is the usual caller, but PicoWS never calls it (it drives
+     * the SD and display itself), so without this explicit call isPsramEnabled()
+     * stays false and f_malloc would fall back to the SRAM heap. Compiled out
+     * entirely when PSRAM_CS_PIN is 0, i.e. on the HW_CONFIG 15 board. */
+#if PICO_RP2350 && PSRAM_CS_PIN
+    if (Frens::initPsram()) {
+        printf("[I] PSRAM detected: %u KB available for cartridge ROMs\n",
+               (unsigned)(Frens::GetAvailableMemory() / 1024u));
+    } else {
+        printf("[W] PSRAM not detected; falling back to the flash ROM cache\n");
+    }
+#endif
+
+    /* Display init. Now after the mount so dmg_panel can read /boot.txt. */
+    ili9341_init();
+    set_brightness(5);
+    ili9341_clear_black();
+
+    /* Show initialization screen */
+    ili9341_fill_screen(UI_BG);
+    ili9341_fill_rect(0, 0, 320, 20, UI_BAR);
+    ili9341_text(APP_TITLE, 8, 6, UI_TBRT, UI_BAR);
+    ili9341_text("Iniciando MicroSD...", 50, 110, UI_TXT, UI_BG);
+    ili9341_flush_rows(0, 239);
+
+    if (fr != FR_OK) {
+        ili9341_fill_screen(UI_BG);
+        ili9341_fill_rect(0, 0, 320, 20, UI_BAR);
+        ili9341_text(APP_TITLE, 8, 6, UI_TBRT, UI_BAR);
+        ili9341_text("Erro ao montar cartao MicroSD!", 20, 75, UI_ERR, UI_BG);
+        char errbuf[48];
+        snprintf(errbuf, sizeof(errbuf), "Codigo FatFS: %d", (int)fr);
+        ili9341_text(errbuf, 20, 100, UI_TXT, UI_BG);
+        ili9341_text("SPI1: MISO=12 CS=13 SCK=14 MOSI=15", 20, 125, UI_TXT, UI_BG);
+        ili9341_text("Verifique se ha pasta /roms/ws/", 20, 150, UI_TXT, UI_BG);
+        ili9341_flush_rows(0, 239);
+        while (true) {
+            gpio_put(LED_GPIO_PIN, !gpio_get(LED_GPIO_PIN));
+            sleep_ms(300);
+            bool u, d, l, r, a, b, sel, sta;
+            read_ui_buttons(&u, &d, &l, &r, &a, &b, &sel, &sta);
+            if (a || b || sta || sel) {
+                watchdog_reboot(0, 0, 0);
+                while (1) tight_loop_contents();
+            }
+        }
+    }
+
+    dmg_init_boot_mode();
+    load_config();
+#if USE_I2S_AUDIO
+    audio_i2s_setup(USE_I2S_AUDIO, 44100, -1);
+#endif
+    set_sound_volume_level(cfg_volume);
+    set_brightness(cfg_bright);
+    ili9341_set_grid_effect(cfg_grid);
+    ili9341_set_fps_overlay(cfg_fps, "60");
+    ensure_save_dirs();
+
+
+    printf("\n=== %s WonderSwan for RP2350 ===\n", APP_TITLE);
+    printf("CPU: %lu MHz | Display: ILI9341 320x240\n",
+           (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+
+    s_selected_rom[0] = '\0';
+
+    while (true) {
+        if (rom_file_selector(s_selected_rom, sizeof(s_selected_rom))) {
+            if (flash_load_rom(s_selected_rom)) {
+                wait_buttons_released();
+                run_game();
+            } else {
+                /* Show error */
+                ili9341_fill_screen(UI_BG);
+                ili9341_text("ROM load failed!", 80, 120, UI_ERR, UI_BG);
+                ili9341_flush_rows(0, 239);
+                sleep_ms(2000);
+            }
+        }
+    }
+
+    return 0;
 }

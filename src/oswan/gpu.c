@@ -18,11 +18,17 @@
 //#define STATISTICS
 
 #include <string.h>
+#include "pico.h"
+#include <stdbool.h>
 #include <io.h>
 #include "./nec/nec.h"
 #include "io.h"
 #include "gpu.h"
-#include "graphics.h"
+
+/* Declared here rather than via an include: src/oswan does not carry
+ * pico_shared/drivers on its include path, and this is the only symbol the GPU
+ * needs from the display driver. Declared in ili9341.h as well. */
+void ili9341_ws_palette_changed(uint32 bank);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -83,12 +89,22 @@ extern uint8 internalRam[0x10000];
 #define RGB(r, g, b) (((int)r<<16) | ((int)g << 8 ) | (int)b )
 
 uint8 ws_gpu_operatingInColor;
+/* What the renderer (and the display driver) should draw: colour tiles and the 256-entry
+ * palette only while the console is a WonderSwan Color AND the game has switched the video
+ * hardware to colour (bit 7 of port 0x60). A colour system running a game in its mono
+ * compatibility mode -- Final Fantasy, after "New Game" -- has to be drawn with the mono
+ * path: the colour path has no decoder for video mode 0, so its tiles stayed unconverted
+ * and the screen filled with the backdrop colour and stale glyphs. */
+uint8 ws_gpu_colorActive;
 uint8 ws_videoMode;
 uint8 ws_gpu_scanline = 0;
 __aligned(4) int16 ws_palette[16 * 4];
 __aligned(4) int8 ws_paletteColors[8];
 __aligned(4) int16 wsc_palette[16 * 16];
 __aligned(4) uint32 ws_shades[16];
+__aligned(4) uint16_t wsc_palette_rgb565[256];
+/* Same colours in native byte order: the display blend wants them unswapped */
+__aligned(4) uint16_t wsc_palette_rgb565_native[256];
 int ws_gpu_forceColorSystemBool = 0;
 int ws_gpu_forceMonoSystemBool = 0;
 
@@ -181,8 +197,6 @@ uint8	*wsc_modified_tile;
 #else
 __aligned(4) uint8 wsc_tile_cache[1024 * 8 * 8];
 uint8 *ws_tile_cache = wsc_tile_cache;
-__aligned(4) uint8 wsc_hflipped_tile_cache[1024 * 8 * 8];
-uint8 *ws_hflipped_tile_cache = wsc_hflipped_tile_cache;
 __aligned(4) uint8 wsc_modified_tile[1024];
 uint8 *ws_modified_tile = wsc_modified_tile;
 
@@ -228,6 +242,7 @@ void ws_gpu_forceColorSystem(void) {
     ws_gpu_forceColorSystemBool = 1;
     ws_gpu_forceMonoSystemBool = 0;
     ws_gpu_operatingInColor = 1;
+    ws_gpu_colorActive = (ws_ioRam[0x60] & 0x80) ? 1 : 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -245,6 +260,7 @@ void ws_gpu_forceMonoSystem(void) {
     ws_gpu_forceColorSystemBool = 0;
     ws_gpu_forceMonoSystemBool = 1;
     ws_gpu_operatingInColor = 0;
+    ws_gpu_colorActive = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -260,7 +276,6 @@ void ws_gpu_forceMonoSystem(void) {
 ////////////////////////////////////////////////////////////////////////////////
 void ws_gpu_init(void) {
     memset(wsc_tile_cache, 0x00, 1024 * 8 * 8);
-    memset(wsc_hflipped_tile_cache, 0x00, 1024 * 8 * 8);
     memset(wsc_modified_tile, 0x01, 1024);
 
     ws_gpu_forceColorSystemBool = 0;
@@ -323,6 +338,7 @@ void ws_gpu_done(void) {
 //
 ////////////////////////////////////////////////////////////////////////////////
 void ws_gpu_changeVideoMode(uint8 value) {
+    ws_gpu_colorActive = (ws_gpu_operatingInColor && (value & 0x80)) ? 1 : 0;
     if (ws_videoMode != (value >> 5)) {
         ws_videoMode = value >> 5;
         if (ws_videoMode == 4)
@@ -381,7 +397,7 @@ void ws_gpu_clearCache(void) {
 ////////////////////////////////////////////////////////////////////////////////
 static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 line,
                                                       uint32 vFlip, uint32 hFlip, uint32 bank) {
-    if (ws_gpu_operatingInColor) {
+    if (ws_gpu_colorActive) {
         if (bank)
             tileIndex += 512;
 
@@ -392,7 +408,6 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
             ws_4_colors_tiles_cache_update_time+=-ticker();
 #endif
             uint8 *tileInCachePtr = &wsc_tile_cache[tileIndex << 6];
-            uint8 *hflippedTileInCachePtr = &wsc_hflipped_tile_cache[tileIndex << 6];
             uint16 *tileInRamPtr = (uint16 *) &internalRam[0x2000 + (tileIndex << 4)];
             uint16 tileLine;
 
@@ -400,28 +415,19 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
                 tileLine = *tileInRamPtr++;
 
                 tileInCachePtr[0] = ((tileLine & 0x80) >> 7) | ((tileLine & 0x8000) >> 14);
-                hflippedTileInCachePtr[7] = tileInCachePtr[0];
                 tileInCachePtr[1] = ((tileLine & 0x40) >> 6) | ((tileLine & 0x4000) >> 13);
-                hflippedTileInCachePtr[6] = tileInCachePtr[1];
                 tileInCachePtr[2] = ((tileLine & 0x20) >> 5) | ((tileLine & 0x2000) >> 12);
-                hflippedTileInCachePtr[5] = tileInCachePtr[2];
                 tileInCachePtr[3] = ((tileLine & 0x10) >> 4) | ((tileLine & 0x1000) >> 11);
-                hflippedTileInCachePtr[4] = tileInCachePtr[3];
                 tileInCachePtr[4] = ((tileLine & 0x08) >> 3) | ((tileLine & 0x0800) >> 10);
-                hflippedTileInCachePtr[3] = tileInCachePtr[4];
                 tileInCachePtr[5] = ((tileLine & 0x04) >> 2) | ((tileLine & 0x0400) >> 9);
-                hflippedTileInCachePtr[2] = tileInCachePtr[5];
                 tileInCachePtr[6] = ((tileLine & 0x02) >> 1) | ((tileLine & 0x0200) >> 8);
-                hflippedTileInCachePtr[1] = tileInCachePtr[6];
                 tileInCachePtr[7] = ((tileLine & 0x01) >> 0) | ((tileLine & 0x0100) >> 7);
-                hflippedTileInCachePtr[0] = tileInCachePtr[7];
 
                 tileInCachePtr += 8;
-                hflippedTileInCachePtr += 8;
             }
             ws_modified_tile[tileIndex] = 0;
 #ifdef STATISTICS
-                                                                                                                                    ws_4_colors_tiles_cache_update_time+=ticker();
+            ws_4_colors_tiles_cache_update_time+=ticker();
 			ws_4_colors_tiles_cache_update_number++;
 #endif
         } else if (wsc_modified_tile[tileIndex]) {
@@ -431,7 +437,6 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
                 ws_16_colors_layered_tiles_cache_update_time+=-ticker();
 #endif
                 uint8 *tileInCachePtr = &wsc_tile_cache[tileIndex << 6];
-                uint8 *hflippedTileInCachePtr = &wsc_hflipped_tile_cache[tileIndex << 6];
                 uint32 *tileInRamPtr = (uint32 *) &internalRam[0x4000 + (tileIndex << 5)];
                 uint32 tileLine;
 
@@ -441,41 +446,25 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
 
                     tileInCachePtr[0] = ((tileLine & 0x00000080) >> 7) | ((tileLine & 0x00008000) >> 14) |
                                         ((tileLine & 0x00800000) >> 21) | ((tileLine & 0x80000000) >> 28);
-                    hflippedTileInCachePtr[7] = tileInCachePtr[0];
-
                     tileInCachePtr[1] = ((tileLine & 0x00000040) >> 6) | ((tileLine & 0x00004000) >> 13) |
                                         ((tileLine & 0x00400000) >> 20) | ((tileLine & 0x40000000) >> 27);
-                    hflippedTileInCachePtr[6] = tileInCachePtr[1];
-
                     tileInCachePtr[2] = ((tileLine & 0x00000020) >> 5) | ((tileLine & 0x00002000) >> 12) |
                                         ((tileLine & 0x00200000) >> 19) | ((tileLine & 0x20000000) >> 26);
-                    hflippedTileInCachePtr[5] = tileInCachePtr[2];
-
                     tileInCachePtr[3] = ((tileLine & 0x00000010) >> 4) | ((tileLine & 0x00001000) >> 11) |
                                         ((tileLine & 0x00100000) >> 18) | ((tileLine & 0x10000000) >> 25);
-                    hflippedTileInCachePtr[4] = tileInCachePtr[3];
-
                     tileInCachePtr[4] = ((tileLine & 0x00000008) >> 3) | ((tileLine & 0x00000800) >> 10) |
                                         ((tileLine & 0x00080000) >> 17) | ((tileLine & 0x08000000) >> 24);
-                    hflippedTileInCachePtr[3] = tileInCachePtr[4];
-
                     tileInCachePtr[5] = ((tileLine & 0x00000004) >> 2) | ((tileLine & 0x00000400) >> 9) |
                                         ((tileLine & 0x00040000) >> 16) | ((tileLine & 0x04000000) >> 23);
-                    hflippedTileInCachePtr[2] = tileInCachePtr[5];
-
                     tileInCachePtr[6] = ((tileLine & 0x00000002) >> 1) | ((tileLine & 0x00000200) >> 8) |
                                         ((tileLine & 0x00020000) >> 15) | ((tileLine & 0x02000000) >> 22);
-                    hflippedTileInCachePtr[1] = tileInCachePtr[6];
-
                     tileInCachePtr[7] = ((tileLine & 0x00000001) >> 0) | ((tileLine & 0x00000100) >> 7) |
                                         ((tileLine & 0x00010000) >> 14) | ((tileLine & 0x01000000) >> 21);
-                    hflippedTileInCachePtr[0] = tileInCachePtr[7];
 
                     tileInCachePtr += 8;
-                    hflippedTileInCachePtr += 8;
                 }
 #ifdef STATISTICS
-                                                                                                                                        ws_16_colors_layered_tiles_cache_update_time+=ticker();
+                ws_16_colors_layered_tiles_cache_update_time+=ticker();
 				ws_16_colors_layered_tiles_cache_update_number++;
 #endif
             } else
@@ -485,7 +474,6 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
                 ws_16_colors_packed_tiles_cache_update_time+=-ticker();
 #endif
                 uint8 *tileInCachePtr = &wsc_tile_cache[tileIndex << 6];
-                uint8 *hflippedTileInCachePtr = &wsc_hflipped_tile_cache[tileIndex << 6];
                 uint32 *tileInRamPtr = (uint32 *) &internalRam[0x4000 + (tileIndex << 5)];
                 uint32 tileLine;
 
@@ -494,28 +482,18 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
                     tileLine = *tileInRamPtr++;
 
                     tileInCachePtr[0] = (tileLine >> 4) & 0x0f;
-                    hflippedTileInCachePtr[7] = tileInCachePtr[0];
                     tileInCachePtr[1] = (tileLine >> 0) & 0x0f;
-                    hflippedTileInCachePtr[6] = tileInCachePtr[1];
                     tileInCachePtr[2] = (tileLine >> 12) & 0x0f;
-                    hflippedTileInCachePtr[5] = tileInCachePtr[2];
                     tileInCachePtr[3] = (tileLine >> 8) & 0x0f;
-                    hflippedTileInCachePtr[4] = tileInCachePtr[3];
                     tileInCachePtr[4] = (tileLine >> 20) & 0x0f;
-                    hflippedTileInCachePtr[3] = tileInCachePtr[4];
                     tileInCachePtr[5] = (tileLine >> 16) & 0x0f;
-                    hflippedTileInCachePtr[2] = tileInCachePtr[5];
                     tileInCachePtr[6] = (tileLine >> 28) & 0x0f;
-                    hflippedTileInCachePtr[1] = tileInCachePtr[6];
                     tileInCachePtr[7] = (tileLine >> 24) & 0x0f;
-                    hflippedTileInCachePtr[0] = tileInCachePtr[7];
 
                     tileInCachePtr += 8;
-                    hflippedTileInCachePtr += 8;
-
                 }
 #ifdef STATISTICS
-                                                                                                                                        ws_16_colors_packed_tiles_cache_update_time+=ticker();
+                ws_16_colors_packed_tiles_cache_update_time+=ticker();
 				ws_16_colors_packed_tiles_cache_update_number++;
 #endif
             } else {
@@ -526,9 +504,19 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
         }
         if (vFlip)
             line = 7 - line;
-        if (hFlip)
-            return (&wsc_hflipped_tile_cache[(tileIndex << 6) + (line << 3)]);
-        else
+        if (hFlip) {
+            static uint8 s_hflip[8];
+            const uint8 *src = &wsc_tile_cache[(tileIndex << 6) + (line << 3)];
+            s_hflip[0] = src[7];
+            s_hflip[1] = src[6];
+            s_hflip[2] = src[5];
+            s_hflip[3] = src[4];
+            s_hflip[4] = src[3];
+            s_hflip[5] = src[2];
+            s_hflip[6] = src[1];
+            s_hflip[7] = src[0];
+            return s_hflip;
+        } else
             return (&wsc_tile_cache[(tileIndex << 6) + (line << 3)]);
 
     } else {
@@ -538,7 +526,6 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
             ws_4_shades_tiles_cache_update_time+=-ticker();
 #endif
             uint8 *tileInCachePtr = &ws_tile_cache[tileIndex << 6];
-            uint8 *hflippedTileInCachePtr = &ws_hflipped_tile_cache[(tileIndex << 6) + 7];
             uint32 *tileInRamPtr = (uint32 *) &internalRam[0x2000 + (tileIndex << 4)];
             uint32 tileLine;
 
@@ -546,38 +533,46 @@ static __always_inline uint8 *ws_tileCache_getTileRow(uint32 tileIndex, uint32 l
             for (int line = 0; line < 4; line++) {
                 tileLine = *tileInRamPtr++;
 
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x80) >> 7) | ((tileLine & 0x8000) >> 14);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x40) >> 6) | ((tileLine & 0x4000) >> 13);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x20) >> 5) | ((tileLine & 0x2000) >> 12);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x10) >> 4) | ((tileLine & 0x1000) >> 11);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x08) >> 3) | ((tileLine & 0x0800) >> 10);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x04) >> 2) | ((tileLine & 0x0400) >> 9);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x02) >> 1) | ((tileLine & 0x0200) >> 8);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x01) >> 0) | ((tileLine & 0x0100) >> 7);
-                hflippedTileInCachePtr += 16;
+                *tileInCachePtr++ = ((tileLine & 0x80) >> 7) | ((tileLine & 0x8000) >> 14);
+                *tileInCachePtr++ = ((tileLine & 0x40) >> 6) | ((tileLine & 0x4000) >> 13);
+                *tileInCachePtr++ = ((tileLine & 0x20) >> 5) | ((tileLine & 0x2000) >> 12);
+                *tileInCachePtr++ = ((tileLine & 0x10) >> 4) | ((tileLine & 0x1000) >> 11);
+                *tileInCachePtr++ = ((tileLine & 0x08) >> 3) | ((tileLine & 0x0800) >> 10);
+                *tileInCachePtr++ = ((tileLine & 0x04) >> 2) | ((tileLine & 0x0400) >> 9);
+                *tileInCachePtr++ = ((tileLine & 0x02) >> 1) | ((tileLine & 0x0200) >> 8);
+                *tileInCachePtr++ = ((tileLine & 0x01) >> 0) | ((tileLine & 0x0100) >> 7);
                 tileLine >>= 16;
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x80) >> 7) | ((tileLine & 0x8000) >> 14);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x40) >> 6) | ((tileLine & 0x4000) >> 13);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x20) >> 5) | ((tileLine & 0x2000) >> 12);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x10) >> 4) | ((tileLine & 0x1000) >> 11);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x08) >> 3) | ((tileLine & 0x0800) >> 10);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x04) >> 2) | ((tileLine & 0x0400) >> 9);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x02) >> 1) | ((tileLine & 0x0200) >> 8);
-                *hflippedTileInCachePtr-- = *tileInCachePtr++ = ((tileLine & 0x01) >> 0) | ((tileLine & 0x0100) >> 7);
-                hflippedTileInCachePtr += 16;
+                *tileInCachePtr++ = ((tileLine & 0x80) >> 7) | ((tileLine & 0x8000) >> 14);
+                *tileInCachePtr++ = ((tileLine & 0x40) >> 6) | ((tileLine & 0x4000) >> 13);
+                *tileInCachePtr++ = ((tileLine & 0x20) >> 5) | ((tileLine & 0x2000) >> 12);
+                *tileInCachePtr++ = ((tileLine & 0x10) >> 4) | ((tileLine & 0x1000) >> 11);
+                *tileInCachePtr++ = ((tileLine & 0x08) >> 3) | ((tileLine & 0x0800) >> 10);
+                *tileInCachePtr++ = ((tileLine & 0x04) >> 2) | ((tileLine & 0x0400) >> 9);
+                *tileInCachePtr++ = ((tileLine & 0x02) >> 1) | ((tileLine & 0x0200) >> 8);
+                *tileInCachePtr++ = ((tileLine & 0x01) >> 0) | ((tileLine & 0x0100) >> 7);
             }
             // tile cache updated
             ws_modified_tile[tileIndex] = 0;
 #ifdef STATISTICS
-                                                                                                                                    ws_4_shades_tiles_cache_update_time+=ticker();
+            ws_4_shades_tiles_cache_update_time+=ticker();
 			ws_4_shades_tiles_cache_update_number++;
 #endif
         }
         if (vFlip)
             line = 7 - line;
-        if (hFlip)
-            return (&ws_hflipped_tile_cache[(tileIndex << 6) + (line << 3)]);
-        else
+        if (hFlip) {
+            static uint8 s_hflip_mono[8];
+            const uint8 *src = &ws_tile_cache[(tileIndex << 6) + (line << 3)];
+            s_hflip_mono[0] = src[7];
+            s_hflip_mono[1] = src[6];
+            s_hflip_mono[2] = src[5];
+            s_hflip_mono[3] = src[4];
+            s_hflip_mono[4] = src[3];
+            s_hflip_mono[5] = src[2];
+            s_hflip_mono[6] = src[1];
+            s_hflip_mono[7] = src[0];
+            return s_hflip_mono;
+        } else
             return (&ws_tile_cache[(tileIndex << 6) + (line << 3)]);
     }
     return (NULL);
@@ -617,7 +612,7 @@ static __always_inline void ws_drawClippedSpriteLine(uint8 *framebuffer, uint16 
         nbPixels = (clip_x1 - x);
     framebuffer += x;
 
-    if (ws_gpu_operatingInColor) {
+    if (ws_gpu_colorActive) {
         while (nbPixels) {
             if (*ws_tileRow) *framebuffer = (paletteIndex << 4) + *ws_tileRow;
             framebuffer++;
@@ -655,21 +650,113 @@ static __always_inline void ws_drawClippedSpriteLine(uint8 *framebuffer, uint16 
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
+/* Console build only: ~12 KB of SRAM, which the HW15 board does not have to spare */
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN
+/* -------------------------------------------------------------------------- */
+/* SRAM fast path for the common WonderSwan Color scanline                     */
+/*                                                                            */
+/* ws_gpu_renderScanline() below is 123 KB of unrolled code that lives in flash */
+/* and fights the PSRAM ROM for the 16 KB XIP cache. A colour line with no     */
+/* foreground window and no sprite window -- almost every game, almost every    */
+/* line -- needs only this: background, priority-0 sprites, foreground,         */
+/* priority-1 sprites. Same pixels, same order, same transparency rules, but a  */
+/* few KB that run from SRAM. Anything else falls through to the full renderer. */
+/* -------------------------------------------------------------------------- */
+static void __not_in_flash_func(ws_render_layer_color)(uint8 *fb, uint32 mapBase,
+                                                       uint32 scrollX, uint32 scrollY, uint32 scanline) {
+    scrollY = (scrollY + scanline) & 0xff;
+    const uint32 firstTile = scrollX >> 3;
+    const uint16 *map = (const uint16 *) (internalRam + mapBase + ((scrollY & 0xfff8) << 3));
+    const uint32 lineInTile = scrollY & 0x07;
+    const int col = (int) (scrollX & 0x07);
+    const int nt = col ? 29 : 28;
+    int px = -col;
+
+    for (int t = 0; t < nt; t++, px += 8) {
+        const uint16 info = map[(firstTile + (uint32) t) & 0x1f];
+        const uint8 *row = ws_tileCache_getTileRow(info & 0x1ff, lineInTile,
+                                                   info & 0x8000, info & 0x4000, info & 0x2000);
+        const uint8 palbase = (uint8) (((info >> 9) & 0x0f) << 4);
+        if (px >= 0 && px + 8 <= 224) {
+            uint8 *d = fb + px;
+            for (int i = 0; i < 8; i++) {
+                const uint8 v = row[i];
+                if (v) d[i] = (uint8) (palbase + v);
+            }
+        } else {
+            for (int i = 0; i < 8; i++) {
+                const int x = px + i;
+                if ((unsigned) x < 224u && row[i]) fb[x] = (uint8) (palbase + row[i]);
+            }
+        }
+    }
+}
+
+static void __not_in_flash_func(ws_render_sprites_color)(uint8 *fb, uint32 scanline, uint32 priority) {
+    const uint32 first = ws_ioRam[0x05];
+    const uint32 count = ws_ioRam[0x06];
+    const uint32 *sprites = (const uint32 *) (internalRam + (((uint32) ws_ioRam[0x04]) << 9)) + count - 1;
+
+    for (uint32 i = count; i > first; i--) {
+        const uint32 spr = *sprites--;
+        if ((spr & 0x2000) != priority) continue;
+
+        const uint32 x = (spr & 0xff000000) >> 24;
+        const uint32 y = (spr & 0x00ff0000) >> 16;
+        if (scanline < y || scanline > y + 7) continue;
+        if (x >= 224 || y >= 144) continue;
+
+        const uint8 *row = ws_tileCache_getTileRow(spr & 0x1ff, (scanline - y) & 0x07,
+                                                   spr & 0x8000, spr & 0x4000, 0);
+        uint32 n = 8;
+        if (x + n > 224) n = 224 - x;
+        const uint32 palbase = (8 + ((spr & 0xe00) >> 9)) << 4;
+        uint8 *d = fb + x;
+        for (uint32 k = 0; k < n; k++) {
+            if (row[k]) d[k] = (uint8) (palbase + row[k]);
+        }
+    }
+}
+
+static void __not_in_flash_func(ws_render_scanline_color_fast)(uint8 *fb) {
+    const uint32 sl = ws_gpu_scanline;
+    const uint8 io0 = ws_ioRam[0x00];
+
+    memset(fb, ws_ioRam[0x01], 224);
+    if (io0 & 0x01)
+        ws_render_layer_color(fb, ((uint32) ws_ioRam[0x07] & 0x0f) << 11, ws_ioRam[0x10], ws_ioRam[0x11], sl);
+    if (io0 & 0x04)
+        ws_render_sprites_color(fb, sl, 0);
+    if (io0 & 0x02)
+        ws_render_layer_color(fb, ((uint32) ws_ioRam[0x07] & 0xf0) << 7, ws_ioRam[0x12], ws_ioRam[0x13], sl);
+    if (io0 & 0x04)
+        ws_render_sprites_color(fb, sl, 0x2000);
+}
+
+#endif
+
 void ws_gpu_renderScanline(uint8 *framebuffer) {
 
     if (ws_gpu_scanline > 143)
         return;
+
+    /* colour, no foreground window (0x30), no sprite window (0x08) */
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN && !defined(WS_NO_FAST_RENDER)
+    if (ws_gpu_colorActive && !(ws_ioRam[0x00] & 0x38)) {
+        ws_render_scanline_color_fast(framebuffer);
+        return;
+    }
+#endif
 #ifdef STATISTICS
     long startTime=ticker();
 #endif
-    framebuffer += (224 * ws_gpu_scanline);
 
     // fill with background color
     uint8 backgroundColor;
-    if (ws_gpu_operatingInColor)
+    if (ws_gpu_colorActive)
         backgroundColor = ws_ioRam[0x01];
     else
-        backgroundColor = ws_paletteColors[ws_palette[((ws_ioRam[0x01] & 0xf0) >> 2) + (ws_ioRam[0x01] & 0x03)]];
+        backgroundColor = ws_paletteColors[ws_ioRam[0x01] & 0x07];
 
     memset(framebuffer, backgroundColor, 224);
 
@@ -694,7 +781,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
         uint8 *scanlinePtr = framebuffer;
 
-        if (ws_gpu_operatingInColor) {
+        if (ws_gpu_colorActive) {
             // render the first clipped tile
             if (columnInTile) {
                 uint16 tileInfo = ws_bgScrollRamBase[ws_currentTile & 0x1f];
@@ -705,8 +792,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 #pragma GCC unroll 8
                 for (int i = columnInTile; i < 8; i++) {
-                    if (*ws_tileRow)
-                        *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                        if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                     scanlinePtr++;
                     ws_tileRow++;
                 }
@@ -724,8 +810,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                                                             tileInfo & 0x4000, tileInfo & 0x2000);
 
                 for (int ii = 0; ii < 8; ii++) {
-                    if (*ws_tileRow)
-                        *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                        if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                     scanlinePtr++;
                     ws_tileRow++;
                 }
@@ -740,8 +825,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 
                 for (int i = 0; i < columnInTile; i++) {
-                    if (*ws_tileRow)
-                        *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                        if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                     scanlinePtr++;
                     ws_tileRow++;
                 }
@@ -758,6 +842,11 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                 int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
                 ws_tileRow += columnInTile;
 
+                /* WonderSwan transparency applies to SCR1 too: bit 2 of the palette
+                 * index (bit 11 of the tile attribute) means colour 0 of that
+                 * palette is transparent, for BOTH layers. Do not flatten this to
+                 * an unconditional write -- Klonoa's HUD relies on it, and so do
+                 * sprites whose colour-0 pixels must show the scene behind. */
                 if ((tileInfo >> 9) & 0x04) {
                     for (int i = columnInTile; i < 8; i++) {
                         if (*ws_tileRow)
@@ -849,8 +938,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
                 if ((tileInfo >> 9) & 0x04) {
                     for (int i = 0; i < columnInTile; i++) {
-                        if (*ws_tileRow)
-                            *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+if (*ws_tileRow) *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
                         scanlinePtr++;
                         ws_tileRow++;
                     }
@@ -927,7 +1015,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
         // window disabled
         if (!windowMode) {
-            if (ws_gpu_operatingInColor) {
+            if (ws_gpu_colorActive) {
                 // render the first clipped tile
                 if (columnInTile) {
                     uint16 tileInfo = ws_fgScrollRamBase[ws_currentTile & 0x1f];
@@ -940,8 +1028,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 
                     for (int i = columnInTile; i < 8; i++) {
-                        if (*ws_tileRow)
-                            *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                            if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         scanlinePtr++;
                         ws_tileRow++;
                     }
@@ -961,8 +1048,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 #pragma GCC unroll 8
                     for (int ii = 0; ii < 8; ii++) {
-                        if (*ws_tileRow)
-                            *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                            if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         scanlinePtr++;
                         ws_tileRow++;
                     }
@@ -979,8 +1065,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 
                     for (int i = 0; i < columnInTile; i++) {
-                        if (*ws_tileRow)
-                            *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
+                            if (*ws_tileRow) *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         scanlinePtr++;
                         ws_tileRow++;
                     }
@@ -1105,8 +1190,9 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
         } else
             // foreground layer displayed only inside the window
         if (windowMode == 0x20) {
+            if (ws_gpu_scanline >= ws_fgWindow_y0 && ws_gpu_scanline <= ws_fgWindow_y1) {
             int column = 0;
-            if (ws_gpu_operatingInColor) {
+            if (ws_gpu_colorActive) {
                 // render the first clipped tile
                 if (columnInTile) {
                     uint16 tileInfo = ws_fgScrollRamBase[ws_currentTile & 0x1f];
@@ -1182,12 +1268,22 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
                     ws_tileRow += columnInTile;
 
-                    for (int i = columnInTile; i < 8; i++) {
-                        if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                            *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                        column++;
-                        scanlinePtr++;
-                        ws_tileRow++;
+                    if ((tileInfo >> 9) & 0x04) {
+                        for (int i = columnInTile; i < 8; i++) {
+                            if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
+                    } else {
+                        for (int i = columnInTile; i < 8; i++) {
+                            if ((column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
                     }
                 }
                 int nbTiles = 28;
@@ -1202,47 +1298,25 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                                                                 tileInfo & 0x2000);
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
 
-
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
+                    if ((tileInfo >> 9) & 0x04) {
+#pragma GCC unroll 8
+                        for (int ii = 0; ii < 8; ii++) {
+                            if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            scanlinePtr++;
+                            ws_tileRow++;
+                            column++;
+                        }
+                    } else {
+#pragma GCC unroll 8
+                        for (int ii = 0; ii < 8; ii++) {
+                            if ((column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            scanlinePtr++;
+                            ws_tileRow++;
+                            column++;
+                        }
+                    }
                 }
 
                 // render the last clipped tile
@@ -1254,21 +1328,32 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                                                                 tileInfo & 0x2000);
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
 
-
-                    for (int i = 0; i < columnInTile; i++) {
-                        if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
-                            *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                        column++;
-                        scanlinePtr++;
-                        ws_tileRow++;
+                    if ((tileInfo >> 9) & 0x04) {
+                        for (int i = 0; i < columnInTile; i++) {
+                            if ((*ws_tileRow) && (column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
+                    } else {
+                        for (int i = 0; i < columnInTile; i++) {
+                            if ((column >= ws_fgWindow_x0) && (column <= ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
                     }
                 }
+            }
             }
         } else
             // foreground layer displayed only outside the window
         if (windowMode == 0x30) {
+            bool line_outside_y = (ws_gpu_scanline < ws_fgWindow_y0 || ws_gpu_scanline > ws_fgWindow_y1);
             int column = 0;
-            if (ws_gpu_operatingInColor) {
+            if (ws_gpu_colorActive) {
                 // render the first clipped tile
                 if (columnInTile) {
                     uint16 tileInfo = ws_fgScrollRamBase[ws_currentTile & 0x1f];
@@ -1280,7 +1365,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                     ws_tileRow += columnInTile;
 
                     for (int i = columnInTile; i < 8; i++) {
-                        if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                        if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
                             *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         column++;
                         scanlinePtr++;
@@ -1302,7 +1387,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 #pragma GCC unroll 8
                     for (int ii = 0; ii < 8; ii++) {
-                        if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                        if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
                             *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         scanlinePtr++;
                         ws_tileRow++;
@@ -1320,7 +1405,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 
 
                     for (int i = 0; i < columnInTile; i++) {
-                        if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                        if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
                             *scanlinePtr = (((tileInfo >> 9) & 0x0f) << 4) + *ws_tileRow;
                         column++;
                         scanlinePtr++;
@@ -1339,12 +1424,22 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
                     ws_tileRow += columnInTile;
 
-                    for (int i = columnInTile; i < 8; i++) {
-                        if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                            *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                        column++;
-                        scanlinePtr++;
-                        ws_tileRow++;
+                    if ((tileInfo >> 9) & 0x04) {
+                        for (int i = columnInTile; i < 8; i++) {
+                            if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
+                    } else {
+                        for (int i = columnInTile; i < 8; i++) {
+                            if (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
                     }
                 }
                 int nbTiles = 28;
@@ -1358,46 +1453,25 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                                                                 tileInfo & 0x4000, tileInfo & 0x2000);
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
 
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
-                    if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                        *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                    scanlinePtr++;
-                    ws_tileRow++;
-                    column++;
+                    if ((tileInfo >> 9) & 0x04) {
+#pragma GCC unroll 8
+                        for (int ii = 0; ii < 8; ii++) {
+                            if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            scanlinePtr++;
+                            ws_tileRow++;
+                            column++;
+                        }
+                    } else {
+#pragma GCC unroll 8
+                        for (int ii = 0; ii < 8; ii++) {
+                            if (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            scanlinePtr++;
+                            ws_tileRow++;
+                            column++;
+                        }
+                    }
                 }
 
                 // render the last clipped tile
@@ -1409,13 +1483,22 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
                                                                 tileInfo & 0x2000);
                     int16 *ws_paletteAlias = &ws_palette[((tileInfo >> 9) & 0x0f) << 2];
 
-
-                    for (int i = 0; i < columnInTile; i++) {
-                        if ((*ws_tileRow) && ((column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
-                            *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
-                        column++;
-                        scanlinePtr++;
-                        ws_tileRow++;
+                    if ((tileInfo >> 9) & 0x04) {
+                        for (int i = 0; i < columnInTile; i++) {
+                            if ((*ws_tileRow) && (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1)))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
+                    } else {
+                        for (int i = 0; i < columnInTile; i++) {
+                            if (line_outside_y || (column < ws_fgWindow_x0) || (column > ws_fgWindow_x1))
+                                *scanlinePtr = ws_paletteColors[ws_paletteAlias[*ws_tileRow]];
+                            column++;
+                            scanlinePtr++;
+                            ws_tileRow++;
+                        }
                     }
                 }
             }
@@ -1478,7 +1561,7 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
-void ws_gpu_write_byte(uint32_t offset, uint8_t value) {
+void __not_in_flash_func(ws_gpu_write_byte)(uint32_t offset, uint8_t value) {
     // ws 4 color tiles
     if ((offset >= 0x2000) && (offset < 0x4000)) {
         if (internalRam[offset] != value)
@@ -1507,10 +1590,35 @@ void ws_gpu_write_byte(uint32_t offset, uint8_t value) {
             color <<= 8;
             color |= (internalRam[(offset & 0xfffe)]);
 
+            int idx = (offset & 0x1ff) >> 1;
+            wsc_palette[idx] = (int16)color;
+
             uint8 r = (color >> 8) & 0xf;
             uint8 g = (color >> 4) & 0xf;
             uint8 b = color & 0xf;
-            graphics_set_palette((offset & 0x1ff) >> 1, RGB888(r * 16, g * 16, b * 16));
+            uint16 r5 = (r << 1) | (r >> 3);
+            uint16 g6 = (g << 2) | (g >> 2);
+            uint16 b5 = (b << 1) | (b >> 3);
+            uint16 c565 = (uint16)((r5 << 11) | (g6 << 5) | b5);
+            const uint16 old565 = wsc_palette_rgb565_native[idx];
+            wsc_palette_rgb565_native[idx] = c565;
+            wsc_palette_rgb565[idx] = __builtin_bswap16(c565);
+
+            /* Tell the display driver. Its dirty-row hash covers the tile
+             * indices only, so recolouring a palette entry changes the pixels
+             * of every row that uses it while leaving every hash untouched --
+             * those rows were being skipped and the old colours stayed on
+             * screen. Digimon Tamers showed this as white gaps in the "press
+             * start" blink and in the 1P/2P/options menu.
+             *
+             * Only a colour that really changed counts, and only for its own
+             * 16-entry bank: a game that re-uploads the same palette every frame
+             * (or fades one bank) must not invalidate every row on screen. The
+             * write happens one byte at a time, so the half-written colour of
+             * the first byte shows up here as a change too, which is correct --
+             * the pixels do change when the second byte lands. */
+            if (c565 != old565)
+                ili9341_ws_palette_changed((uint32)idx >> 4);
         }
     } else if (offset < 0x4000)
         internalRam[offset] = value;

@@ -1,9 +1,31 @@
+#include <stdint.h>
 extern uint8_t	cpu_readport(uint8_t);
 void cpu_writeport(uint32_t,uint8_t);
+void ws_check_interrupts(void);
 #define cpu_readop cpu_readmem20	
 #define cpu_readop_arg cpu_readmem20	
 void cpu_writemem20(uint32_t,uint8_t);
 uint8_t cpu_readmem20(uint32_t);
+
+/* Direct page pointers maintained by memory.c (NULL = take the full slow path).
+ * The V30 core reads memory for every opcode byte and operand; going through an
+ * out-of-line function with a switch each time was the bulk of the emulation cost. */
+extern const uint8_t *ws_page[17];
+extern uint32_t ws_mc; /* counts every write that actually changes memory, and every port write (idle detection) */
+extern uint8_t internalRam[0x10000];
+static inline void ws_write20(uint32_t a, uint8_t v)
+{
+	if (a < 0x2000u) { if (internalRam[a] != v) { internalRam[a] = v; ws_mc++; } }
+	else cpu_writemem20(a, v);
+}
+static inline uint8_t ws_read20(uint32_t a)
+{
+	const uint32_t b = a >> 16;
+	const uint8_t *p = (b <= 16u) ? ws_page[b] : (const uint8_t *)0;
+	if (__builtin_expect(p != (const uint8_t *)0, 1))
+		return p[a & 0xFFFFu];
+	return cpu_readmem20(a);
+}
 
 typedef enum { ES, CS, SS, DS } SREGS;
 typedef enum { AW, CW, DW, BW, SP, BP, IX, IY } WREGS;
@@ -127,12 +149,12 @@ typedef enum { AL,AH,CL,CH,DL,DH,BL,BH,SPL,SPH,BPL,BPH,IXL,IXH,IYL,IYH } BREGS;
 #define CLKM(v30MZm,v30MZ) { nec_ICount-=( ModRM >=0xc0 )?v30MZ:v30MZm; }
 #define CLKR(v30MZo,v30MZe,vall) { if (ModRM >=0xc0) nec_ICount-=vall; else nec_ICount-=(I.ip&1)?v30MZo:v30MZe; }
 #else
-#define CLKS(v20,v30,v33) { const UINT32 ccount=(v20<<16)|(v30<<8)|v33; nec_ICount-=(ccount>>cpu_type)&0x7f; nec_TotalClock+=(ccount>>cpu_type)&0x7f; }
+#define CLKS(v20,v30,v33) { const UINT32 ccount=(v20<<16)|(v30<<8)|v33; nec_ICount-=(ccount>>cpu_type)&0x7f; }
 
-#define CLK(all) { nec_ICount-=all; nec_TotalClock+=all; }
-#define CLKW(v30MZo,v30MZe) { nec_ICount-=(I.ip&1)?v30MZo:v30MZe; nec_TotalClock+=(I.ip&1)?v30MZo:v30MZe; }
-#define CLKM(v30MZm,v30MZ) { nec_ICount-=( ModRM >=0xc0 )?v30MZ:v30MZm; nec_TotalClock+=( ModRM >=0xc0 )?v30MZ:v30MZm; }
-#define CLKR(v30MZo,v30MZe,vall) { if (ModRM >=0xc0) { nec_ICount-=vall; nec_TotalClock+=vall;} else {nec_ICount-=(I.ip&1)?v30MZo:v30MZe; nec_TotalClock+=(I.ip&1)?v30MZo:v30MZe; } }
+#define CLK(all) { nec_ICount-=all; }
+#define CLKW(v30MZo,v30MZe) { nec_ICount-=(I.ip&1)?v30MZo:v30MZe; }
+#define CLKM(v30MZm,v30MZ) { nec_ICount-=( ModRM >=0xc0 )?v30MZ:v30MZm; }
+#define CLKR(v30MZo,v30MZe,vall) { if (ModRM >=0xc0) { nec_ICount-=vall;} else {nec_ICount-=(I.ip&1)?v30MZo:v30MZe; } }
 #endif
 
 #define CompressFlags() (uint16_t)(CF | (PF << 2) | (AF << 4) | (ZF << 6) \
@@ -179,6 +201,7 @@ typedef enum { AL,AH,CL,CH,DL,DH,BL,BH,SPL,SPH,BPL,BPH,IXL,IXH,IYL,IYH } BREGS;
 	if (flag)								\
 	{										\
 		I.ip = (uint16_t)(I.ip+tmp);			\
+		if (tmp < 0) nec_backjump();			\
 		nec_ICount-=3;						\
 		return;								\
 	}

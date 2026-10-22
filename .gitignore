@@ -397,3 +397,10 @@ MigrationBackup/
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
 .git
+# Build output, firmware images, ROMs and media: large or not ours to redistribute
+build_*/
+*.uf2
+*.ws
+*.wsc
+*.mp4
+NitroSwan/

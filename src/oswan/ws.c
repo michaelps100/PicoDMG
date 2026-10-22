@@ -20,8 +20,10 @@
 #include "./nec/nec.h"
 #include "./nec/necintrf.h"
 #include "memory.h"
+#include "rom.h"
 #include "gpu.h"
 #include "ws.h"
+#include "ws_audio.h"
 
 
 //#define DEBUG
@@ -42,6 +44,8 @@ uint32	ws_cycles;
 uint32	ws_skip;
 uint32	ws_cyclesByLine=256;
 
+
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 ////////////////////////////////////////////////////////////////////////////////
@@ -53,49 +57,46 @@ uint32	ws_cyclesByLine=256;
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
+bool s_is_klonoa = false;
+
 void ws_patchRom(void)
 {
-
 	uint8	*rom=memory_getRom();
 	uint32	romSize=memory_getRomSize();
 
-#if 0
-	fprintf(log_get(),"developper Id: 0x%.2x\nGame Id: 0x%.2x\n",rom[romSize-10],rom[romSize-8]);
-#endif
+	ws_cyclesByLine = 256;
+    s_is_klonoa = false;
 
-	if((rom[romSize-10]==0x01)&&(rom[romSize-8]==0x27)) // Detective Conan 
+	if (!rom || romSize < 10) return;
+	ws_romHeaderStruct *hdr = ws_rom_getHeader(rom, romSize);
+
+	if (hdr->developerId == 0x01 && hdr->cartId == 0x27) // Detective Conan
 	{
-		// WS cpu is using cache/pipeline or
-		//   there's protected ROM bank where 
-		//   pointing CS 
-		
-		rom[0xfffe8]=0xea;
-		rom[0xfffe9]=0x00;
-		rom[0xfffea]=0x00;
-		rom[0xfffeb]=0x00;
-		rom[0xfffec]=0x20;
-		
+		/* Handled dynamically in cpu_readmem20 since Flash ROM is read-only */
 	}
 
-#if 1
-	ws_cyclesByLine=256;
-#else
-	ws_cyclesByLine=677;
 
-	if((( rom[romSize-10]==0x01)&&(rom[romSize-8]==0x23))|| //Final Lap special
-		((rom[romSize-10]==0x00)&&(rom[romSize-8]==0x17))|| //turn tablis
-		((rom[romSize-10]==0x01)&&(rom[romSize-8]==0x08))|| //klonoa
-		((rom[romSize-10]==0x26)&&(rom[romSize-8]==0x01))|| //ring infinity
-		((rom[romSize-10]==0x01)&&(rom[romSize-8]==0x04))|| //puyo puyo 2
-		((rom[romSize-10]==0x1b)&&(rom[romSize-8]==0x03))|| //rainbow islands
-		((rom[romSize-10]==0x28)&&(rom[romSize-8]==0x01))|| //FF1
-		((rom[romSize-10]==0x28)&&(rom[romSize-8]==0x02)))  //FF2
-			ws_cyclesByLine=837;
+	if (((hdr->developerId == 0x01) && (hdr->cartId == 0x23)) || // Final Lap special
+		((hdr->developerId == 0x00) && (hdr->cartId == 0x17)) || // turn tablis
+		((hdr->developerId == 0x26) && (hdr->cartId == 0x01)) || // ring infinity
+		((hdr->developerId == 0x01) && (hdr->cartId == 0x04)) || // puyo puyo 2
+		((hdr->developerId == 0x1b) && (hdr->cartId == 0x03)) || // rainbow islands
+		((hdr->developerId == 0x28) && (hdr->cartId == 0x01)) || // FF1
+		((hdr->developerId == 0x28) && (hdr->cartId == 0x02)))   // FF2
+	{
+		ws_cyclesByLine = 837;
+	}
 
-	if(((rom[romSize-10]==0x01)&&(rom[romSize-8]==0x3)))    //digimon tamers
-		ws_cyclesByLine=574;
-#endif
+	if ((hdr->developerId == 0x01) && (hdr->cartId == 0x08))    // Klonoa
+	{
+		ws_cyclesByLine = 384;
+        s_is_klonoa = true;
+	}
 
+	if ((hdr->developerId == 0x01) && (hdr->cartId == 0x03))    // digimon tamers
+	{
+		ws_cyclesByLine = 574;
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -112,14 +113,10 @@ void ws_patchRom(void)
 int ws_init(uint8  *rom, size_t romSize)
 {
 	ws_memory_init(rom, romSize);
-// TODO: Move patches to filebrowser_read
-    //	ws_patchRom();
+	ws_patchRom();
 	ws_io_init();
-//	ws_audio_init();
+	ws_audio_init();
 	ws_gpu_init();
-
-	if (ws_rotated())
-		ws_io_flipControls();
 
 	return(1);
 }
@@ -138,10 +135,11 @@ void ws_reset(void)
 {
 	ws_memory_reset();
 	ws_io_reset();
-//	ws_audio_reset();
+	ws_audio_reset();
 	ws_gpu_reset();
 	nec_reset(NULL);
 	nec_set_reg(NEC_SP,0x2000);
+	ws_memory_bank_changed();
 }
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -160,41 +158,23 @@ int ws_executeLine(uint8 *framebuffer, int renderLine)
 {
 	int drawWholeScreen=0;
  
-//	ws_audio_process();
+	ws_audio_process_line(ws_gpu_scanline);
 
 	// update scanline register
 	ws_ioRam[2]=ws_gpu_scanline;
 
-	ws_cycles=nec_execute((ws_cyclesByLine>>1)+(rand()&7));
-
-	ws_cycles+=nec_execute((ws_cyclesByLine>>1)+(rand()&7));
+	ws_cycles=nec_execute(ws_cyclesByLine>>1);
+	ws_cycles+=nec_execute((ws_cyclesByLine+1)>>1);
 #ifdef DEBUG
 sprintf(buf, "%d", ws_cycles);
 pgDebug(buf, 2);
 #endif
-	if(ws_cycles>=ws_cyclesByLine+ws_cyclesByLine)
-		ws_skip=ws_cycles/ws_cyclesByLine;
-	else
-		ws_skip=1;
-	ws_cycles%=ws_cyclesByLine;
+	if (renderLine && ws_gpu_scanline < 144)
+		ws_gpu_renderScanline(framebuffer);
 
-#ifdef DEBUG
-sprintf(buf, "%d", ws_cycles);
-pgDebug(buf, 3);
-#endif
-
-	for(uint32 uI=0;uI<ws_skip;uI++)
-	{
-	   if (renderLine)
-		   ws_gpu_renderScanline(framebuffer);
-
-		ws_gpu_scanline++;
-		if(ws_gpu_scanline==144) {
-			drawWholeScreen=1;
-//			renderer_update_sound();
-//			render_screen();
-		}
-
+	ws_gpu_scanline++;
+	if (ws_gpu_scanline == 144) {
+		drawWholeScreen = 1;
 	}
 
 #ifdef DEBUG
@@ -205,13 +185,29 @@ pgDebug(buf, 4);
 	{
 		ws_gpu_scanline=0;
 		{
-			if((ws_ioRam[0xb2]&32))/*VBLANK END INT*/ 
+			/* A timer whose reload value was never programmed cannot count: no event.
+			 * Final Fantasy switches both timers on (and their interrupts) before it has
+			 * even built its interrupt dispatch table, relying on exactly that. Firing
+			 * every line instead sent the ISR through an empty table. Klonoa is the one
+			 * game that needs the every-line behaviour (its voice streaming), so it keeps it. */
+			if ((ws_ioRam[0xa2] & 0x04) && ((ws_ioRam[0xa6] | ws_ioRam[0xa7]) || s_is_klonoa)) /* VBLANK TIMER ENABLE */
 			{
-				if(ws_ioRam[0xa7]!=0x35)/*Beatmania Fix*/
-				{
-					ws_ioRam[0xb6]&=~32;
-					nec_int((ws_ioRam[0xb0]+5)*4);
+				uint16_t reload = ws_ioRam[0xa6] | (ws_ioRam[0xa7] << 8);
+				uint16_t count = ws_ioRam[0xaa] | (ws_ioRam[0xab] << 8);
+				if (count <= 1 || reload == 0) {
+					count = (reload > 1) ? reload : 1;
+					if (ws_ioRam[0xb2] & 32) {
+						ws_ioRam[0xb6] |= 32;
+						ws_check_interrupts();
+					}
+					if (!(ws_ioRam[0xa2] & 0x08)) {
+						ws_ioRam[0xa2] &= ~0x04;
+					}
+				} else {
+					count--;
 				}
+				ws_ioRam[0xaa] = count & 0xFF;
+				ws_ioRam[0xab] = count >> 8;
 			}
 		}
 	}
@@ -224,24 +220,28 @@ pgDebug(buf, 4);
 #ifdef DEBUG
 pgDebug("VBLANK INT", 5);
 #endif
-			ws_ioRam[0xb6]&=~64;
-			nec_int((ws_ioRam[0xb0]+6)*4);
+			ws_ioRam[0xb6] |= 64;
+			ws_check_interrupts();
 		}
 	}
-	if(ws_ioRam[0xa4]&&(ws_ioRam[0xb2]&128)) /*HBLANK INT*/
+	if ((ws_ioRam[0xa2] & 0x01) && ((ws_ioRam[0xa4] | ws_ioRam[0xa5]) || s_is_klonoa)) /* HBLANK TIMER ENABLE, see above */
 	{
-#ifdef DEBUG
-pgDebug("VBLANK INT", 6);
-#endif
-		if(!ws_ioRam[0xa5])
-			ws_ioRam[0xa5]=ws_ioRam[0xa4];
-		if(ws_ioRam[0xa5]) 
-			ws_ioRam[0xa5]--;
-		if((!ws_ioRam[0xa5])&&(ws_ioRam[0xb2]&128))
-		{
-			ws_ioRam[0xb6]&=~128;
-			nec_int((ws_ioRam[0xb0]+7)*4);
+		uint16_t reload = ws_ioRam[0xa4] | (ws_ioRam[0xa5] << 8);
+		uint16_t count = ws_ioRam[0xa8] | (ws_ioRam[0xa9] << 8);
+		if (count <= 1 || reload == 0) {
+			count = (reload > 1) ? reload : 1;
+			if (ws_ioRam[0xb2] & 128) {
+				ws_ioRam[0xb6] |= 128;
+				ws_check_interrupts();
+			}
+			if (!(ws_ioRam[0xa2] & 0x02)) {
+				ws_ioRam[0xa2] &= ~0x01;
+			}
+		} else {
+			count--;
 		}
+		ws_ioRam[0xa8] = count & 0xFF;
+		ws_ioRam[0xa9] = count >> 8;
 	}
 
 	if((ws_ioRam[0x2]==ws_ioRam[0x3])&&(ws_ioRam[0xb2]&16)) /*SCANLINE INT*/
@@ -249,8 +249,8 @@ pgDebug("VBLANK INT", 6);
 #ifdef DEBUG
 pgDebug("SCANLINE INT", 76);
 #endif
-		ws_ioRam[0xb6]&=~16;
-		nec_int((ws_ioRam[0xb0]+4)*4);
+		ws_ioRam[0xb6] |= 16;
+		ws_check_interrupts();
 	}
 
   return(drawWholeScreen);
@@ -270,7 +270,7 @@ void ws_done(void)
 {
 	ws_memory_done();
 	ws_io_done();
-//	ws_audio_done();
+	ws_audio_done();
 	ws_gpu_done();
 }
 ////////////////////////////////////////////////////////////////////////////////
@@ -306,6 +306,7 @@ void	ws_set_system(int system)
 	else
 	if (system==WS_SYSTEM_MONO)
 		ws_gpu_forceMonoSystem();
+	ws_memory_bank_changed();
 }
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -748,6 +749,7 @@ __always_inline int ws_rotated(void)
 {
 	uint8	*rom=memory_getRom();
 	uint32	romSize=memory_getRomSize();
-
-	return(rom[romSize-4]&1);
+	if (!rom || romSize < 10) return 0;
+	ws_romHeaderStruct *hdr = ws_rom_getHeader(rom, romSize);
+	return (hdr->flags & 1);
 }

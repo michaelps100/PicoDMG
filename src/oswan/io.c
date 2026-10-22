@@ -12,16 +12,19 @@
 
 
 #include <string.h>
+#include "pico.h"
 #include <io.h>
 #include "./nec/nec.h"
 #include "initialio.h"
 #include "ieeprom.h"
 #include "gpu.h"
-#include "psram_spi.h"
-//#include "audio.h"
+#include "memory.h"
+#include <stdbool.h>
+#include "ws_audio.h"
 
 extern uint32 externalEepromAddressMask;
 extern uint32 romAddressMask;
+extern bool ili9341_get_ws_vertical(void);
 
 __aligned(4) uint8 ws_ioRam[0x100];
 
@@ -126,7 +129,7 @@ void ws_io_done(void) {
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
-uint8_t cpu_readport(uint8_t port) {
+uint8_t __not_in_flash_func(cpu_readport)(uint8_t port) {
     int w1, w2;
 
     switch (port) {
@@ -134,6 +137,8 @@ uint8_t cpu_readport(uint8_t port) {
         case 0x4f:
         case 0x50:
         case 0x51:
+        case 0x6a:
+        case 0x6b:
         case 0x80:
         case 0x81:
         case 0x82:
@@ -155,10 +160,8 @@ uint8_t cpu_readport(uint8_t port) {
         case 0x92:
         case 0x93:
         case 0x94:
-//				return(ws_audio_port_read(port));
-            return 0xff;
-        case 0xaa:
-            return 0xff;
+        case 0x95:
+            return ws_audio_port_read(port);
         case 0xb3:    // ???
             if (ws_ioRam[0xb3] < 0x80)
                 return 0;
@@ -169,27 +172,48 @@ uint8_t cpu_readport(uint8_t port) {
             return 0xc4;
         case 0xb5:
             w1 = ws_ioRam[0xb5];
+            w2 = 0;
             if (w1 & 0x40) {
-                if (ws_key_flipped)
-                    w2 = (ws_key_start << 1);
-                else
-                    w2 = (ws_key_start << 1) | (ws_key_button_1 << 2) | (ws_key_button_2 << 3);
-                return (uint8) ((w1 & 0xf0) | w2);
+                /* Row 0x40: START, Button A, Button B */
+                if (ws_key_start)    w2 |= (1 << 1);
+                if (ws_key_button_1) w2 |= (1 << 2);
+                if (ws_key_button_2) w2 |= (1 << 3);
             }
             if (w1 & 0x20) {
-                if (ws_key_flipped)
-                    w2 = (ws_key_button_1) | (ws_key_button_2 << 2);
-                else
-                    w2 = (ws_key_up << 0) | (ws_key_right << 1) | (ws_key_down << 2) | (ws_key_left << 3);
-                return (uint8) ((w1 & 0xf0) | w2);
+                /* Row 0x20: X-pad */
+                if (ili9341_get_ws_vertical()) {
+                    /* In Tate mode: physical A/B map to X-pad for actions / rotation.
+                     * X1 (bit 0) = Jump (Button B).
+                     * X2 (bit 1) = Action / Wind Ring (Button A).
+                     * Never send opposing bits simultaneously (X1|X3 or X2|X4) as games cancel them.
+                     */
+                    if (ws_key_button_1) w2 |= (1 << 1); /* X2 = Button A */
+                    if (ws_key_button_2) w2 |= (1 << 0); /* X1 = Button B */
+                } else {
+                    if (ws_key_up)    w2 |= (1 << 0);
+                    if (ws_key_right) w2 |= (1 << 1);
+                    if (ws_key_down)  w2 |= (1 << 2);
+                    if (ws_key_left)  w2 |= (1 << 3);
+                }
             }
             if (w1 & 0x10) {
-                w2 = 0x00;
-                if (ws_key_flipped)
-                    w2 = (ws_key_up << 1) | (ws_key_right << 2) | (ws_key_down << 3) | (ws_key_left);
-                return (uint8) ((w1 & 0xf0) | w2);
+                /* Row 0x10: Y-pad */
+                if (ili9341_get_ws_vertical()) {
+                    /* In Tate mode: physical D-pad maps to Y-pad for directional movement */
+                    if (ws_key_left)  w2 |= (1 << 0); /* Y1 = Left */
+                    if (ws_key_up)    w2 |= (1 << 1); /* Y2 = Up */
+                    if (ws_key_right) w2 |= (1 << 2); /* Y3 = Right */
+                    if (ws_key_down)  w2 |= (1 << 3); /* Y4 = Down */
+                } else {
+                    if (ws_key_up)    w2 |= (1 << 0);
+                    if (ws_key_right) w2 |= (1 << 1);
+                    if (ws_key_down)  w2 |= (1 << 2);
+                    if (ws_key_left)  w2 |= (1 << 3);
+                }
             }
-            break;
+            return (uint8)((w1 & 0xf0) | (w2 & 0x0f));
+        case 0xb6:
+            return ws_ioRam[0xb6];
         case 0xbe:    // internal eeprom status/command register
             // ack eeprom write
             if (ws_ioRam[0xbe] & 0x20)
@@ -215,14 +239,12 @@ uint8_t cpu_readport(uint8_t port) {
         case 0xc4:    // external eeprom even uint8_t read
             w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) &
                  (externalEepromAddressMask);
-            return read8psram(w1);
-            //return externalEeprom[w1];
+            return externalEeprom[w1 & 0x1fff];
 
         case 0xc5:    // external eeprom odd uint8_t read
             w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) &
                  (externalEepromAddressMask);
-            return read8psram(w1 + 1);
-            //				return externalEeprom[w1+1];
+            return externalEeprom[(w1 + 1) & 0x1fff];
 
         case 0xc8:    // external eeprom status/command register
             // ack eeprom write
@@ -291,19 +313,46 @@ uint8_t cpu_readport(uint8_t port) {
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
-void cpu_writeport(uint32_t port, uint8_t value) {
+void __not_in_flash_func(cpu_writeport)(uint32_t port, uint8_t value) {
     int w1;
+    /* OUT DX,AL / OUT DX,AX hand over a 16-bit port number. Final Fantasy loads only DL
+     * (mov dl,8Eh) and leaves whatever was in DH, so it really does issue OUT to values
+     * like 0x948E and relies on the hardware decoding just the low 8 bits. ws_ioRam[] has
+     * 256 entries: indexing it with the full number wrote ~38 KB past its end (silent
+     * while RAM sat behind it, a bus fault once the array moved to the top of SRAM). */
+    port &= 0xFFu;
+    ws_mc++; /* any port write counts as a state change for idle detection */
 
-    if (ws_ioRam[port] == value)
+    if (port == 0xb6) {
+        ws_ioRam[0xb6] &= ~value;
+        ws_check_interrupts();
         return;
+    }
+
+    if (ws_ioRam[port] == value) {
+        if (port != 0x52 && port != 0x48 && (port < 0x80 || port > 0x95))
+            return;
+    }
 
     ws_ioRam[port] = value;
 
+    /* ROM bank registers move the pages the CPU fast path points at */
+    if (port >= 0xc0 && port <= 0xc3) ws_memory_bank_changed();
+
     switch (port) {
+        case 0xb2:
+            ws_check_interrupts();
+            break;
         case 0x4e:
         case 0x4f:
         case 0x50:
         case 0x51:
+            break;
+        case 0x52:
+            ws_audio_port_write(port, value);
+            break;
+        case 0x6a:
+        case 0x6b:
         case 0x80:
         case 0x81:
         case 0x82:
@@ -325,7 +374,8 @@ void cpu_writeport(uint32_t port, uint8_t value) {
         case 0x92:
         case 0x93:
         case 0x94:
-//				ws_audio_port_write(port,value);
+        case 0x95:
+            ws_audio_port_write(port, value);
             break;
         case 0x48:    // DMA
 
@@ -363,14 +413,12 @@ void cpu_writeport(uint32_t port, uint8_t value) {
 
         case 0xc4:
             w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) & externalEepromAddressMask;
-            write8psram(w1, value);
-            //			   externalEeprom[w1]=value;
+            externalEeprom[w1 & 0x1fff] = value;
             return;
 
         case 0xc5:
             w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) & externalEepromAddressMask;
-            write8psram(w1 + 1, value);
-            //			   externalEeprom[w1+1]=value;
+            externalEeprom[(w1 + 1) & 0x1fff] = value;
             return;
 
         case 0xca:
