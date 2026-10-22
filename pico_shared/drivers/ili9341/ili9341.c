@@ -1822,6 +1822,13 @@ void __not_in_flash_func(ili9341_stream_ws_frame_end)(void) {
 
 static uint16_t s_ws_vxmap[ILI9341_WIDTH];
 static bool     s_ws_vxmap_ready = false;
+/* Image span of a Tate row: only these pixels are sent, the side borders are cleared once
+ * when the mode is entered (clear_black on toggle, game start and menu exit). */
+static uint16_t s_ws_vx0 = 0u;
+static uint16_t s_ws_vw  = ILI9341_WIDTH;
+/* Rows last sent full width because an overlay (FPS, volume HUD) reached into the borders;
+ * their next send is full width too, which wipes the overlay off the borders. */
+static bool     s_ws_vrow_wide[ILI9341_HEIGHT];
 static dmg_scale_weight_t s_ws_vxweights[ILI9341_WIDTH];
 
 static uint8_t  s_ws_vstretch_rows[2][WS_VERT_H][2];
@@ -1901,6 +1908,8 @@ static void ws_prepare_vxmap(void) {
             }
         }
     }
+    s_ws_vx0 = (uint16_t)disp_x;
+    s_ws_vw  = (uint16_t)disp_w;
     s_ws_vxmap_ready = true;
 }
 
@@ -1950,6 +1959,13 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
 
     ws_prepare_vxmap();
 
+    const bool overlay = (s_fps_enabled && row >= 8 && row < 16) ||
+                         (row >= 180 && row < 200 && dmg_volume_hud_is_active());
+    const bool wide = overlay || s_ws_vrow_wide[row];
+    s_ws_vrow_wide[row] = overlay;
+    const uint16_t xlo = wide ? 0u : s_ws_vx0;
+    const uint16_t xhi = wide ? (uint16_t)ILI9341_WIDTH : (uint16_t)(s_ws_vx0 + s_ws_vw);
+
     const uint8_t slot = s_write_slot;
     while (__atomic_load_n(&s_slot_state[slot], __ATOMIC_ACQUIRE)) {
         tight_loop_contents();
@@ -1962,14 +1978,14 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
     if (!apply_grid) {
         if (!do_blend) {
             if (ws_gpu_colorActive) {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t mx = s_ws_vxmap[x];
                     if (mx == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t idx = indexed_144[mx];
                     dst16[x] = wsc_palette_rgb565[idx];
                 }
             } else {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t mx = s_ws_vxmap[x];
                     if (mx == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t idx = indexed_144[mx] & 0x0Fu;
@@ -1978,7 +1994,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
             }
         } else {
             if (ws_gpu_colorActive) {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t i0 = s_ws_vxweights[x].src_idx;
                     if (i0 == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t w1 = s_ws_vxweights[x].weight1;
@@ -1991,7 +2007,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
                     }
                 }
             } else {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t i0 = s_ws_vxweights[x].src_idx;
                     if (i0 == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t w1 = s_ws_vxweights[x].weight1;
@@ -2008,7 +2024,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
     } else {
         if (!do_blend) {
             if (ws_gpu_colorActive) {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t mx = s_ws_vxmap[x];
                     if (mx == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t idx = indexed_144[mx];
@@ -2026,7 +2042,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
                     dst16[x] = __builtin_bswap16(c);
                 }
             } else {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t mx = s_ws_vxmap[x];
                     if (mx == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t idx = indexed_144[mx] & 0x0Fu;
@@ -2046,7 +2062,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
             }
         } else {
             if (ws_gpu_colorActive) {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t i0 = s_ws_vxweights[x].src_idx;
                     if (i0 == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t w1 = s_ws_vxweights[x].weight1;
@@ -2070,7 +2086,7 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
                     dst16[x] = __builtin_bswap16(c);
                 }
             } else {
-                for (uint16_t x = 0; x < ILI9341_WIDTH; x++) {
+                for (uint16_t x = xlo; x < xhi; x++) {
                     uint16_t i0 = s_ws_vxweights[x].src_idx;
                     if (i0 == 0xFFFFu) { dst16[x] = 0; continue; }
                     uint8_t w1 = s_ws_vxweights[x].weight1;
@@ -2129,6 +2145,8 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
     }
 
     s_slot_row[slot] = row;
+    s_slot_x0[slot]  = xlo;
+    s_slot_w[slot]   = (uint16_t)(xhi - xlo);
     __atomic_store_n(&s_slot_state[slot], 1u, __ATOMIC_RELEASE);
     s_write_slot = (uint8_t)((slot + 1u) % NES_LCD_SLOTS);
 }

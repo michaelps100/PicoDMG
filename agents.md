@@ -637,3 +637,29 @@ O save feito dentro do jogo (SRAM/EEPROM do cartucho) se perdia ao desligar o co
 ### Pendente
 - Comandos curtos da EEPROM (erase, EWEN/EWDS, ERAL/WRAL) continuam ignorados, como no Mednafen.
 - SRAM de 128 KB+ (`saveType` 0x03..0x05) continua espelhada nos 64 KB de `ws_staticRam`.
+
+---
+
+## 29. Slowdown no Modo Vertical (Tate) (22/10/2026)
+
+### Sintoma
+Ao girar para vertical (SELECT), o jogo perdia velocidade; no horizontal rodava a 60 FPS.
+
+### Causa
+O modo horizontal já enviava ao painel só a largura ativa da linha (`s_slot_x0`/`s_slot_w`, §27.2). O vertical (`ws_vband_push`) continuava enviando **sempre 320 px (640 B) por linha**, incluindo as bordas pretas, embora a imagem tenha só 144 px (Integer) ou 154 px (Fit). Além disso, no vertical o envio não se sobrepõe à emulação: o quadro inteiro é emulado, girado e só então as 224 linhas são empurradas. Com ~17 ms só de SPI numa cena que muda, o quadro passava de 16,7 ms.
+
+### Correção (`pico_shared/drivers/ili9341/ili9341.c`)
+- `ws_prepare_vxmap()` guarda o span da imagem em `s_ws_vx0` / `s_ws_vw`.
+- `ws_vband_push()` converte e envia só `[s_ws_vx0, s_ws_vx0 + s_ws_vw)`, preenchendo `s_slot_x0`/`s_slot_w`. Linhas consecutivas com o mesmo span seguem na mesma janela `RAMWR`.
+- As bordas não são reenviadas: já são limpas por `ili9341_clear_black()` na troca de orientação, na entrada do jogo e na saída do menu.
+- **Overlays**: as linhas do FPS (8..15, com overlay ligado) e do HUD de volume (180..199, ativo) vão em largura total. `s_ws_vrow_wide[]` marca essas linhas para que o **próximo** envio delas também seja em largura total, apagando o texto das bordas quando o overlay some (o hash dessas linhas já é invalidado ao desligar o FPS e ao expirar o HUD).
+
+### Binários
+| Alvo | Arquivo | Tamanho | Validação |
+| :--- | :--- | ---: | :--- |
+| **Core2350B (HW16)** | `PicoWS_hw16.uf2` | 832.000 B | [OK] vertical em Fit + Progressive sem slowdown (confirmado pelo usuário) |
+| **RP2350 Plus (HW15)** | `PicoWS.uf2` | 774.656 B | compila limpo; [PENDENTE] hardware |
+
+### Pendente
+- Integer e Stretch no vertical não foram testados (Stretch envia 320 px de qualquer forma; o ganho é em Integer e Fit).
+- Se ainda houver queda em cenas pesadas: enviar o quadro girado anterior **durante** a emulação do seguinte (1 quadro de latência), girar em blocos para poupar o cache da PSRAM e converter uma vez as linhas duplicadas pelo Fit.
