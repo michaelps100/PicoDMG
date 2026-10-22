@@ -663,3 +663,57 @@ O modo horizontal já enviava ao painel só a largura ativa da linha (`s_slot_x0
 ### Pendente
 - Integer e Stretch no vertical não foram testados (Stretch envia 320 px de qualquer forma; o ganho é em Integer e Fit).
 - Se ainda houver queda em cenas pesadas: enviar o quadro girado anterior **durante** a emulação do seguinte (1 quadro de latência), girar em blocos para poupar o cache da PSRAM e converter uma vez as linhas duplicadas pelo Fit.
+
+---
+
+## 30. Klonoa: Música Muda/Some ao Agarrar o Moo — Causa Real Encontrada (22/10/2026)
+
+### Sintoma
+Ao agarrar o inimigo-balão (Moo/Boo), o áudio mudava e muitas vezes a música sumia, e não voltava mais na fase.
+
+### O que os itens 22–26 descreviam (e por que estavam errados)
+Os itens 22, 23, 25 e 26 registram cinco tentativas por palpite (latch de volume na porta 0x89, gate do modo voz, timers, 384/837 ciclos). **Nenhuma está no código atual**: `src/oswan/ws_audio.c` é idêntico a `ws_audio_pristine.c`. Duas premissas deles eram falsas, confirmadas pela ROM e pelo trace:
+- "O Klonoa não programa recarga no timer de HBlank": falso. O boot (`ROM 0x401A1`) faz `out A4,1`, `out A6,1`, `out A2,0x0F`, `B2=0xC0`. O hack `s_is_klonoa` em `ws.c` virou código morto (mantido, sem efeito no Klonoa).
+- A voz PCM não era o problema: o trace mostrou a voz tocando 1 amostra por linha, sem saturar o mixer, e a música continuando depois dela.
+
+### Método
+1. Desmontagem da ROM com capstone (modo 16 bits) para entender o driver de som:
+   | Endereço | Função |
+   | :--- | :--- |
+   | `0x4DE8D` | tick do driver, chamado nas ISRs de VBlank; reconstrói a porta 0x90 a partir de `[0x271]` |
+   | `0x4E312` | início da voz: `[0x271] \|= 0x22`, instala ISR `4000:E7B7`, `B2 \|= 0x80`, `0x94=0x0F` |
+   | `0x4E759` | ISR de voz: 1 amostra por HBlank em `out 0x89`; no fim zera `[0x264]` e `B2 &= 0x7F` |
+   | `0x4DE37` | parada forçada da voz (`0x94=0`, `0x90 &= 0xDD`, `B2 &= 0x7F`) |
+   | `0x4DDDD` | **parada de um som** (chamada de `0x4A7D9`, logo após a lógica de agarrar) |
+2. Trace em hardware (`src/oswan/ws_snd_trace.{h,c}`): escritas de som/timer/interrupção + resumo por quadro, gravado em `0:/saves/ws/klonoa_trace.txt` ao abrir o menu.
+
+### Causa raiz
+No quadro do evento o trace mostrou, numa única passada: `OUT 90=8D` e depois `88..8F=8D`. A porta **0x8F é a base da RAM de formas de onda**, gravada só uma vez no boot (`0x0A` → `0x280`) e **nunca mais**. A partir daí os 4 canais tocam lixo da RAM em `0x2340`: o timbre muda ou a música some.
+
+Como o jogo chega lá:
+1. `0x4DDDD` calcula a trilha a partir do byte da tabela de sons **sem** `and al,0x0F` (a rotina de tocar, `0x4DD97`, mascara). O som `0x0D` tem byte `0xC1` → trilha em `0x100 + 0xC1*0x58` = **`0x4358`**.
+2. O WonderSwan **mono tem só 16 KB** de RAM interna; `0x4358` não existe. O emulador devolvia **`0xFF`** ali.
+3. Com `[0x435A]=0xFF`, o teste `& 0x20` (trilha de voz) passa e chama `0x4DE28`, que termina com `AL = porta90 & 0xDD` = `0x8D`.
+4. Com `[0x435B]=0xFF` (máscara de canais), o laço `out dx,al` com `dx=0x88..` escreve `0x8D` nas 8 portas, incluindo a 0x8F.
+
+No hardware (ares, `Bus::read`/`Bus::write`): no modelo mono, RAM interna `0x4000..0xFFFF` **lê `0x90` e descarta escritas**. Com `0x90`, o bit 0x20 está limpo (sem chamada, `AL` continua 0) e a máscara `0x90` só zera os volumes de 2 canais, que o driver regrava na nota seguinte. Mednafen dá 64 KB de RAM inclusive no mono, o que também não dispara o bug (a área fica zerada).
+
+### Correção (`src/oswan/memory.c`)
+- `cpu_readmem20_slow`, banco 0: mono e `offset >= 0x4000` → `0x90` (era `0xFF`).
+- `cpu_writemem20`, banco 0: mono e `offset >= 0x4000` → escrita descartada.
+- O teste usa `ws_gpu_operatingInColor` (modelo do aparelho), não `ws_gpu_colorActive` (modo de cor): um WSC em modo mono continua com 64 KB, como no ares (`system.color()`).
+- Os caminhos rápidos do V30 não contornam: leitura vai por `ws_page[0]` (NULL no mono → caminho lento) e escrita rápida só abaixo de `0x2000`.
+
+### Trace de diagnóstico (mantido, desligado)
+`WS_SND_TRACE` é **0 por padrão**: todos os ganchos (`io.c`, `nec.c`, `ws.c`, `ws_audio.c`, `main.cpp`) viram inline vazio e nada é alocado. Para ligar: build com PSRAM e `-DWS_EXTRA_DEFS="WS_SND_TRACE=1"`. Ocupa 256 KB de PSRAM e ~1,5 KB de SRAM; grava o arquivo a cada abertura do menu.
+
+### Binários
+| Alvo | Arquivo | Tamanho | Validação |
+| :--- | :--- | ---: | :--- |
+| **Core2350B (HW16)** | `PicoWS_hw16.uf2` | 832.000 B | [OK] música intacta depois de agarrar o Moo (confirmado pelo usuário, build com trace ligado; o final difere só pelo trace desligado) |
+| **RP2350 Plus (HW15)** | `PicoWS.uf2` | 775.168 B | compila limpo; [PENDENTE] hardware |
+
+### Pendente / observações
+- A correção vale para todos os jogos mono: alinha com o hardware, mas convém um teste rápido em outros `.ws`.
+- O emulador roda o WS a 60 quadros/s em vez de 75,47 (`BASE_FRAME_US`): a voz sai a ~9,5 kHz em vez de 12 kHz e a música fica 20% mais lenta. Limitação global, não relacionada a este bug.
+- O trace mostrou ~6 interrupções de HBlank perdidas por quadro durante a voz (pendentes enquanto a ISR de VBlank roda); inaudível, mas registrado.

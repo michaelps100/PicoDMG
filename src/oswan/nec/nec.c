@@ -50,6 +50,7 @@
 #define cpu_writemem20 ws_write20
 #endif
 #include "necintrf.h"
+#include "../ws_snd_trace.h"
 
 typedef union
 {                   /* eight general registers */
@@ -1028,6 +1029,7 @@ void ws_check_interrupts(void)
 	for (int i = 0; i < 8; i++) {
 		if (pending & (1 << i)) {
 			uint32_t wektor = ((uint32_t)ws_ioRam[0xb0] + i) * 4;
+			ws_trace_irq(i);
 			nec_int(wektor);
 			break;
 		}

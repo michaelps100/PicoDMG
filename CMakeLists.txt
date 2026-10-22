@@ -70,6 +70,7 @@ set(OSWAN_SRC
     src/oswan/io.c
     src/oswan/gpu.c
     src/oswan/ws_audio.c
+    src/oswan/ws_snd_trace.c
     src/oswan/nec/nec.c
 )
 

@@ -16,6 +16,21 @@
 #include "memory.h"
 #include "io.h"
 #include "external_audio.h"
+#include "ws_snd_trace.h"
+
+#if WS_SND_TRACE
+static ws_audio_trace_t s_tr;
+
+static inline uint8_t tr_abs8(int32_t v) {
+    if (v < 0) v = -v;
+    return v > 255 ? 255 : (uint8_t)v;
+}
+
+void ws_audio_trace_take(ws_audio_trace_t *out) {
+    *out = s_tr;
+    memset(&s_tr, 0, sizeof(s_tr));
+}
+#endif
 
 extern uint8_t cpu_readmem20(uint32_t addr);
 
@@ -358,6 +373,27 @@ static inline uint32_t ws_audio_render_sample(void) {
 
     int32_t out_l = (mix_l * 54 * cur_vol) >> 8;
     int32_t out_r = (mix_r * 54 * cur_vol) >> 8;
+
+#if WS_SND_TRACE
+    if (ws_trace_on) {
+        for (int ch = 0; ch < 4; ch++) {
+            uint8_t p = tr_abs8(ch_l[ch]);
+            uint8_t q = tr_abs8(ch_r[ch]);
+            if (q > p) p = q;
+            if (p > s_tr.ch_peak[ch]) s_tr.ch_peak[ch] = p;
+        }
+        if (s_hvoice_ctrl & 0x80) {
+            uint8_t h = tr_abs8((int32_t)s_hyper_voice - 128);
+            if (h > s_tr.hv_peak) s_tr.hv_peak = h;
+        }
+        int32_t pk = mix_l < 0 ? -mix_l : mix_l;
+        int32_t pr = mix_r < 0 ? -mix_r : mix_r;
+        if (pr > pk) pk = pr;
+        if (pk > s_tr.mix_peak) s_tr.mix_peak = (uint16_t)(pk > 0xFFFF ? 0xFFFF : pk);
+        if ((out_l > 32767 || out_l < -32768 || out_r > 32767 || out_r < -32768) && s_tr.clipped != 0xFFFF)
+            s_tr.clipped++;
+    }
+#endif
 
     if (out_l > 32767)  out_l = 32767;
     else if (out_l < -32768) out_l = -32768;

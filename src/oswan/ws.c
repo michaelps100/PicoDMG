@@ -24,6 +24,7 @@
 #include "gpu.h"
 #include "ws.h"
 #include "ws_audio.h"
+#include "ws_snd_trace.h"
 
 
 //#define DEBUG
@@ -183,6 +184,7 @@ pgDebug(buf, 4);
 #endif
 	if(ws_gpu_scanline>158)
 	{
+		ws_trace_frame_end();
 		ws_gpu_scanline=0;
 		{
 			/* A timer whose reload value was never programmed cannot count: no event.
@@ -220,6 +222,7 @@ pgDebug(buf, 4);
 #ifdef DEBUG
 pgDebug("VBLANK INT", 5);
 #endif
+			ws_trace_timer_fire(6, (ws_ioRam[0xb6] & 64) != 0);
 			ws_ioRam[0xb6] |= 64;
 			ws_check_interrupts();
 		}
@@ -231,6 +234,7 @@ pgDebug("VBLANK INT", 5);
 		if (count <= 1 || reload == 0) {
 			count = (reload > 1) ? reload : 1;
 			if (ws_ioRam[0xb2] & 128) {
+				ws_trace_timer_fire(7, (ws_ioRam[0xb6] & 128) != 0);
 				ws_ioRam[0xb6] |= 128;
 				ws_check_interrupts();
 			}

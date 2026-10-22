@@ -21,6 +21,7 @@
 #include "memory.h"
 #include <stdbool.h>
 #include "ws_audio.h"
+#include "ws_snd_trace.h"
 
 extern uint32 externalEepromAddressMask;
 extern uint32 romAddressMask;
@@ -322,6 +323,7 @@ void __not_in_flash_func(cpu_writeport)(uint32_t port, uint8_t value) {
      * 256 entries: indexing it with the full number wrote ~38 KB past its end (silent
      * while RAM sat behind it, a bus fault once the array moved to the top of SRAM). */
     port &= 0xFFu;
+    ws_trace_port((uint8_t)port, value);
     ws_mc++; /* any port write counts as a state change for idle detection */
 
     if (port == 0xb6) {

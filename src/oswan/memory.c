@@ -78,7 +78,7 @@ void ws_memory_bank_changed(void) {
     if (!ws_rom || romSize < 0x10000 || (romSize & 0xFFFF) || romAddressMask < 0xFFFF) return;
 
     /* Bank 0: 64 KB of internal RAM only on a WonderSwan Color (the mono model
-     * mirrors/returns 0xFF past 16 KB, which needs the slow path). */
+     * has 16 KB and reads 0x90 past it, which needs the slow path). */
     if (ws_gpu_operatingInColor) ws_page[0] = internalRam;
 
     /* Bank 1: cartridge SRAM. With 64 KB or more the 16-bit offset indexes the
@@ -112,6 +112,8 @@ void cpu_writemem20(uint32_t addr, uint8_t value) {
 
     // 0 - RAM - 16 KB (WS) / 64 KB (WSC) internal RAM
     if (!bank) {
+        /* The mono WonderSwan has no RAM at 0x4000-0xFFFF: writes go nowhere (ares Bus::write) */
+        if (!ws_gpu_operatingInColor && offset >= 0x4000) return;
         if (internalRam[offset] != value) ws_mc++;
         ws_gpu_write_byte(offset, value);
 //		ws_audio_write_byte(offset,value);
@@ -155,7 +157,14 @@ static uint8_t cpu_readmem20_slow(uint32_t addr) {
         case 0:        // 0 - RAM - 16 KB (WS) / 64 KB (WSC) internal RAM
             if (ws_gpu_operatingInColor || offset < 0x4000)
                 return (internalRam[offset]);
-            return (0xff);
+            /* Mono WonderSwan: 0x4000-0xFFFF is unpopulated and reads 0x90 (ares Bus::read).
+             * Klonoa depends on it: its stop-sound routine (ROM 0x4DDDD) forgets to mask the
+             * priority nibble of the track number, so stopping sound 0x0D indexes a track at
+             * 0x4358. Reading 0xFF there made the game take the voice-stop branch and write
+             * the clobbered AL (0x8D) to ports 0x88-0x8F, moving the wavetable base (0x8F)
+             * off the instruments: the music changed or went silent after the Moo grab.
+             * With 0x90 the same code only zeroes two channel volumes, as on hardware. */
+            return (0x90);
 
         case 1:    // 1 - SRAM (cart)
             if (sramAddressMask) {

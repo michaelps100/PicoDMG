@@ -50,6 +50,7 @@ extern "C" {
 #include "oswan/io.h"
 #include "oswan/rom.h"
 #include "oswan/ws_audio.h"
+#include "oswan/ws_snd_trace.h"
 }
 #include "ws_state_io.h"
 
@@ -865,6 +866,7 @@ typedef enum {
 static ingame_action_e show_ingame_menu(const char *game_name) {
     watchdog_disable();
     ws_flush_battery_save();
+    ws_trace_dump("0:/saves/ws/klonoa_trace.txt");   /* no-op unless WS_SND_TRACE=1 */
     dmg_action_t act = dmg_ingame_menu(&s_ws_desc, game_name);
     if (act == DMG_ACTION_RESUME || act == DMG_ACTION_RESET) {
         ili9341_clear_black();
@@ -892,6 +894,18 @@ static void run_game(void) {
     uint8_t *rom_base = s_rom_in_psram ? s_rom_ptr : (uint8_t *)WS_ROM_CACHE_ABS;
     ws_init(rom_base, s_last_flashed_size);
     ws_reset();
+#if WS_SND_TRACE
+    /* Optional sound/timer/interrupt trace (WS_SND_TRACE=1, see ws_snd_trace.h): 16384
+     * entries in PSRAM, dumped to the card each time the pause menu opens. Allocated once. */
+    static void *s_trace_buf = nullptr;
+    const size_t trace_bytes = 16384u * 16u;
+    if (s_trace_buf == nullptr && Frens::isPsramEnabled() &&
+        (uint32_t)Frens::GetAvailableMemory() > trace_bytes + 1024u * 1024u) {
+        s_trace_buf = Frens::f_malloc(trace_bytes);
+        if (s_trace_buf) ws_trace_attach(s_trace_buf, trace_bytes);
+    }
+#endif
+    ws_trace_reset();
     ws_romHeaderStruct *hdr = ws_rom_getHeader(rom_base, s_last_flashed_size);
     const char *ext = strrchr(s_selected_rom, '.');
     if ((hdr && hdr->minimumSupportSystem == WS_SYSTEM_COLOR) || (ext && strcasecmp(ext, ".wsc") == 0))
