@@ -313,6 +313,7 @@ uint8_t __not_in_flash_func(cpu_readport)(uint8_t port) {
 //
 //
 ////////////////////////////////////////////////////////////////////////////////
+extern volatile uint32_t ws_sram_epoch;
 void __not_in_flash_func(cpu_writeport)(uint32_t port, uint8_t value) {
     int w1;
     /* OUT DX,AL / OUT DX,AX hand over a 16-bit port number. Final Fantasy loads only DL
@@ -329,8 +330,11 @@ void __not_in_flash_func(cpu_writeport)(uint32_t port, uint8_t value) {
         return;
     }
 
+    /* EEPROM data/command ports (0xBA..0xBE, 0xC4..0xC8) are never skipped: writing the same
+     * word to two addresses, or issuing the same command twice, is a real second access. */
     if (ws_ioRam[port] == value) {
-        if (port != 0x52 && port != 0x48 && (port < 0x80 || port > 0x95))
+        if (port != 0x52 && port != 0x48 && (port < 0x80 || port > 0x95) &&
+            (port < 0xba || port > 0xbe) && (port < 0xc4 || port > 0xc8))
             return;
     }
 
@@ -411,14 +415,20 @@ void __not_in_flash_func(cpu_writeport)(uint32_t port, uint8_t value) {
             internalEeprom[w1] = value;
             return;
 
-        case 0xc4:
-            w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) & externalEepromAddressMask;
-            externalEeprom[w1 & 0x1fff] = value;
+        case 0xc4:    /* external EEPROM data latch; stored by the write command */
+        case 0xc5:
             return;
 
-        case 0xc5:
-            w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) & externalEepromAddressMask;
-            externalEeprom[(w1 + 1) & 0x1fff] = value;
+        case 0xc8:    /* external EEPROM command: bit 5 = write the latched word */
+            if ((value & 0x20) && externalEepromAddressMask) {
+                w1 = (((((uint16_t) ws_ioRam[0xc7]) << 8) | ((uint16_t) ws_ioRam[0xc6])) << 1) & externalEepromAddressMask;
+                uint8 *dst = &externalEeprom[w1 & 0x1ffe];
+                if (dst[0] != ws_ioRam[0xc4] || dst[1] != ws_ioRam[0xc5]) {
+                    dst[0] = ws_ioRam[0xc4];
+                    dst[1] = ws_ioRam[0xc5];
+                    ws_sram_epoch++;
+                }
+            }
             return;
 
         case 0xca:

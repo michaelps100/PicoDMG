@@ -599,3 +599,41 @@ Um `git checkout -- CMakeLists.txt` meu **reverteu o `CMakeLists.txt` não commi
 4. Recompilar os outros emuladores para pegar a cor corrigida do HUD de volume.
 5. Contadores leves de profiling ainda existem em `ili9341.c` (`s_prof`), sem consumidor; remover se desejado.
 6. O FF1 é uma ROM mono (`minimumSupportSystem = 0`) nomeada `.wsc`: o emulador a roda como WSC pela extensão (`main.cpp`).
+
+---
+
+## 28. Save Interno dos Jogos (`.sav`) não Chegava ao Cartão (22/10/2026)
+
+### Sintoma
+O save feito dentro do jogo (SRAM/EEPROM do cartucho) se perdia ao desligar o console; os savestates (`.ss`) sobreviviam.
+
+### Causas
+| # | Causa | Efeito |
+| :--- | :--- | :--- |
+| 1 | `ws_sram_save()` só era chamado no fim de `run_game()` (saída por SELECT+START ou Exit do menu) | Desligar o console, standby da chave POWER ou reset perdia todo save feito na sessão |
+| 2 | `cpu_writeport()` descarta escritas cujo valor é igual ao anterior (`ws_ioRam[port] == value`), e as portas de EEPROM não estavam na lista de exceções | Gravar a mesma palavra em dois endereços seguidos (ex: vários `0x0000`) só gravava a primeira: EEPROM corrompida/desatualizada |
+| 3 | Escrita em `0xC4`/`0xC5` ia direto para `externalEeprom` no endereço atual de `0xC6`/`0xC7` | Se o jogo escrevesse o dado antes do endereço, o byte ia para o endereço anterior. No hardware (e no Mednafen) a escrita só ocorre no comando de `0xC8` |
+
+### Correções
+- **`src/oswan/memory.c`**: `volatile uint32_t ws_sram_epoch`, incrementado em `cpu_writemem20()` (banco 1) só quando o byte da SRAM realmente muda. O caminho rápido do V30 (`ws_write20`) passa por `cpu_writemem20()` para `a >= 0x2000`, então nenhuma escrita na SRAM escapa.
+- **`src/oswan/io.c`**:
+  - Portas `0xBA..0xBE` e `0xC4..0xC8` nunca são descartadas pela deduplicação.
+  - `0xC4`/`0xC5` agora são apenas o latch de dados (`ws_ioRam`).
+  - `0xC8` com bit `0x20` (write) grava a palavra latchada em `externalEeprom[(addr << 1) & mask]` e incrementa `ws_sram_epoch` só se o conteúdo mudou. Leitura (`0xC4`/`0xC5` em `cpu_readport`) inalterada.
+- **`src/main.cpp`**:
+  - `s_sav_path`, `s_sav_active`, `s_sav_epoch` e `ws_flush_battery_save()`: grava o `.sav` se `ws_sram_epoch` mudou desde a última gravação; loga `[E] Battery save failed` em falha.
+  - No loop do jogo: grava ~2 s depois da última alteração (o jogo terminou de salvar) ou, se o jogo nunca parar de escrever, a cada 30 s. Após a gravação, `frame_timer` e `audio_primed` são rearmados para o frame longo do SD não ser lido como atraso.
+  - Ao abrir o menu de pausa (`show_ingame_menu`) e ao sair do jogo.
+  - `s_ws_desc.display.stop_blitter = ws_stop_blitter` (para o blitter e grava o `.sav`): é o callback que `dmg_power_enter_standby()` chama, então a chave POWER também grava antes do standby.
+  - Comentário do Reset corrigido: `ws_memory_reset()` **apaga** `ws_staticRam` e `externalEeprom`; o Reset relê o `.sav`, que está atualizado porque foi gravado ao abrir o menu.
+- Formato do `.sav` inalterado (73.728 B = `ws_staticRam` + `externalEeprom`); saves antigos continuam válidos.
+
+### Binários
+| Alvo | Arquivo | Tamanho | Validação |
+| :--- | :--- | ---: | :--- |
+| **Core2350B (HW16)** | `PicoWS_hw16.uf2` | 831.488 B | [OK] save interno persiste após desligar (confirmado pelo usuário) |
+| **RP2350 Plus (HW15)** | `PicoWS.uf2` | 774.144 B | compila limpo; [PENDENTE] hardware |
+
+### Pendente
+- Comandos curtos da EEPROM (erase, EWEN/EWDS, ERAL/WRAL) continuam ignorados, como no Mednafen.
+- SRAM de 128 KB+ (`saveType` 0x03..0x05) continua espelhada nos 64 KB de `ws_staticRam`.

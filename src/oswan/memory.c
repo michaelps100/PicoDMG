@@ -65,6 +65,9 @@ static bool s_is_conan = false;
  * Rebuilt whenever something it depends on changes: the ROM bank registers
  * 0xC0..0xC3, the colour/mono system, a reset or a state load. */
 const uint8_t *ws_page[17];
+/* Bumped whenever cartridge SRAM or the external EEPROM really changes. main.cpp watches it to
+ * write the .sav shortly after the game saves, instead of only when the game is left. */
+volatile uint32_t ws_sram_epoch;
 unsigned ws_prof_rom;
 
 void ws_memory_bank_changed(void) {
@@ -117,7 +120,7 @@ void cpu_writemem20(uint32_t addr, uint8_t value) {
         if (sramAddressMask) {
             uint32_t sram_addr = (offset + (((uint32_t)ws_ioRam[0xC1]) << 16)) & sramAddressMask;
             uint8 *dst = &ws_staticRam[sram_addr & (sizeof(ws_staticRam) - 1)];
-            if (*dst != value) { *dst = value; ws_mc++; }
+            if (*dst != value) { *dst = value; ws_mc++; ws_sram_epoch++; }
         }
     }
 

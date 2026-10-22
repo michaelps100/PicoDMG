@@ -349,6 +349,30 @@ static void save_config(void);
 static bool ws_get_fps(void);
 static void ws_apply_fps(bool on);
 
+/* Battery save (.sav) of the running game. ws_sram_epoch is bumped by the core on every real
+ * change to cartridge SRAM / external EEPROM; the .sav is written whenever it differs from
+ * the epoch last written, so a save made inside the game reaches the card without having to
+ * leave the game first. */
+extern "C" volatile uint32_t ws_sram_epoch;
+static char     s_sav_path[ROM_NAME_LEN + 32];
+static bool     s_sav_active = false;
+static uint32_t s_sav_epoch  = 0;
+
+static void ws_flush_battery_save(void) {
+    if (!s_sav_active) return;
+    const uint32_t ep = ws_sram_epoch;
+    if (ep == s_sav_epoch) return;
+    if (ws_sram_save(s_sav_path)) s_sav_epoch = ep;
+    else printf("[E] Battery save failed: %s\n", s_sav_path);
+}
+
+/* The power switch parks Core 1 through this callback before standby, and the pause
+ * menu before drawing: both are moments the .sav must be on the card. */
+static void ws_stop_blitter(void) {
+    ili9341_blitter_stop();
+    ws_flush_battery_save();
+}
+
 static void ws_custom_submenu(const struct dmg_emulator_desc *desc, const char *game_name) {
     (void)desc;
     image_submenu(game_name);
@@ -378,7 +402,7 @@ static const dmg_emulator_desc_t s_ws_desc = {
         .flush_rows = ili9341_flush_rows,
         .fill_screen = ili9341_fill_screen,
         .flush = ili9341_flush,
-        .stop_blitter = ili9341_blitter_stop,
+        .stop_blitter = ws_stop_blitter,
         .start_blitter = ili9341_blitter_start,
     },
     .is_rom_file = ws_is_rom_file,
@@ -840,6 +864,7 @@ typedef enum {
 
 static ingame_action_e show_ingame_menu(const char *game_name) {
     watchdog_disable();
+    ws_flush_battery_save();
     dmg_action_t act = dmg_ingame_menu(&s_ws_desc, game_name);
     if (act == DMG_ACTION_RESUME || act == DMG_ACTION_RESET) {
         ili9341_clear_black();
@@ -880,9 +905,11 @@ static void run_game(void) {
 
     char clean_name[64];
     get_basename(s_selected_rom, clean_name, sizeof(clean_name));
-    char sav_path[ROM_NAME_LEN + 32];
-    snprintf(sav_path, sizeof(sav_path), "%s/%s.sav", get_saves_dir(), clean_name);
+    const char *sav_path = s_sav_path;
+    snprintf(s_sav_path, sizeof(s_sav_path), "%s/%s.sav", get_saves_dir(), clean_name);
     ws_sram_load(sav_path);
+    s_sav_epoch  = ws_sram_epoch;
+    s_sav_active = true;
 
     /* Auto-detect if game is vertically oriented from ROM header */
     extern int ws_rotated(void);
@@ -912,6 +939,12 @@ static void run_game(void) {
     int32_t  lag_us      = 0;   /* how far behind real time the last frame ended */
     uint8_t  skipped_in_row = 0;
     bool     audio_primed = false;  /* ring has reached its working level at least once */
+    /* In-game saves: the .sav used to be written only when the game was left, so switching
+     * the console off after saving inside the game lost the save, while savestates (written
+     * at once) survived. Now it is written ~2 s after the last change to SRAM/EEPROM, once
+     * the game has stopped writing; a game that never stops writing is still saved every
+     * 30 s. The pause menu and the power switch flush it too (ws_stop_blitter). */
+    uint32_t sram_seen = ws_sram_epoch, sram_quiet_since = time_us_32(), sram_dirty_since = 0;
     /* Drop any half-finished SELECT+START hold or closed edge latch left over
      * from the previous game. */
     dmg_combo_reset();
@@ -983,6 +1016,22 @@ static void run_game(void) {
         }
         s_last_sel = raw_sel;
 
+        {
+            const uint32_t ep = ws_sram_epoch;
+            const uint32_t tnow = time_us_32();
+            if (ep == s_sav_epoch) {
+                sram_dirty_since = tnow;
+            } else {
+                if (ep != sram_seen) { sram_seen = ep; sram_quiet_since = tnow; }
+                if (tnow - sram_quiet_since > 2000000u || tnow - sram_dirty_since > 30000000u) {
+                    ws_flush_battery_save();
+                    sram_dirty_since = time_us_32();
+                    audio_primed = false;   /* the SD write is a long frame; do not read it as the ring running dry */
+                    frame_timer = time_us_32();
+                }
+            }
+        }
+
         if (s_req_pause && !s_req_exit) {
             s_req_pause = false;
             ingame_action_e action = show_ingame_menu(s_selected_rom);
@@ -991,12 +1040,9 @@ static void run_game(void) {
                 ws_reset();
                 /* Reload the battery save, exactly as game entry does.
                  *
-                 * ws_reset() itself does NOT clear ws_staticRam -- the memset on
-                 * that buffer in ws_memory_reset() is commented out in the Oswan
-                 * core -- so the cartridge SRAM survives in RAM. It does clear
-                 * internalRam, and the game re-probes its save locations from
-                 * power-on, so whatever the session had established in RAM was
-                 * not the state the game came up expecting.
+                 * ws_reset() clears cartridge SRAM and EEPROM along with
+                 * internalRam; the .sav was flushed when the menu opened, so it
+                 * holds the latest in-game save.
                  *
                  * Reading the .sav back makes Reset deterministic and identical
                  * to entering the game from the ROM selector, which is what
@@ -1133,7 +1179,8 @@ static void run_game(void) {
 
     watchdog_disable();
     ili9341_blitter_stop();
-    ws_sram_save(sav_path);
+    ws_flush_battery_save();   /* final flush; the game is normally saved long before this */
+    s_sav_active = false;
     ws_done();
     ili9341_clear_black();
 
