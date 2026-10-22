@@ -1552,48 +1552,65 @@ static inline uint16_t ws_dim565(uint16_t c) {
 }
 
 /* Source line resolved to native RGB565 once, so the Shimmerless blend does not
- * look every neighbour up (and byte-swap it) again for each output pixel. */
+ * look every neighbour up (and byte-swap it) again for each output pixel. With Grid
+ * the darkened copy is built here too: 224 darkenings per source line instead of one
+ * per output pixel, shared by both panel rows of a Fit line. Blending two darkened
+ * neighbours equals darkening the blend (the Grid dim is a linear scale). */
 static uint16_t s_ws_src565[WS_SRC_W + 1];
+static uint16_t s_ws_src565_dim[WS_SRC_W + 1];
 
-/* Converts one indexed 224-pixel line to the RGB565 big-endian row of the slot,
- * for the active span only (the margins are not sent). */
-static void __not_in_flash_func(ws_convert_row)(uint16_t *dst16, const uint8_t *indexed_224,
-                                                uint8_t row, bool apply_grid) {
-    const bool     color   = ws_gpu_colorActive;
-    const uint32_t imask   = color ? 0xFFu : 0x0Fu;
-    const uint16_t *lut_be  = color ? wsc_palette_rgb565 : s_ws_pal;
-    const uint16_t *lut_nat = color ? wsc_palette_rgb565_native : s_ws_pal_native;
-    const uint32_t x0 = s_ws_ax0;
-    const uint32_t x1 = (uint32_t)s_ws_ax0 + s_ws_aw;
-    const bool row_dim = apply_grid && (row & 1u);
+static void __not_in_flash_func(ws_resolve_src)(const uint8_t *indexed_224, bool apply_grid) {
     const bool do_blend = s_shimmerless_enabled && (s_scale_mode != SCALE_INTEGER);
-
-    if (!do_blend) {
-        if (!apply_grid) {
-            for (uint32_t x = x0; x < x1; x++) {
-                dst16[x] = lut_be[indexed_224[s_ws_xmap[x]] & imask];
-            }
-        } else {
-            for (uint32_t x = x0; x < x1; x++) {
-                uint16_t c = lut_nat[indexed_224[s_ws_xmap[x]] & imask];
-                if (row_dim || (x & 1u)) c = ws_dim565(c);
-                dst16[x] = __builtin_bswap16(c);
-            }
-        }
-        return;
-    }
-
+    if (!do_blend && !apply_grid) return;   /* ws_emit_row reads the big-endian LUT directly */
+    const uint32_t imask   = ws_gpu_colorActive ? 0xFFu : 0x0Fu;
+    const uint16_t *lut_nat = ws_gpu_colorActive ? wsc_palette_rgb565_native : s_ws_pal_native;
     for (int i = 0; i < WS_SRC_W; i++) {
         s_ws_src565[i] = lut_nat[indexed_224[i] & imask];
     }
     s_ws_src565[WS_SRC_W] = s_ws_src565[WS_SRC_W - 1];
+    if (apply_grid) {
+        for (int i = 0; i <= WS_SRC_W; i++) {
+            s_ws_src565_dim[i] = ws_dim565(s_ws_src565[i]);
+        }
+    }
+}
+
+/* Emits one panel row of the source line last passed to ws_resolve_src() as the RGB565
+ * big-endian row of the slot, for the active span only (the margins are not sent).
+ * Grid darkens odd rows entirely and odd columns of even rows. */
+static void __not_in_flash_func(ws_emit_row)(uint16_t *dst16, const uint8_t *indexed_224,
+                                             uint8_t row, bool apply_grid) {
+    const uint32_t x0 = s_ws_ax0;
+    const uint32_t x1 = (uint32_t)s_ws_ax0 + s_ws_aw;
+    const bool do_blend = s_shimmerless_enabled && (s_scale_mode != SCALE_INTEGER);
+
+    if (!do_blend && !apply_grid) {
+        const uint32_t imask  = ws_gpu_colorActive ? 0xFFu : 0x0Fu;
+        const uint16_t *lut_be = ws_gpu_colorActive ? wsc_palette_rgb565 : s_ws_pal;
+        for (uint32_t x = x0; x < x1; x++) {
+            dst16[x] = lut_be[indexed_224[s_ws_xmap[x]] & imask];
+        }
+        return;
+    }
+
+    const bool row_dim = apply_grid && (row & 1u);
+    const uint16_t *src[2];
+    src[0] = row_dim ? s_ws_src565_dim : s_ws_src565;      /* even columns */
+    src[1] = apply_grid ? s_ws_src565_dim : s_ws_src565;   /* odd columns */
+
+    if (!do_blend) {
+        for (uint32_t x = x0; x < x1; x++) {
+            dst16[x] = __builtin_bswap16(src[x & 1u][s_ws_xmap[x]]);
+        }
+        return;
+    }
 
     for (uint32_t x = x0; x < x1; x++) {
+        const uint16_t *sp = src[x & 1u];
         const uint32_t i0 = s_ws_xweights[x].src_idx;
         const uint8_t  w1 = s_ws_xweights[x].weight1;
-        uint16_t c = s_ws_src565[i0];
-        if (w1) c = dmg_blend_rgb565(c, s_ws_src565[i0 + 1u], w1);
-        if (apply_grid && (row_dim || (x & 1u))) c = ws_dim565(c);
+        uint16_t c = sp[i0];
+        if (w1) c = dmg_blend_rgb565(c, sp[i0 + 1u], w1);
         dst16[x] = __builtin_bswap16(c);
     }
 }
@@ -1730,6 +1747,7 @@ void __not_in_flash_func(ili9341_stream_ws_line)(int line, const uint8_t *indexe
     const uint8_t first = s_write_slot;
     const size_t span_bytes = 2u * (size_t)s_ws_aw;
     uint16_t *pristine = NULL;
+    bool resolved = false;
     uint8_t slots[2];
     uint8_t srows[2];
     uint8_t np = 0;
@@ -1741,7 +1759,11 @@ void __not_in_flash_func(ili9341_stream_ws_line)(int line, const uint8_t *indexe
         if (pristine != NULL) {
             memcpy(&dst16[s_ws_ax0], &pristine[s_ws_ax0], span_bytes);
         } else {
-            ws_convert_row(dst16, indexed_224, rows[i], grid);
+            if (!resolved) {
+                ws_resolve_src(indexed_224, grid);
+                resolved = true;
+            }
+            ws_emit_row(dst16, indexed_224, rows[i], grid);
             if (!grid) pristine = dst16;
         }
         slots[np] = slot;

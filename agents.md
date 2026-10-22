@@ -774,3 +774,67 @@ Sem botão físico: X2 nos jogos verticais (a terceira ação do Tetris).
 2. Digimon girado com SELECT: mesmos controles do item 1.
 3. Klonoa horizontal e girado: igual à horizontal de antes.
 4. Tetris: A e B giram a peça em sentidos opostos; A confirma nos menus; D-pad como antes.
+
+---
+
+## 32. Digimon 02 D1 Tamers: 60 FPS com Folga e Áudio sem Estalos (22/10/2026)
+
+### Sintoma
+Em Fit + Progressive + Shimmerless + Grid, no Core2350B, o Digimon Adventure 02 - D1 Tamers (Japan e English v0.97) caía às vezes para 57–58 FPS, e nesses trechos o áudio ficava horrível.
+
+### Método
+Build de diagnóstico temporário (`WS_PROFILE=1`, **já removido**) com duas linhas no overlay de FPS, medidas por quadro no trecho onde o jogo caía:
+
+| Medida | O que é |
+| :--- | :--- |
+| `n` | V30 + áudio + timers |
+| `m` | pior quadro do segundo |
+| `g` | renderizador de linhas (`ws_gpu_renderScanline`) |
+| `p` | conversão de pixels para o painel (`ili9341_stream_ws_line`) |
+| `w` / `c` | Core 0 esperando slot / Core 1 no SPI |
+| `s` | quadros não desenhados |
+| `f` | menor nível do anel I2S (%) |
+| `u` | underruns do DMA de áudio por segundo |
+| `L` | linhas por quadro no renderizador completo em flash |
+
+### Resultados (mesmo ponto do jogo)
+| Build | n | m | g | p | FPS | w | c | s | f | u | L |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 574 ciclos/linha (antigo) | 13,4 | 18,0 | 3,1 | 0,7 | 58 | 0,0 | 1,8 | 0 | 4 | 281 | 144 |
+| 256 ciclos/linha | 7,5 | 13,4 | 3,1 | 1,2 | 61 | 0,0 | 2,7 | 0 | 48 | 0 | 144 |
+| 256 + caminho rápido com janelas (final) | 7,5 | 13,8 | 3,3 | 1,2 | 61 | 0,0 | 2,8 | 0 | 48 | 0 | 0 |
+
+Tempos em ms por quadro. O FPS de 61 é arredondamento da janela de 1 s; o pacing segue o DAC.
+
+### Causas
+| # | Causa | Efeito |
+| :--- | :--- | :--- |
+| 1 | `ws_patchRom()` dava **574 ciclos por linha** ao par dev `0x01` / cart `0x03` (header das duas ROMs: `01 01 03`), 2,24× os 256 do hardware. Speed hack herdado do Oswan | A detecção de ciclo ocioso (§27.3) escondia o custo enquanto o jogo esperava no escalonador; numa cena ocupada o V30 pagava cada ciclo extra: ~17 ms por quadro contra 16,7 disponíveis |
+| 2 | `audio_primed` só ligava quando o anel chegava a 50% depois da espera do pacing. Um jogo lento desde o primeiro quadro nunca chega lá | O salto de desenho e o esticamento de áudio ficavam **desligados a sessão inteira**: anel a 4%, 281 underruns/s, nenhum quadro pulado (`s0` com `f4`). É isso que tornava o áudio "horrível" e não só falho |
+| 3 | Quadros atrasados geravam 735 amostras mesmo assim; a menos de 60 quadros/s o DAC consome mais do que recebe | O anel esvazia, `dma_handler` não rearma o DMA, e cada lacuna é um estalo |
+
+### Correções
+1. **`src/oswan/ws.c`**: `WS_DIGIMON_CYCLES`, padrão **256**, sobrescrevível por `-DWS_EXTRA_DEFS="WS_DIGIMON_CYCLES=574"` para A/B. Os motivos que justificavam o hack no Oswan (interrupções descartadas, timers errados) foram corrigidos nos itens 23 e 27.5. O jogo foi conferido pelo usuário a 256.
+2. **`src/main.cpp`**: `audio_primed` também liga após 30 quadros (`unprimed_frames`), zerado junto com ele na gravação do `.sav`. Vale para todos os jogos.
+3. **Áudio esticado** (`ws_audio.c`, `ws_audio_set_samples_per_frame()`): com o anel abaixo de 50%, o quadro seguinte gera até **800 amostras** (+9%, linear de 50% a 25% de fill) em vez de 735. O valor é travado na linha 0, então um quadro nunca mistura duas contagens. Os osciladores avançam pelo relógio do WS por amostra de saída, então **o tom não muda**: o quadro só dura um pouco mais de áudio, acompanhando a lentidão que o jogo já tem. A voz PCM (amostra escrita pela CPU por HBlank) fica até 9% mais grave enquanto isso dura. Turbo e builds sem I2S ficam em 735.
+4. **Conversão Shimmerless + Grid** (`ili9341.c`): `ws_convert_row()` virou `ws_resolve_src()` + `ws_emit_row()`. A linha-fonte é resolvida para RGB565 **e** para a cópia escurecida do Grid uma vez (224 escurecimentos em vez de até 320 por linha de painel), e as duas linhas do Fit que saem da mesma linha-fonte reaproveitam o resultado. Blend de dois vizinhos escurecidos = escurecer o blend (o dim é escala linear), diferença máxima de 1 LSB.
+5. **Caminho rápido com janelas** (`gpu.c`, só console): `ws_render_scanline_color_fast` passou a cobrir **todas** as linhas coloridas. Plano frontal com janela (`0x20` dentro, `0x30` fora, bordas inclusivas, teste de Y) desenhado numa cópia da linha e recortado de volta, equivalente ao teste por pixel. Sprites com bit `0x1000` recortados pela janela de sprites (portas `0x0C..0x0F`), mesmos testes de `ws_drawClippedSpriteLine`, e a borda direita limitada a 224 px (com `x1` até 255 o renderizador completo escrevia além da linha). Linhas mono continuam no renderizador completo.
+
+### O que as medições mostraram além do esperado
+- **O renderizador em flash não era o custo do `g`.** Com o caminho rápido, `L` foi de 144 a 0 e `g` ficou em ~3,2 ms. O tempo de render do Digimon está em outro lugar: provavelmente no cache de tiles (`ws_tileCache_getTileRow`, que decodifica tiles modificados) e nos acessos à RAM interna do WS, não em código em flash. O caminho rápido fica pelo cache XIP liberado e pela uniformidade, não por ganho medido.
+- **O SPI não é o gargalo neste jogo**: `w` 0,0 e `c` < 3 ms; a maior parte das linhas é pulada pelo hash.
+- **A conversão de pixels roda no Core 0** (`ili9341_stream_ws_line` é chamada do laço do jogo), não no Core 1. `p` subiu de 0,7 para 1,2 ms entre 574 e 256 porque, com o jogo mais rápido, mais linhas mudam por quadro.
+
+### Diferença conhecida com o hardware (mantida)
+Modo de janela `0x10` (bit "fora" sem o bit de habilitar): o Oswan não desenha o plano frontal; no hardware (e no Mednafen) a janela fica desligada e o plano aparece inteiro. O caminho rápido reproduz o Oswan, para que esta mudança fosse só de desempenho. Corrigir isso é uma mudança de comportamento separada, a validar.
+
+### Binários
+| Alvo | Arquivo | Tamanho | Heap livre | Validação |
+| :--- | :--- | ---: | ---: | :--- |
+| **Core2350B (HW16)** | `PicoWS_hw16.uf2` | 834.048 B | 18.516 B | [OK] Digimon 60 FPS com ~5 ms de folga, áudio sem underruns (build de diagnóstico, mesmo código sem o overlay) |
+| **RP2350 Plus (HW15)** | `PicoWS.uf2` | 775.168 B | 10.868 B | compila limpo; [PENDENTE] hardware (recebe 1–4; o 5 é só console) |
+
+### Pendente
+1. Regressão nos outros jogos com o caminho rápido com janelas e o novo `audio_primed`: Klonoa (música e voz do Moo), FF1, Tetris, um `.ws` mono, modo vertical.
+2. Se ainda for preciso folga no render: medir `ws_tileCache_getTileRow` (decodificação de tiles 4bpp/2bpp) antes de mexer.
+3. Contadores antigos sem consumidor: `s_prof` (`ili9341.c`), `ws_prof_rom` (`memory.c`), `ws_prof_instr` (`nec.c`).

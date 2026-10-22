@@ -37,7 +37,13 @@ extern uint8_t cpu_readmem20(uint32_t addr);
 #define WS_CLOCK_HZ            3072000ULL
 #define AUDIO_SAMPLE_RATE       44100ULL
 #define SAMPLES_PER_FRAME       735        /* 44100 Hz / 60 FPS */
+#define SAMPLES_PER_FRAME_MAX   (8 * 159)  /* ws_audio_process_line renders at most 8 per line */
 #define SCANLINES_PER_FRAME     159
+
+/* Output samples produced per emulated frame (see ws_audio_set_samples_per_frame). The
+ * requested value is latched at line 0, so a frame is never split between two counts. */
+static int s_spf      = SAMPLES_PER_FRAME;
+static int s_spf_next = SAMPLES_PER_FRAME;
 
 /* Cycles of 3.072MHz per 44.1kHz audio sample in 16.16 fixed-point */
 #define CYCLES_PER_SAMPLE_FP16  ((uint32_t)((WS_CLOCK_HZ << 16) / AUDIO_SAMPLE_RATE))
@@ -408,9 +414,10 @@ void ws_audio_process_line(int line) {
     if (line < 0 || line >= SCANLINES_PER_FRAME) return;
     if (line == 0) {
         s_samples_rendered_in_frame = 0;
+        s_spf = s_spf_next;
     }
 
-    int target = (line + 1) * SAMPLES_PER_FRAME / SCANLINES_PER_FRAME;
+    int target = (line + 1) * s_spf / SCANLINES_PER_FRAME;
     int count = target - s_samples_rendered_in_frame;
     if (count <= 0) return;
 
@@ -423,4 +430,14 @@ void ws_audio_process_line(int line) {
     s_samples_rendered_in_frame += count;
 
     EXT_AUDIO_ENQUEUE_SAMPLES(line_samples, count);
+}
+
+/* A frame that cannot be emulated in 1/60 s produces fewer than 44100 samples per second,
+ * the I2S ring runs dry and the DMA stops: gaps and clicks. Stretching the frame's audio
+ * instead keeps the DAC fed. The oscillators step by WS clock per output sample, so the
+ * pitch does not change; the frame just lasts a little longer, as the game already does. */
+void ws_audio_set_samples_per_frame(int n) {
+    if (n < SAMPLES_PER_FRAME) n = SAMPLES_PER_FRAME;
+    if (n > SAMPLES_PER_FRAME_MAX) n = SAMPLES_PER_FRAME_MAX;
+    s_spf_next = n;
 }

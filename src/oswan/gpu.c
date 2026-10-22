@@ -692,10 +692,18 @@ static void __not_in_flash_func(ws_render_layer_color)(uint8 *fb, uint32 mapBase
     }
 }
 
+/* Sprites of one priority. A sprite with its window bit (0x1000) is clipped to the
+ * sprite window (ports 0x0C..0x0F) when that window is on (port 0x00 bit 3) and not
+ * empty; any other sprite is clipped to the screen. Same tests as ws_drawClippedSpriteLine,
+ * with the right edge also held to the 224-pixel line (a window x1 up to 255 made the
+ * full renderer write past it). */
 static void __not_in_flash_func(ws_render_sprites_color)(uint8 *fb, uint32 scanline, uint32 priority) {
     const uint32 first = ws_ioRam[0x05];
     const uint32 count = ws_ioRam[0x06];
     const uint32 *sprites = (const uint32 *) (internalRam + (((uint32) ws_ioRam[0x04]) << 9)) + count - 1;
+    const uint32 wx0 = ws_ioRam[0x0c], wy0 = ws_ioRam[0x0d];
+    const uint32 wx1 = ws_ioRam[0x0e], wy1 = ws_ioRam[0x0f];
+    const bool win_on = (ws_ioRam[0x00] & 0x08) && (wx0 != wx1);
 
     for (uint32 i = count; i > first; i--) {
         const uint32 spr = *sprites--;
@@ -704,17 +712,65 @@ static void __not_in_flash_func(ws_render_sprites_color)(uint8 *fb, uint32 scanl
         const uint32 x = (spr & 0xff000000) >> 24;
         const uint32 y = (spr & 0x00ff0000) >> 16;
         if (scanline < y || scanline > y + 7) continue;
-        if (x >= 224 || y >= 144) continue;
+
+        uint32 cx0 = 0, cy0 = 0, cx1 = 224, cy1 = 144;
+        if (win_on && (spr & 0x1000)) {
+            cx0 = wx0; cy0 = wy0; cx1 = wx1; cy1 = wy1;
+        }
+        if (x + 7 < cx0 || x >= cx1) continue;
+        if (y + 7 < cy0 || y >= cy1) continue;
 
         const uint8 *row = ws_tileCache_getTileRow(spr & 0x1ff, (scanline - y) & 0x07,
                                                    spr & 0x8000, spr & 0x4000, 0);
-        uint32 n = 8;
-        if (x + n > 224) n = 224 - x;
+        int32_t start = (int32_t) x, end = (int32_t) x + 8;
+        if (start < (int32_t) cx0) start = (int32_t) cx0;
+        if (end > (int32_t) cx1) end = (int32_t) cx1;
+        if (end > 224) end = 224;
         const uint32 palbase = (8 + ((spr & 0xe00) >> 9)) << 4;
-        uint8 *d = fb + x;
-        for (uint32 k = 0; k < n; k++) {
-            if (row[k]) d[k] = (uint8) (palbase + row[k]);
+        for (int32_t px = start; px < end; px++) {
+            const uint8 v = row[px - (int32_t) x];
+            if (v) fb[px] = (uint8) (palbase + v);
         }
+    }
+}
+
+/* Foreground layer under its window (port 0x00 bits 4..5, window in ports 0x08..0x0B,
+ * edges inclusive), as the full renderer does it:
+ *   0x00 no window, 0x20 drawn only inside, 0x30 drawn only outside, 0x10 not drawn.
+ * (On hardware 0x10 means "window off" and the layer is drawn; the full renderer has
+ * never drawn it, and this path matches the full renderer.) The layer is drawn into a
+ * copy of the line and only the visible columns are taken back, which equals the
+ * per-pixel window test because the layer writes only non-transparent pixels. */
+static void __not_in_flash_func(ws_render_fg_color)(uint8 *fb, uint32 sl, uint32 mode) {
+    const uint32 map = ((uint32) ws_ioRam[0x07] & 0xf0) << 7;
+    if (mode == 0x00) {
+        ws_render_layer_color(fb, map, ws_ioRam[0x12], ws_ioRam[0x13], sl);
+        return;
+    }
+    if (mode == 0x10) return;
+
+    const uint32 x0 = ws_ioRam[0x08], y0 = ws_ioRam[0x09];
+    const uint32 x1 = ws_ioRam[0x0a], y1 = ws_ioRam[0x0b];
+    const bool line_in = (sl >= y0 && sl <= y1);
+    if (mode == 0x20 && !line_in) return;
+    if (mode == 0x30 && !line_in) {
+        ws_render_layer_color(fb, map, ws_ioRam[0x12], ws_ioRam[0x13], sl);
+        return;
+    }
+
+    uint8 __aligned(4) tmp[224];
+    memcpy(tmp, fb, 224);
+    ws_render_layer_color(tmp, map, ws_ioRam[0x12], ws_ioRam[0x13], sl);
+    if (mode == 0x20) {
+        if (x0 <= x1 && x0 < 224) {
+            const uint32 e = (x1 < 223) ? x1 : 223;
+            memcpy(fb + x0, tmp + x0, e - x0 + 1);
+        }
+    } else {
+        /* outside: columns < x0 and columns > x1 (together everything when x0 > x1) */
+        const uint32 a = (x0 < 224) ? x0 : 224;
+        memcpy(fb, tmp, a);
+        if (x1 < 223) memcpy(fb + x1 + 1, tmp + x1 + 1, 223 - x1);
     }
 }
 
@@ -728,7 +784,7 @@ static void __not_in_flash_func(ws_render_scanline_color_fast)(uint8 *fb) {
     if (io0 & 0x04)
         ws_render_sprites_color(fb, sl, 0);
     if (io0 & 0x02)
-        ws_render_layer_color(fb, ((uint32) ws_ioRam[0x07] & 0xf0) << 7, ws_ioRam[0x12], ws_ioRam[0x13], sl);
+        ws_render_fg_color(fb, sl, io0 & 0x30);
     if (io0 & 0x04)
         ws_render_sprites_color(fb, sl, 0x2000);
 }
@@ -740,9 +796,9 @@ void ws_gpu_renderScanline(uint8 *framebuffer) {
     if (ws_gpu_scanline > 143)
         return;
 
-    /* colour, no foreground window (0x30), no sprite window (0x08) */
+    /* every colour line, windows included */
 #if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN && !defined(WS_NO_FAST_RENDER)
-    if (ws_gpu_colorActive && !(ws_ioRam[0x00] & 0x38)) {
+    if (ws_gpu_colorActive) {
         ws_render_scanline_color_fast(framebuffer);
         return;
     }

@@ -32,6 +32,10 @@ uint8_t ws_audio_port_read(uint32_t port);
 /* Scanline audio generation (called for each scanline 0..158) */
 void ws_audio_process_line(int line);
 
+/* Output samples per emulated frame: 735 (44100 / 60) normally, more to stretch the
+ * audio of frames that run late. Takes effect at the next line 0. */
+void ws_audio_set_samples_per_frame(int n);
+
 /* Volume & state sync */
 void ws_audio_set_volume(uint8_t volume_level);
 void ws_audio_sync_from_ioram(void);

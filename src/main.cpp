@@ -953,6 +953,12 @@ static void run_game(void) {
     int32_t  lag_us      = 0;   /* how far behind real time the last frame ended */
     uint8_t  skipped_in_row = 0;
     bool     audio_primed = false;  /* ring has reached its working level at least once */
+    /* Frames since audio_primed was cleared. A game that runs slower than real time from
+     * its first frame never fills the ring to its working level, so waiting for that alone
+     * kept render-skip and audio stretch off for the whole session: the ring sat near
+     * empty and clicked (Digimon at 574 cycles/line: fill 4%, ~280 underruns/s, 0 skips).
+     * After 30 frames the startup / SD-write transient is over either way. */
+    uint8_t  unprimed_frames = 0;
     /* In-game saves: the .sav used to be written only when the game was left, so switching
      * the console off after saving inside the game lost the save, while savestates (written
      * at once) survived. Now it is written ~2 s after the last change to SRAM/EEPROM, once
@@ -1041,6 +1047,7 @@ static void run_game(void) {
                     ws_flush_battery_save();
                     sram_dirty_since = time_us_32();
                     audio_primed = false;   /* the SD write is a long frame; do not read it as the ring running dry */
+                    unprimed_frames = 0;
                     frame_timer = time_us_32();
                 }
             }
@@ -1099,7 +1106,18 @@ static void run_game(void) {
          * keeps the previous image. Never more than 2 in a row. */
 #if USE_I2S_AUDIO
         /* With audio the DAC is the clock: skip drawing only when its buffer is running dry */
-        const bool behind = audio_primed && !cfg_turbo && audio_i2s_get_fill_permille() < 300;
+        const int fill_now = audio_i2s_get_fill_permille();
+        const bool behind = audio_primed && !cfg_turbo && fill_now < 300;
+        /* A frame that ran late leaves the ring below its working level (~55% after the
+         * pacing wait). Instead of letting it run dry -- the DMA stops and every gap is a
+         * click -- the next frame produces more audio: up to +9% (800 samples) at 25%
+         * fill. Same pitch, slightly slower tempo, exactly what the game is doing. */
+        int spf = 735;
+        if (audio_primed && !cfg_turbo && fill_now < 500) {
+            const int f = (fill_now < 250) ? 250 : fill_now;
+            spf = 735 + ((500 - f) * 65) / 250;
+        }
+        ws_audio_set_samples_per_frame(spf);
 #else
         const bool behind = lag_us > 2500;
 #endif
@@ -1167,7 +1185,7 @@ static void run_game(void) {
                 busy_wait_us_32(100);
                 fill = audio_i2s_get_fill_permille();
             }
-            if (fill >= 500) audio_primed = true;
+            if (!audio_primed && (fill >= 500 || ++unprimed_frames >= 30)) audio_primed = true;
             lag_us = 0;
             frame_timer = time_us_32();
         } else

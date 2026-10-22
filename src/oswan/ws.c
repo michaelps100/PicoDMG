@@ -60,6 +60,15 @@ uint32	ws_cyclesByLine=256;
 ////////////////////////////////////////////////////////////////////////////////
 bool s_is_klonoa = false;
 
+/* Oswan's speed hack gave Digimon Adventure 02 - D1 Tamers 574 cycles per line, 2.24x
+ * the 256 of the hardware. The idle-cycle skip hid it while the game sat in its
+ * scheduler, but a busy scene paid for every extra cycle: measured where it dropped, on the
+ * Core2350B, V30 time 13.4 ms/frame at 574 (58 FPS, audio underruns) against 7.5 ms at
+ * 256 (60 FPS). Overridable for A/B tests: -DWS_EXTRA_DEFS="WS_DIGIMON_CYCLES=574" */
+#ifndef WS_DIGIMON_CYCLES
+#define WS_DIGIMON_CYCLES 256
+#endif
+
 void ws_patchRom(void)
 {
 	uint8	*rom=memory_getRom();
@@ -99,7 +108,7 @@ void ws_patchRom(void)
 
 	if ((hdr->developerId == 0x01) && (hdr->cartId == 0x03))    // digimon tamers
 	{
-		ws_cyclesByLine = 574;
+		ws_cyclesByLine = WS_DIGIMON_CYCLES;
 	}
 }
 
