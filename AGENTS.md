@@ -164,8 +164,100 @@ Para solucionar de forma definitiva o tempo de espera do carregamento, aprofunda
 
 ---
 
+## 9. Artes `.565` no Modo Gráfico (Tema)
+
+### Formato
+- Arquivo `<chave>.565` em `0:/emu/assets/themes/<N>/`.
+- Cabeçalho de 4 bytes: `uint16 largura`, `uint16 altura` (little-endian), seguido de `largura × altura` pixels **RGB565 little-endian**, linha a linha.
+- Tamanho padrão **266×240** = exatamente a janela do `GB_MODE=1` (x=45..310). Qualquer tamanho até 320×240 é aceito e centralizado na área visível (janela DMG com `GB_MODE=1`, tela cheia com `GB_MODE=0`), com preto em volta.
+
+### Busca da arte (`src/gui.cpp`, `main.cpp`)
+- Em cada pasta de tema (ativo, depois tema 0), `.565` é tentado **antes** do `.444` legado. Só builds `USE_ILI9341`.
+- Ordem das chaves, primeira que existir vence: **nome do `.uf2` sem extensão** (`PicoNES.uf2` → `PicoNES.565`), depois o `image_key` do `emulators.txt` (ou derivado), depois o nome do programa.
+- `.444` legado continua funcionando: é convertido para RGB565 na carga, para todos os buffers do modo gráfico terem o mesmo formato.
+
+### Pipeline de cor
+- O framebuffer do bootloader é RGB444 (`0x0RGB`) e o flush converte para RGB565. No modo gráfico os buffers já estão em RGB565, então o driver tem um modo de passagem direta: `ili9341_set_native_565(true)` (ligado só em volta do flush de cada quadro do modo gráfico, desligado logo depois).
+- Cores de sobreposição (rodapé, HUD de volume, cartão "sem arte") passam por `gui_color()` (RGB444 → RGB565) quando o modo de passagem está ativo.
+
+### Conversão
+- `tools/img_to_565.ps1` (só PowerShell + System.Drawing, sem instalar nada): redimensiona com bicúbica de alta qualidade, cobrindo o alvo e cortando o excesso centralizado (proporção mantida).
+  ```powershell
+  powershell -File tools\img_to_565.ps1 -InDir C:\dev\PicoDMG-Temp\NewIMG -OutDir I:\emu\assets\themes\0
+  ```
+
+---
+
+## 10. Transição entre Emuladores por Rolagem de Hardware
+
+### Problema
+Cada quadro da transição recompunha e reenviava a tela inteira (153 KB, ~25 ms) em 16 quadros, depois de ler a próxima imagem do SD. Como o envio era mais lento que a varredura do painel, o corte caía numa linha diferente a cada quadro (efeito "cascata").
+
+### Solução (`ili9341_hscroll_*`, `gui_hw_slide_*`)
+- ST7789 e ILI9341 rolam ao longo do eixo de 320 px (gates), que em paisagem (`MADCTL` com `MV`) é o **eixo X da tela**. Usa `VSCRDEF` (0x33) e `VSCRSADD` (0x37); saída do modo com `NORON`.
+- A imagem antiga fica parada na GRAM; a cada passo só muda o endereço de leitura e são enviadas **apenas as colunas reveladas** (`ili9341_write_cols_565`, buffer de linha duplo com DMA).
+- `GB_MODE=1`: áreas fixas `TFA`/`BFA` mantêm as bordas pretas (45 px / 9 px); só a janela 266 px rola.
+- `MY` ligado (`ROTATE=1`: 0xE8 / 0xA0) inverte as áreas fixas e o sinal do deslocamento; tratado em `ili9341_hscroll_begin`.
+- Retrato ou `GRAM offset` ≠ 0: `begin()` retorna falso e a troca é instantânea.
+- Duração 220 ms (`GUI_HW_SLIDE_US`), ease-out cúbico baseado em tempo. Roda até o fim num laço próprio, para nada tocar no painel em modo de rolagem.
+- O rodapé de botões rola junto (a rolagem move colunas inteiras) e volta ao lugar no fim.
+
+### Cache na PSRAM
+- Uma imagem 320×240 decodificada por emulador (até 32), alocada sob demanda só com PSRAM e com folga de 512 KB (`f_malloc` entra em `panic()` quando falha).
+- Vizinhos (`sel±1`) pré-carregados com o menu parado e sem botão pressionado; troca de tema invalida o cache.
+- Sem PSRAM (HW15): sem cache, cada troca lê do SD; a rolagem por hardware funciona igual (precisa de um só buffer).
+
+---
+
+## 11. Abertura ao Ligar (Logo + Som) — substitui a tela de logo + QR
+
+### Comportamento (`showBootIntro`, `main.cpp`)
+- Tela preta → 250 ms → logo surge do preto (fade-in de 350 ms) e desce em velocidade constante até o centro da área visível em 1150 ms → o som toca ao pousar → logo parado 1300 ms (e até o som terminar) → busca de emuladores com o logo ainda na tela → lista.
+- Qualquer botão pula. A espera pela soltura acontece **depois** da checagem do calibrador, para SELECT segurado ao ligar continuar abrindo o calibrador; SELECT+START+UP segue indo para o BOOTSEL.
+- **Só ao iniciar o console** (energizar ou acordar do standby, que reinicia sem marca). Ao voltar de um emulador (`returnRequested`, `scratch[7] = LOADER_RETURN_MAGIC`) a abertura é pulada e a tela fica preta durante a busca.
+
+### Assets (`src/boot_anim_assets.h`, gerado — não editar à mão)
+- Logo 150×39 em RGB565, alfa já misturado sobre preto (tamanho nativo, sem escala).
+- Som: mono 16 bits 22050 Hz, ~0,7 s, cortado do áudio do vídeo de referência do início do ataque até o fim do decaimento, com fade de 40 ms no final.
+- Gerador: `tools/make_boot_anim_assets.py logo565.raw 150 39 audio.s16 src/boot_anim_assets.h`. Logo fonte em `tools/boot_anim_src/logo.png`.
+
+### Áudio I2S no bootloader
+- `pico_shared/BoardConfigs.cmake`, HW_CONFIG 15 e 16: `USE_I2S_AUDIO=PICO_AUDIO_I2S_DRIVER_PCM5000A`, MAX98357A em **GP26 (DIN) / GP27 (BCK) / GP28 (LRCK)**, PIO0 — mesma ligação dos emuladores. Antes estava desligado (`0`).
+- Reprodução: reamostragem 22,05 → 44,1 kHz por interpolação linear, completando o anel de 1024 quadros (`EXT_AUDIO_GET_FREE`) a cada volta do laço, seguida de 50 ms de silêncio para o amplificador não parar numa amostra ≠ 0.
+- Volume segue `VOLUME=` do `/boot.txt`: ganhos `{0, 40, 80, 130, 190, 256}/256`; `VOLUME=0` = mudo.
+- `pico_shared/wavplayer.cpp`: ramos que usam o anel DVI (`dvi_`) isolados com `#if !USE_ILI9341`, porque deixavam de compilar com áudio externo ligado.
+- **Antes de pular para o app** (`app_launch_run`, `src/app_launch.c`): `reset_block(PIO0 | DMA)`, para o estado do I2S da abertura não passar para o emulador, que espera configurar tudo do zero como num boot a frio.
+
+### Tearing na descida
+- Em paisagem o painel varre ao longo do eixo X; escrever o logo linha a linha fazia a varredura cortá-lo na diagonal.
+- `ili9341_write_rect_by_columns()`: envia só as 150 colunas do logo, **coluna por coluna** (eixo da varredura). No pior caso sobra uma emenda vertical de 1 px.
+- Sem o pino TE ligado a um GPIO não há sincronismo com a varredura; seria o próximo passo se for preciso eliminar por completo.
+
+---
+
+## 12. Painel: Taxa de Varredura e Limpeza da GRAM
+
+- **ST7789 a ~111 Hz**: `st7789_init_sequence()` agora envia `PORCTRL 0xB2 = {0x0C,0x0C,0x00,0x33,0x33}` e `FRCTRL2 0xC6 = 0x01` (padrão de fábrica 0x0F = 60 Hz) — os mesmos valores de `dmg_panel_st7789_timing()` do `shared_menu`, já validados no Core2350B. Comandos exclusivos do ST7789: não enviar ao ILI9341.
+- **ILI9341 inalterado**: o `FRMCTR1` nunca foi medido no vidro (ver §26 do `AGENTS.md` raiz).
+- **`clear_gram()` antes do `DISPON`** nos dois init: nem o reset por hardware nem o `SWRESET` limpam a GRAM, e o standby da chave só manda `SLPIN` sem cortar a energia. Sem isso, ao religar a chave o painel acendia com o último quadro da lista até a abertura pintar por cima. Custa ~40 ms no boot (30 MHz).
+
+---
+
+## 13. Scripts de Build Atuais
+
+| Placa | Script | Pasta | Saída |
+| :--- | :--- | :--- | :--- |
+| **HW15** (RP2350 Plus / ILI9341) | `build_ili9341.ps1` | `build_hw15/` | `build_hw15/pico-bootLoader.uf2` |
+| **HW16** (Core2350B / ST7789) | `build_core2350b.ps1` | `build_hw16/` | `build_hw16/pico-bootLoader.uf2` |
+
+Os dois configuram explicitamente (`HW_CONFIG`, `USE_ILI9341`, painel padrão). Variáveis `CACHE` do `BoardConfigs.cmake` não sobrescrevem um cache existente: ao mudar uma delas (ex.: `USE_I2S_AUDIO`), apague o `CMakeCache.txt` da pasta antes de compilar. Com a abertura, a imagem do bootloader termina em ~0x10056270 (~345 KB dos 512 KB reservados).
+
+---
+
 ## 📋 Status: Concluído e Validado
 - Ambos os targets (`USE_ILI9341=1` e `USE_ILI9341=0`) compilam sem erros e geram seus respectivos arquivos `.uf2`.
 - O layout de tela de 320x240 pixels é transmitido na integridade para o display SPI via DMA em 16 bits.
 - Os arquivos `.uf2` colocados diretamente em `/emu/` são detectados e exibidos no menu sem a necessidade do arquivo `emulators.txt`.
+- Validado no console Core2350B (HW16): artes `.565` no modo gráfico, transição por rolagem de hardware, descida do logo sem tearing perceptível, abertura pulada ao voltar de emulador, sem quadro antigo ao religar a chave.
+- Pendente de validação em hardware: som da abertura (nível conforme `VOLUME=`); som de todos os emuladores depois do `reset_block(PIO0 | DMA)` no salto para o app; HW15 (RP2350 Plus / ILI9341) com as mesmas mudanças.
 - Gravação ultra-rápida com `ili9341_flush_rows()`, buffer de SD de 32 KB, gravação Flash em blocos de 16 KB, apagamento de 64 KB e clock acelerado no barramento SPI.
