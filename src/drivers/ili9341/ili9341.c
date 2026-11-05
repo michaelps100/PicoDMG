@@ -238,6 +238,24 @@ static void apply_invert(void)
     write_cmd(s_invert ? CMD_INVON : CMD_INVOFF);
 }
 
+// Paint the whole panel memory black. Neither the hardware reset nor SWRESET
+// clears GRAM, and the power-switch standby only puts the panel to sleep
+// (SLPIN) without cutting its power, so after a wake the panel still holds the
+// last picker frame. Called right before DISPON so the screen lights up black
+// instead of flashing that stale frame until the first real flush.
+static void clear_gram(void)
+{
+    static const uint8_t zeros[2 * ILI9341_WIDTH] = { 0 };
+    set_addr_window(0, 0, ILI9341_WIDTH - 1, ILI9341_HEIGHT - 1);
+    write_cmd(CMD_RAMWR);
+    dc_data();
+    cs_low();
+    for (int y = 0; y < ILI9341_HEIGHT; y++) {
+        spi_write_blocking(ILI9341_SPI, zeros, sizeof(zeros));
+    }
+    cs_high();
+}
+
 // ST7789 power-on sequence, after the hardware reset. Deliberately the short
 // one: it is byte-for-byte the sequence PicoGBC's mk_st7789.c runs in the field
 // on this console (same CS/DC/RST/BL pins), so there is no reason to invent a
@@ -271,7 +289,7 @@ static void st7789_init_sequence(void)
         write_data_buf(frctrl2, sizeof(frctrl2));
     }
 
-    set_addr_window(0, 0, ILI9341_WIDTH - 1, ILI9341_HEIGHT - 1);
+    clear_gram();
 
     write_cmd(CMD_NORON);
     sleep_ms(10);
@@ -355,6 +373,8 @@ static void ili9341_init_sequence(void)
 
     write_cmd(CMD_SLPOUT);
     sleep_ms(120);
+
+    clear_gram();
 
     write_cmd(CMD_DISPON);
     sleep_ms(120);
