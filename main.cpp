@@ -2255,9 +2255,26 @@ int main()
         LOG("Panel: %s (dir=%s)", p2, g_emuDir);
     }
 
-    // Power-on intro (logo drop + chime). Buttons held at power-on skip it at
-    // once, so the SELECT-hold calibrator check below still sees SELECT.
-    const bool intro_skipped = showBootIntro(ini.volume);
+    // Power-on intro (logo drop + chime): only when the console starts --
+    // power-on, or waking from the power switch, which reboots without the
+    // return marker -- never when an emulator sends us back to the picker
+    // (returnRequested, scratch[7] set by the emulator before its reboot).
+    // Buttons held at power-on skip it at once, so the SELECT-hold calibrator
+    // check below still sees SELECT.
+    bool intro_skipped = false;
+    if (returnRequested) {
+        LOG("Returned from emulator: skipping intro");
+#if USE_ILI9341
+        // Black while the emulators are scanned, instead of whatever the
+        // panel held when initAll() brought it up.
+        if (uint16_t *fb = getActiveFramebuffer()) {
+            memset(fb, 0, SCREENWIDTH * SCREENHEIGHT * sizeof(uint16_t));
+            ili9341_flush(true);
+        }
+#endif
+    } else {
+        intro_skipped = showBootIntro(ini.volume);
+    }
 
 #if USE_ILI9341
     // Hold SELECT to open the panel calibrator (1 second continuous hold).
