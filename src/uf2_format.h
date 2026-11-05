@@ -65,6 +65,25 @@ typedef enum {
     UF2_CLS_BAD_PAYLOAD   /* payload_size impossible                            */
 } uf2_class_t;
 
+/* Check if a family ID is an executable Arm application for RP2350. RISC-V
+ * images are deliberately not accepted: the loader only enters apps through an
+ * Arm vector table, so one would be skipped block by block and reported as the
+ * wrong family by uf2_diag. */
+static inline bool uf2_is_app_family(uint32_t family)
+{
+    return family == UF2_FAMILY_RP2350_ARM_S ||
+           family == UF2_FAMILY_RP2350_ARM_NS;
+}
+
+static inline bool uf2_family_matches(uint32_t block_family, uint32_t expected_family)
+{
+    if (block_family == expected_family)
+        return true;
+    if (expected_family == UF2_FAMILY_RP2350_ARM_S && uf2_is_app_family(block_family))
+        return true;
+    return false;
+}
+
 /*
  * Classify a block for an application partition spanning [region_base, region_end).
  *
@@ -94,8 +113,8 @@ static inline uf2_class_t uf2_classify_block(const uf2_block_t *b,
         return UF2_CLS_SKIP;
     }
     if (b->flags & UF2_FLAG_FAMILY_ID_PRESENT) {
-        if (b->file_size_or_family != expected_family) {
-            return UF2_CLS_SKIP; /* e.g. RISC-V blocks, or the absolute errata block */
+        if (!uf2_family_matches(b->file_size_or_family, expected_family)) {
+            return UF2_CLS_SKIP; /* wrong family / absolute errata block */
         }
     }
     /* Address range check (also rejects wrap-around). */

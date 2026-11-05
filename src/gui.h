@@ -1,7 +1,10 @@
 /*
  * gui.h - Graphical menu support for pico-bootLoader.
  *
- * Loads 320x240 raw 16-bit artwork from <BASEDIR>/assets/themes/<N>/<key>.{444|555}
+ * Loads 320x240 raw 16-bit artwork from <BASEDIR>/assets/themes/<N>/<key>.{444|555}.
+ * On SPI-panel builds (USE_ILI9341) <key>.565 is preferred: header uint16 w,h
+ * (LE) + w*h RGB565 LE, any size up to 320x240, centred in the visible window
+ * (266x240 at x=45 in GB_MODE). Make them with tools/img_to_565.ps1.
  * (BASEDIR defaults to /emu; overridable at runtime via gui_set_asset_dir()
  * fed from /boot.txt, and the active theme directory via gui_set_theme_dir()).
  * Extension picked by the shared FILEXTFORSEARCH macro), holds two reusable image
@@ -87,6 +90,11 @@ bool gui_load_image(const char *image_key, uint16_t *dest_320x240);
  * point of the half-res path. */
 bool gui_load_image_half_res(const char *image_key, uint16_t *dest_160x120);
 
+/* Convert an RGB444 (0x0RGB) UI colour to the pixel format the graphical-menu
+ * buffers use: RGB565 on SPI-panel builds (USE_ILI9341), unchanged elsewhere.
+ * On USE_ILI9341 those buffers are flushed with ili9341_set_native_565(true). */
+uint16_t gui_color(uint16_t c444);
+
 /* Fill a 320x240 buffer with a solid colour (used as a missing-asset
  * placeholder so we never have to crash on a bad SD layout). */
 void gui_fill_solid(uint16_t *dest_320x240, uint16_t color);
@@ -108,6 +116,18 @@ void gui_fill_solid_half_res(uint16_t *dest_160x120, uint16_t color);
  */
 void gui_draw_frame(const uint16_t *a, const uint16_t *b,
                     int slide_px, int direction, bool b_half_res);
+
+/* SPI-panel builds only. Slide `incoming` (a full 320x240 buffer, the image
+ * whose window part is about to be shown) in over what the panel already
+ * shows, using the controller's hardware scroll: begin() returns false when
+ * the panel orientation can't scroll horizontally (portrait, GRAM offset) and
+ * the caller should use gui_draw_frame() slides instead. step() advances the
+ * reveal from p_old to p_new pixels (0..gui_hw_slide_width()), direction +1 =
+ * enters from the right, -1 = from the left. end() once p reached the width. */
+bool gui_hw_slide_begin(const uint16_t *incoming);
+int  gui_hw_slide_width(void);
+void gui_hw_slide_step(int p_old, int p_new, int direction);
+void gui_hw_slide_end(void);
 
 /* Set the one-line button-hint footer drawn at the bottom of every
  * graphical frame. Pass NULL or "" to hide the band. The caller-owned

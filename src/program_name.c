@@ -119,7 +119,7 @@ static bool block_is_program(const uf2_block_t *b)
      * skip it so it never sets image_base. */
     if (b->flags & UF2_FLAG_EXT_TAGS_PRESENT) return false;
     if (b->flags & UF2_FLAG_FAMILY_ID_PRESENT) {
-        if (b->file_size_or_family != UF2_FAMILY_RP2350_ARM_S) return false;
+        if (!uf2_is_app_family(b->file_size_or_family)) return false;
     }
     if (b->payload_size == 0 || b->payload_size > UF2_MAX_PAYLOAD) return false;
     return true;

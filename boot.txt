@@ -115,3 +115,93 @@ GUI=1
 # Default: 0
 #
 THEME=0
+
+
+# --- PANEL -------------------------------------------------------------------
+# Which SPI display controller is wired to the bus, and how it is oriented.
+# These keys are written by the bootloader whenever it creates this file, so a
+# card that never had one still boots onto the right panel. Leave them alone
+# unless your display comes out wrong.
+#
+# With NO card inserted the bootloader falls back to the panel chosen at build
+# time, so a missing card can never leave the display mismatched.
+#
+
+# ST7789=1
+#   0 = ILI9341 (the default on the PicoDMG build)
+#   1 = ST7789  (the default on the Core2350B / HW_CONFIG 16 build)
+#
+ST7789=1
+
+# ROTATE=0
+#   0 = landscape 0 degrees
+#   1 = landscape 180 degrees
+#
+ROTATE=0
+
+# MADCTL=0x28
+#   OPTIONAL. Writes the MADCTL (0x36) register raw, and overrides ROTATE.
+#   Use this when the image comes out mirrored: ST7789 modules disagree on the
+#   mirror bits far more often than on the rotation, and which combination is
+#   right can only be found by looking at the panel.
+#
+#   Start from the value in the boot log ("panel: ... madctl=0x..") and add:
+#     0x80 (MY)  image upside down          -> try 0xA8 from 0x28
+#     0x40 (MX)  image left/right reversed   -> try 0x68 from 0x28
+#     0xC0       both of the above (180 deg) -> try 0xE8 from 0x28
+#   Only the mirror bits are usually wrong. Leave MV (0x20) and BGR (0x08)
+#   alone unless the image is also the wrong size or the wrong colours.
+#
+#   This key is deleted-safe: if you remove the line, the ROTATE value applies
+#   again. The bootloader never writes it for you, so it only takes effect when
+#   you put it here.
+#
+# MADCTL=0xA8
+
+# INVERT=0
+#   0 = INVOFF, 1 = INVON. Some IPS panels need 1 or their colours are inverted
+#   (negative image). TN panels normally stay at 0.
+#
+INVERT=0
+
+
+# --- GAME BOY (PicoGBC / PicoDMG) ---------------------------------------------
+# Read by the Game Boy emulator, not by the bootloader. The keys are listed here
+# because this file is a whitelist: an unrecognised key makes the bootloader
+# reject the WHOLE file, which would silently drop your GB_MODE, VOLUME and
+# panel settings above. Both default to off/unset, so leaving them out changes
+# nothing.
+
+# RUMBLE=0
+#   GPIO driving the rumble motor for cartridges that have one (Mario Tennis,
+#   Perfect Dark, Dragon Warrior Monsters 2). 0 = no motor, which is the default.
+#
+#   Pins 0..9 are refused: they are the console's buttons, and taking one would
+#   break the controls. Pins 10/11 are the optional NFC reader, 12..15 the SD
+#   card and 17..22 the display, so 23 or 24 are the usual choices.
+#
+#   The motor needs a transistor between it and the pin -- do not drive a motor
+#   straight off the GPIO.
+#
+# RUMBLE=23
+
+# RTC_EPOCH=2000-01-01 00:00:00
+#   Starting date for the cartridge real-time clock, used by Pokemon Gold,
+#   Silver and Crystal. Format YYYY-MM-DD, optionally followed by HH:MM:SS.
+#   Defaults to 1 Jan 2000 when the key is absent.
+#
+#   This is only read the FIRST time you play a cartridge. The clock is then
+#   stored in that game's .sav file and just counts forward, so it stays in step
+#   with real time on its own. Change this only if you have deleted the .sav
+#   files or want the in-game date to start from today.
+#
+# RTC_EPOCH=2000-01-01 00:00:00
+
+GB_MODE=1
+ST7789=1
+
+ROTATE=0
+
+INVERT=0
+RUMBLE=23
+RTC_EPOCH=2026-10-01 19:30:00

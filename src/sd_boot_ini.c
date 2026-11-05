@@ -8,6 +8,12 @@
 
 #include "ff.h"
 
+/* Panel default, normally supplied by the build. The fallback keeps this file
+ * compilable (and sensible) on its own. */
+#ifndef DEFAULT_PANEL_ST7789
+#define DEFAULT_PANEL_ST7789 0
+#endif
+
 /* C-linkage shims over Frens::f_malloc / f_free (FrensHelpers.cpp). Declared
  * here rather than pulled in from a header because FrensHelpers.h is C++ only;
  * this is the same arrangement hstx_data_island_queue.c uses. */
@@ -32,6 +38,45 @@ static void snprintf_err(char *err, size_t err_sz, const char *fmt, ...)
     va_end(ap);
 }
 
+/* Strict unsigned decimal for the diagnostic offsets: digits only, no sign, no
+ * trailing junk, no overflow. "007" is fine; "7 " and "0x07" are not (the line
+ * is already trimmed, but that is the loader's promise, not this one's). */
+static bool parse_u8(const char *s, uint8_t *out)
+{
+    if (!s || s[0] == '\0') return false;
+    unsigned v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        v = v * 10u + (unsigned)(*p - '0');
+        if (v > 255u) return false;
+    }
+    *out = (uint8_t)v;
+    return true;
+}
+
+/* Raw MADCTL register value. Hex, with or without a 0x prefix, so the value
+ * maps 1:1 onto the datasheet bit layout the user is dialling in:
+ *   MY 0x80  MX 0x40  MV 0x20  ML 0x10  BGR 0x08  MH 0x04
+ * Accepts at most two hex digits and nothing else -- "0x28", "28", "A8" are
+ * fine; "0x128", "0xZZ" and " 28" (untrimmed) are not. */
+static bool parse_madctl(const char *s, uint8_t *out)
+{
+    if (!s) return false;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    if (s[0] == '\0' || s[1] == '\0' || s[2] != '\0') return false;
+    unsigned v = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned d;
+        if (*p >= '0' && *p <= '9')      d = (unsigned)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') d = (unsigned)(*p - 'a') + 10u;
+        else if (*p >= 'A' && *p <= 'F') d = (unsigned)(*p - 'A') + 10u;
+        else return false;
+        v = (v << 4) | d;
+    }
+    *out = (uint8_t)v;
+    return true;
+}
+
 sd_boot_ini_status_t sd_boot_ini_load(const char *path,
                                       sd_boot_ini_t *out,
                                       char *err, size_t err_sz)
@@ -45,9 +90,40 @@ sd_boot_ini_status_t sd_boot_ini_load(const char *path,
     out->screensaver    = SS_MODE_STARFIELD;
     out->gui_graphical  = true;     /* same first-boot default .guimode had */
     out->theme          = 0;
+    out->gb_mode        = false;
+    out->volume         = 3;
+    out->st7789         = (DEFAULT_PANEL_ST7789 != 0);
+    out->rotate         = 0;
+    out->madctl         = 0;
+    out->invert         = false;
+    out->st7789_xoff    = 0;
+    out->st7789_yoff    = 0;
+    out->rumble_pin     = 0;
+    out->batt_pin       = 0;
+    out->charge_pin     = 0;
+    out->power_switch   = 0;
+    out->power_pin      = 10;
+    strcpy(out->power_behavior, "RESUME");
+    out->power_active_low = 1;
     out->file_present   = false;
     out->seen_gui       = false;
     out->seen_theme     = false;
+    out->seen_gb_mode   = false;
+    out->seen_volume    = false;
+    out->seen_st7789    = false;
+    out->seen_rotate    = false;
+    out->seen_madctl    = false;
+    out->seen_invert    = false;
+    out->seen_st7789_xoff = false;
+    out->seen_st7789_yoff = false;
+    out->seen_rumble    = false;
+    out->seen_batt_pin  = false;
+    out->seen_charge_pin = false;
+    out->seen_rtc_epoch = false;
+    out->seen_power_switch = false;
+    out->seen_power_pin    = false;
+    out->seen_power_behavior = false;
+    out->seen_power_active_low = false;
 
     /* Adopt a leftover .tmp when the real file is gone. sd_boot_ini_save()
      * commits with unlink+rename; a power cut in between leaves only the tmp,
@@ -201,18 +277,288 @@ sd_boot_ini_status_t sd_boot_ini_load(const char *path,
             }
             out->theme = (uint8_t)(val[0] - '0');
             out->seen_theme = true;
+        } else if (strcasecmp(key, "GB_MODE") == 0) {
+            if (out->seen_gb_mode) {
+                snprintf_err(err, err_sz, "duplicate key GB_MODE at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid GB_MODE value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->gb_mode = (val[0] == '1');
+            out->seen_gb_mode = true;
+        } else if (strcasecmp(key, "VOLUME") == 0) {
+            if (out->seen_volume) {
+                snprintf_err(err, err_sz, "duplicate key VOLUME at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (val[0] < '0' || val[0] > '5' || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid VOLUME value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->volume = (uint8_t)(val[0] - '0');
+            out->seen_volume = true;
+        } else if (strcasecmp(key, "ST7789") == 0) {
+            if (out->seen_st7789) {
+                snprintf_err(err, err_sz, "duplicate key ST7789 at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid ST7789 value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->st7789 = (val[0] == '1');
+            out->seen_st7789 = true;
+        } else if (strcasecmp(key, "ROTATE") == 0) {
+            if (out->seen_rotate) {
+                snprintf_err(err, err_sz, "duplicate key ROTATE at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid ROTATE value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->rotate = (uint8_t)(val[0] - '0');
+            out->seen_rotate = true;
+        } else if (strcasecmp(key, "MADCTL") == 0) {
+            uint8_t m;
+            if (out->seen_madctl) {
+                snprintf_err(err, err_sz, "duplicate key MADCTL at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_madctl(val, &m)) {
+                snprintf_err(err, err_sz, "invalid MADCTL value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->madctl = m;
+            out->seen_madctl = true;
+        } else if (strcasecmp(key, "INVERT") == 0) {
+            if (out->seen_invert) {
+                snprintf_err(err, err_sz, "duplicate key INVERT at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid INVERT value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->invert = (val[0] == '1');
+            out->seen_invert = true;
+        } else if (strcasecmp(key, "ST7789_XOFF") == 0) {
+            uint8_t off;
+            if (out->seen_st7789_xoff) {
+                snprintf_err(err, err_sz, "duplicate key ST7789_XOFF at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &off)) {
+                snprintf_err(err, err_sz, "invalid ST7789_XOFF value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->st7789_xoff = off;
+            out->seen_st7789_xoff = true;
+        } else if (strcasecmp(key, "ST7789_YOFF") == 0) {
+            uint8_t off;
+            if (out->seen_st7789_yoff) {
+                snprintf_err(err, err_sz, "duplicate key ST7789_YOFF at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &off)) {
+                snprintf_err(err, err_sz, "invalid ST7789_YOFF value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->st7789_yoff = off;
+            out->seen_st7789_yoff = true;
+        } else if (strcasecmp(key, "RUMBLE") == 0) {
+            uint8_t pin;
+            /* GPIO for the Game Boy rumble motor. 0 = disabled, which is also
+             * the default, so a card that never had this key keeps every other
+             * setting in this file. The bootloader does not act on it: the
+             * value exists so the key is RECOGNISED, and PicoGBC reads it
+             * itself. Without this branch the key would reject the whole file
+             * and silently drop GB_MODE, VOLUME and the panel settings. */
+            if (out->seen_rumble) {
+                snprintf_err(err, err_sz, "duplicate key RUMBLE at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &pin)) {
+                snprintf_err(err, err_sz, "invalid RUMBLE value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->rumble_pin = pin;
+            out->seen_rumble = true;
+        } else if (strcasecmp(key, "BATT_PIN") == 0) {
+            uint8_t pin;
+            /* ADC GPIO of the battery voltage divider. 0 = none, the default.
+             * Recognised here for the same reason as RUMBLE: the emulators'
+             * shared_menu reads it and draws the battery indicator. */
+            if (out->seen_batt_pin) {
+                snprintf_err(err, err_sz, "duplicate key BATT_PIN at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &pin)) {
+                snprintf_err(err, err_sz, "invalid BATT_PIN value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->batt_pin = pin;
+            out->seen_batt_pin = true;
+        } else if (strcasecmp(key, "CHARGE_PIN") == 0) {
+            uint8_t pin;
+            /* GPIO sensing the charger's USB 5 V input (green battery icon).
+             * 0 = none, the default. Read by shared_menu, recognised here. */
+            if (out->seen_charge_pin) {
+                snprintf_err(err, err_sz, "duplicate key CHARGE_PIN at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &pin)) {
+                snprintf_err(err, err_sz, "invalid CHARGE_PIN value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->charge_pin = pin;
+            out->seen_charge_pin = true;
+        } else if (strcasecmp(key, "RTC_EPOCH") == 0) {
+            /* Seed date for the MBC3 real-time clock. Free-form: the value is
+             * validated and interpreted by PicoGBC, so the bootloader only
+             * records it and leaves the syntax alone. Accepting it here is what
+             * matters -- see RUMBLE above. */
+            if (out->seen_rtc_epoch) {
+                snprintf_err(err, err_sz, "duplicate key RTC_EPOCH at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (val[0] == '\0') {
+                snprintf_err(err, err_sz, "empty RTC_EPOCH value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            size_t vl = strlen(val);
+            if (vl >= sizeof(out->rtc_epoch)) {
+                snprintf_err(err, err_sz, "RTC_EPOCH too long at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            memcpy(out->rtc_epoch, val, vl + 1);
+            out->seen_rtc_epoch = true;
+        } else if (strcasecmp(key, "POWER_SWITCH") == 0) {
+            if (out->seen_power_switch) {
+                snprintf_err(err, err_sz, "duplicate key POWER_SWITCH at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid POWER_SWITCH value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->power_switch = (uint8_t)(val[0] - '0');
+            out->seen_power_switch = true;
+        } else if (strcasecmp(key, "POWER_PIN") == 0) {
+            uint8_t pin;
+            if (out->seen_power_pin) {
+                snprintf_err(err, err_sz, "duplicate key POWER_PIN at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (!parse_u8(val, &pin) || pin > 47) {
+                snprintf_err(err, err_sz, "invalid POWER_PIN value at line %d (must be 0..47)", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->power_pin = pin;
+            out->seen_power_pin = true;
+            if (!out->seen_power_switch) {
+                out->power_switch = 1;
+            }
+        } else if (strcasecmp(key, "POWER_BEHAVIOR") == 0) {
+            if (out->seen_power_behavior) {
+                snprintf_err(err, err_sz, "duplicate key POWER_BEHAVIOR at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if (strcasecmp(val, "RESUME") != 0 && strcasecmp(val, "REBOOT") != 0) {
+                snprintf_err(err, err_sz, "invalid POWER_BEHAVIOR value at line %d (must be RESUME or REBOOT)", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            size_t vl = strlen(val);
+            if (vl >= sizeof(out->power_behavior)) vl = sizeof(out->power_behavior) - 1;
+            memcpy(out->power_behavior, val, vl);
+            out->power_behavior[vl] = '\0';
+            out->seen_power_behavior = true;
+        } else if (strcasecmp(key, "POWER_ACTIVE_LOW") == 0) {
+            if (out->seen_power_active_low) {
+                snprintf_err(err, err_sz, "duplicate key POWER_ACTIVE_LOW at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            if ((val[0] != '0' && val[0] != '1') || val[1] != '\0') {
+                snprintf_err(err, err_sz, "invalid POWER_ACTIVE_LOW value at line %d", lineno);
+                f_close(&fil);
+                return SD_BOOT_INI_ERROR;
+            }
+            out->power_active_low = (uint8_t)(val[0] - '0');
+            out->seen_power_active_low = true;
         } else {
-            snprintf_err(err, err_sz, "unknown key '%s' at line %d", key, lineno);
+            /* A wrong key name rejects the whole file, so every other setting
+             * in it is silently lost too -- the panel then falls back to build
+             * defaults and the user sees "nothing I set had any effect". List
+             * the valid keys here; the on-screen message is the only feedback
+             * available before the display is even configured. */
+            snprintf_err(err, err_sz,
+                         "unknown key '%s' at line %d -- valid: BASEDIR INDEX "
+                         "SCREENSAVER GUI THEME GB_MODE VOLUME ST7789 ROTATE "
+                         "MADCTL INVERT ST7789_XOFF ST7789_YOFF RUMBLE RTC_EPOCH BATT_PIN CHARGE_PIN "
+                         "POWER_SWITCH POWER_PIN POWER_BEHAVIOR POWER_ACTIVE_LOW",
+                         key, lineno);
             f_close(&fil);
             return SD_BOOT_INI_ERROR;
         }
     }
     f_close(&fil);
 
-    printf("[bootLoader] boot_ini: %s parsed OK (BASEDIR=%s INDEX=%s SCREENSAVER=%s GUI=%d THEME=%u)\n",
+    /* Shown in the log next to MADCTL, which is only meaningful as an explicit
+     * raw value -- printing the derived one here would imply the file carried
+     * it. */
+    char madctl_str[8];
+    if (out->seen_madctl) {
+        snprintf(madctl_str, sizeof(madctl_str), "0x%02X", (unsigned)out->madctl);
+    } else {
+        snprintf(madctl_str, sizeof(madctl_str), "-");
+    }
+
+    printf("[bootLoader] boot_ini: %s parsed OK (BASEDIR=%s INDEX=%s SCREENSAVER=%s GUI=%d THEME=%u GB_MODE=%d VOLUME=%u ST7789=%d ROTATE=%u MADCTL=%s INVERT=%d XOFF=%u YOFF=%u RUMBLE=%u BATT_PIN=%u CHARGE_PIN=%u RTC_EPOCH=%s)\n",
            path, out->base_dir, out->index_file,
            out->screensaver == SS_MODE_STARFIELD ? "STARFIELD" : "BLOCKS",
-           (int)out->gui_graphical, (unsigned)out->theme);
+           (int)out->gui_graphical, (unsigned)out->theme, (int)out->gb_mode, (unsigned)out->volume,
+           (int)out->st7789, (unsigned)out->rotate,
+           out->seen_madctl ? madctl_str : "derived",
+           (int)out->invert,
+           (unsigned)out->st7789_xoff, (unsigned)out->st7789_yoff,
+           (unsigned)out->rumble_pin,
+           (unsigned)out->batt_pin,
+           (unsigned)out->charge_pin,
+           out->seen_rtc_epoch ? out->rtc_epoch : "-");
     return SD_BOOT_INI_OK;
 }
 
@@ -251,6 +597,7 @@ static int classify(const char *line, char *work, size_t work_sz)
     if (work[0] == '#' || work[0] == ';') return 0;
     if (strcasecmp(work, "GUI")   == 0) return 1;
     if (strcasecmp(work, "THEME") == 0) return 2;
+    if (strcasecmp(work, "VOLUME") == 0) return 3;
     return 0;
 }
 
@@ -286,10 +633,11 @@ bool sd_boot_ini_save(const char *path, const sd_boot_ini_t *ini)
     bool ok           = true;
     bool wrote_gui    = false;
     bool wrote_theme  = false;
+    bool wrote_volume = false;
     bool last_had_eol = true;
 
     if (f_open(&sc->fin, path, FA_READ) == FR_OK) {
-        /* File present: copy through, substituting only our two keys. */
+        /* File present: copy through, substituting only our keys. */
         bool continuation = false;
         while (f_gets(sc->line, sizeof(sc->line), &sc->fin)) {
             size_t len     = strlen(sc->line);
@@ -308,6 +656,10 @@ bool sd_boot_ini_save(const char *path, const sd_boot_ini_t *ini)
                 snprintf(sc->out, sizeof(sc->out), "THEME=%u\n", (unsigned)ini->theme);
                 ok = ok && write_str(&sc->fout, sc->out);
                 wrote_theme = true;
+            } else if (kind == 3 && !wrote_volume) {
+                snprintf(sc->out, sizeof(sc->out), "VOLUME=%u\n", (unsigned)ini->volume);
+                ok = ok && write_str(&sc->fout, sc->out);
+                wrote_volume = true;
             } else if (kind != 0) {
                 /* Duplicate key -- drop it. The parser rejects duplicates, so
                  * echoing it would produce a file that fails to load. */
@@ -337,6 +689,36 @@ bool sd_boot_ini_save(const char *path, const sd_boot_ini_t *ini)
         snprintf(sc->out, sizeof(sc->out), "SCREENSAVER=%s\n",
                  ini->screensaver == SS_MODE_STARFIELD ? "STARFIELD" : "BLOCKS");
         ok = ok && write_str(&sc->fout, sc->out);
+        snprintf(sc->out, sizeof(sc->out), "GB_MODE=%d\n", ini->gb_mode ? 1 : 0);
+        ok = ok && write_str(&sc->fout, sc->out);
+        snprintf(sc->out, sizeof(sc->out), "VOLUME=%u\n", (unsigned)ini->volume);
+        ok = ok && write_str(&sc->fout, sc->out);
+        wrote_volume = true;
+        /* The panel keys too. Creating /boot.txt without them would make the
+         * next boot fall back to DEFAULT_PANEL_ST7789, silently flipping a
+         * ST7789 console back to ILI9341 (or, on an ILI9341 build, the other
+         * way round) with nothing on screen to explain it. The offsets are
+         * diagnostics and stay out unless the user actually set one. */
+        snprintf(sc->out, sizeof(sc->out), "ST7789=%d\n", ini->st7789 ? 1 : 0);
+        ok = ok && write_str(&sc->fout, sc->out);
+        snprintf(sc->out, sizeof(sc->out), "ROTATE=%u\n", (unsigned)ini->rotate);
+        ok = ok && write_str(&sc->fout, sc->out);
+        /* MADCTL is an explicit override, not a derived value -- writing the
+         * derived one out would silently freeze today's default as if the user
+         * had picked it. Only an override the user actually wrote is
+         * materialised. */
+        if (ini->seen_madctl) {
+            snprintf(sc->out, sizeof(sc->out), "MADCTL=0x%02X\n", (unsigned)ini->madctl);
+            ok = ok && write_str(&sc->fout, sc->out);
+        }
+        snprintf(sc->out, sizeof(sc->out), "INVERT=%d\n", ini->invert ? 1 : 0);
+        ok = ok && write_str(&sc->fout, sc->out);
+        if (ini->st7789_xoff || ini->st7789_yoff) {
+            snprintf(sc->out, sizeof(sc->out), "ST7789_XOFF=%u\n", (unsigned)ini->st7789_xoff);
+            ok = ok && write_str(&sc->fout, sc->out);
+            snprintf(sc->out, sizeof(sc->out), "ST7789_YOFF=%u\n", (unsigned)ini->st7789_yoff);
+            ok = ok && write_str(&sc->fout, sc->out);
+        }
     }
 
     /* Don't glue an appended key onto a file that ended without a newline. */
@@ -352,6 +734,12 @@ bool sd_boot_ini_save(const char *path, const sd_boot_ini_t *ini)
         snprintf(sc->out, sizeof(sc->out),
                  "\n# Artwork theme 0..9 (UP/DOWN in graphical mode).\nTHEME=%u\n",
                  (unsigned)ini->theme);
+        ok = ok && write_str(&sc->fout, sc->out);
+    }
+    if (!wrote_volume) {
+        snprintf(sc->out, sizeof(sc->out),
+                 "\n# Sound volume 0..5 (0 = Mute, 5 = Max).\nVOLUME=%u\n",
+                 (unsigned)ini->volume);
         ok = ok && write_str(&sc->fout, sc->out);
     }
 
@@ -384,7 +772,7 @@ bool sd_boot_ini_save(const char *path, const sd_boot_ini_t *ini)
     }
 
     frens_f_free(sc);
-    printf("[bootLoader] boot_ini: saved %s (GUI=%d THEME=%u)\n",
-           path, (int)ini->gui_graphical, (unsigned)ini->theme);
+    printf("[bootLoader] boot_ini: saved %s (GUI=%d THEME=%u VOLUME=%u)\n",
+           path, (int)ini->gui_graphical, (unsigned)ini->theme, (unsigned)ini->volume);
     return true;
 }

@@ -337,7 +337,9 @@ void blocks_draw()
 {
     for (int y = 0; y < SCREENHEIGHT; y++) {
         uint16_t *dst;
-#if !HSTX
+#if USE_ILI9341
+        dst = &Frens::framebuffer[y * SCREENWIDTH];
+#elif !HSTX
         dvi::DVI::LineBuffer *lb = nullptr;
 #if FRAMEBUFFERISPOSSIBLE
         if (Frens::isFrameBufferUsed()) {
@@ -369,13 +371,16 @@ void blocks_draw()
             memcpy(dst + dst_x, row, (size_t)copy_w * sizeof(uint16_t));
         }
 
-#if !HSTX
+#if !HSTX && !USE_ILI9341
 #if FRAMEBUFFERISPOSSIBLE
         if (!Frens::isFrameBufferUsed())
 #endif
             dvi_->setLineBuffer(y, lb);
 #endif
     }
+#if USE_ILI9341
+    ili9341_flush(true);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +481,9 @@ void star_draw()
 
     for (int y = 0; y < SCREENHEIGHT; y++) {
         uint16_t *dst;
-#if !HSTX
+#if USE_ILI9341
+        dst = &Frens::framebuffer[y * SCREENWIDTH];
+#elif !HSTX
         dvi::DVI::LineBuffer *lb = nullptr;
 #if FRAMEBUFFERISPOSSIBLE
         if (Frens::isFrameBufferUsed()) {
@@ -523,13 +530,16 @@ void star_draw()
             }
         }
 
-#if !HSTX
+#if !HSTX && !USE_ILI9341
 #if FRAMEBUFFERISPOSSIBLE
         if (!Frens::isFrameBufferUsed())
 #endif
             dvi_->setLineBuffer(y, lb);
 #endif
     }
+#if USE_ILI9341
+    ili9341_flush(true);
+#endif
 }
 
 // ---------------------------------------------------------------------------

@@ -29,4 +29,6 @@ bool app_launch_present(void);
  * if no valid image is present or the chosen launch method refused. */
 void app_launch_run(void);
 
+extern int g_app_launch_error;
+
 #endif /* APP_LAUNCH_H */

@@ -9,19 +9,18 @@
 // rows 96..135). Park the bar comfortably below it at y=160..179, centred
 // horizontally with a 40-pixel margin on each side.
 #define PB_X       40
-#define PB_Y       160
+#define PB_Y       180
 #define PB_W       240
-#define PB_H       20
+#define PB_H       14
 
 // Percentage label, drawn in a fixed-width field just below the bar so the
 // field self-clears: the text is right-aligned into PB_LBL_CHARS cells and
 // every cell (spaces included) is painted, so "100%" -> "  7%" leaves no
-// stale pixels behind. y=182 gives a 2-pixel gap under the bar; the 8 glyph
-// rows then end at 189, clear of image_convert's filename band at 190.
+// stale pixels behind. y=198 gives a 4-pixel gap under the bar.
 #define PB_LBL_CHARS 4                                       // "100%"
 #define PB_LBL_W     (PB_LBL_CHARS * FONT_CHAR_WIDTH)
 #define PB_LBL_X     (PB_X + (PB_W - PB_LBL_W) / 2)
-#define PB_LBL_Y     (PB_Y + PB_H + 2)
+#define PB_LBL_Y     (PB_Y + PB_H + 4)
 
 // Glyph table for the label: digits '0'..'9' plus '%' and ' '. Extracted from
 // font_8x8[] by a constexpr initializer so the table lands in .data (SRAM,
@@ -70,6 +69,10 @@ static void __not_in_flash_func(pb_draw_glyph)(uint16_t *fb, int x, int gi,
     }
 }
 
+#if USE_ILI9341
+#include "drivers/ili9341/ili9341.h"
+#endif
+
 // __not_in_flash_func: invoked from the flash callback. During the flash op,
 // core1 is still alive servicing HSTX scanlines and any code on core1's path
 // is in SRAM. This function on core0 is also called between bootrom flash
@@ -95,27 +98,36 @@ extern "C" void __not_in_flash_func(progress_bar_draw)(uint32_t numer, uint32_t 
 #endif
     if (!fb) return;
 
+    int cur_pb_x = PB_X;
+    int cur_pb_w = PB_W;
+#if USE_ILI9341
+    if (ili9341_get_gb_mode()) {
+        cur_pb_w = 200;
+        cur_pb_x = 45 + (266 - 200) / 2; // 78
+    }
+#endif
+
     // How much of the interior is filled?  Interior = BAR_W - 2 (subtract the
     // 1-px left + right border). Clamp so a >100% numer never overruns.
-    uint32_t fill_px = (denom > 0) ? (numer * (PB_W - 2) / denom) : 0;
-    if (fill_px > (uint32_t)(PB_W - 2)) fill_px = PB_W - 2;
+    uint32_t fill_px = (denom > 0) ? (numer * (cur_pb_w - 2) / denom) : 0;
+    if (fill_px > (uint32_t)(cur_pb_w - 2)) fill_px = cur_pb_w - 2;
 
     uint32_t pct = (denom > 0) ? (numer * 100u / denom) : 0;
     if (pct > 100) pct = 100;
 
     // Top + bottom borders: solid horizontal stripe.
-    for (int x = 0; x < PB_W; x++) {
-        fb[ PB_Y                * 320 + PB_X + x] = col_border;
-        fb[(PB_Y + PB_H - 1)    * 320 + PB_X + x] = col_border;
+    for (int x = 0; x < cur_pb_w; x++) {
+        fb[ PB_Y                * 320 + cur_pb_x + x] = col_border;
+        fb[(PB_Y + PB_H - 1)    * 320 + cur_pb_x + x] = col_border;
     }
 
     // Interior rows: left border, filled portion, empty portion, right border.
     for (int y = 1; y < PB_H - 1; y++) {
-        uint16_t *row = fb + (PB_Y + y) * 320 + PB_X;
+        uint16_t *row = fb + (PB_Y + y) * 320 + cur_pb_x;
         row[0]         = col_border;
         for (int x = 1; x <= (int)fill_px; x++)         row[x] = col_fill;
-        for (int x = (int)fill_px + 1; x < PB_W - 1; x++) row[x] = col_empty;
-        row[PB_W - 1]  = col_border;
+        for (int x = (int)fill_px + 1; x < cur_pb_w - 1; x++) row[x] = col_empty;
+        row[cur_pb_w - 1]  = col_border;
     }
 
     // Percentage label, right-aligned into the fixed field: "  0%" .. "100%".
@@ -127,7 +139,8 @@ extern "C" void __not_in_flash_func(progress_bar_draw)(uint32_t numer, uint32_t 
     gi[2] = (int)(pct % 10);
     gi[1] = (pct >= 10)  ? (int)((pct / 10) % 10) : PB_GLYPH_SPACE;
     gi[0] = (pct >= 100) ? (int)(pct / 100)       : PB_GLYPH_SPACE;
+    int cur_lbl_x = cur_pb_x + (cur_pb_w - PB_LBL_W) / 2;
     for (int i = 0; i < PB_LBL_CHARS; i++) {
-        pb_draw_glyph(fb, PB_LBL_X + i * FONT_CHAR_WIDTH, gi[i], col_border, col_empty);
+        pb_draw_glyph(fb, cur_lbl_x + i * FONT_CHAR_WIDTH, gi[i], col_border, col_empty);
     }
 }

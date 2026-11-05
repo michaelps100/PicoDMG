@@ -32,16 +32,22 @@
  */
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <strings.h>
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/version.h"
+#include "pico/bootrom.h"
 #include "hardware/clocks.h"
 #include "hardware/watchdog.h"
 #include "hardware/vreg.h"
+#include "hardware/xosc.h"
+#include "hardware/rosc.h"
+#include "hardware/pll.h"
 
 #include "FrensHelpers.h"
+#include "FrensFonts.h"
 #include "RomLister.h"
 #include "menu.h"
 #include "settings.h"
@@ -62,10 +68,12 @@ extern "C" {
 #include "emulators_txt.h"
 #include "uf2_crc.h"
 #include "gui.h"
+#include "boot_anim_assets.h"
 #include "themes.h"
 #include "screensaver.h"
 #include "progress_bar.h"
 #include "sd_boot_ini.h"
+#include "splash_assets.h"
 #include <hardware/divider.h>
 }
 
@@ -78,11 +86,11 @@ extern "C" {
 #if HSTX
 #define PB_COL_BORDER 0x0000u   // black
 #define PB_COL_EMPTY  0x7FFFu   // white (matches menu background)
-#define PB_COL_FILL   0x03E0u   // pure green
+#define PB_COL_FILL   0x5C00u   // brand red #BF0000 (RGB555)
 #else
 #define PB_COL_BORDER 0x0000u   // black
 #define PB_COL_EMPTY  0x0FFFu   // white
-#define PB_COL_FILL   0x00F0u   // pure green
+#define PB_COL_FILL   0x0B00u   // brand red #BF0000 (RGB444)
 #endif
 
 // DrawScreen() has external linkage in pico_shared/menu.cpp but is not declared
@@ -90,6 +98,8 @@ extern "C" {
 // framebuffer for one frame. We drive it directly from our own picker loop.
 void DrawScreen(int selectedRow, int w = 0, int h = 0, uint16_t *imagebuffer = nullptr,
                 int imagex = 0, int imagey = 0);
+
+bool g_bootloader_defer_flush = false;
 
 // splash() is normally provided by each emulator (it is emulator-specific art).
 // The bootloader shows no splash, but menu.cpp references the symbol, so give
@@ -122,7 +132,7 @@ static uint32_t appFlashEnd()
 // Brief on-screen pause (ms) so the "Flashing..." notice registers before
 // the bar starts moving. The bar itself is now live during the erase so we
 // don't need a long read-time -- just enough to acknowledge the press.
-#define FLASH_NOTICE_MS  500
+#define FLASH_NOTICE_MS  50
 
 // On picoDVI we have to stop core1 before flashing (see flashAndLaunch
 // comment), so the screen goes dark for the whole flash op. Hold the
@@ -166,6 +176,7 @@ char  g_index_path[144];              // "<BASEDIR>/<INDEX>"
 char  g_guimode_path[80];             // "<BASEDIR>/.guimode"
 
 #define GUI_SLIDE_PX_PER_FRAME 20            // 320 / 20 = 16 frames ≈ 270 ms
+#define GUI_HW_SLIDE_US        220000u       // hardware-scrolled slide, ease-out
 
 // Fallback label derived from filename when binary_info parsing fails:
 //   "picogenesisPlus_AdafruitFruitJam_arm_piousb.uf2" -> "picogenesisPlus"
@@ -184,11 +195,104 @@ void makeLabelFromFilename(const char *fname, char *out, size_t n)
     out[n - 1] = '\0';
 }
 
+static bool g_gb_mode = false;
+
+// Bumped whenever a change here can affect what /boot.txt is allowed to say.
+// Its only job is to make the running firmware identifiable from the screen
+// itself. A panel symptom ("the image is mirrored") is indistinguishable from
+// "the card's boot.txt is not the one being read" without it, and that mix-up
+// has already cost a full round of debugging.
+#define DMG_BOOT_BUILD_ID "panel3-20260929"
+
+// ---------------------------------------------------------------------------
+// /boot.txt, parsed once.
+//
+// The panel keys (ST7789/ROTATE/INVERT/ST7789_XOFF/ST7789_YOFF) only take
+// effect if they are in place before the panel power-on sequence, which
+// happens inside Frens::initAll(). initAll() mounts the SD card itself, so the
+// parse has to happen from a pre-display hook rather than from main() before
+// the call. The hook caches the result here; main() picks it up after
+// initAll() returns instead of reading the card a second time.
+// ---------------------------------------------------------------------------
+static sd_boot_ini_t      g_boot_ini;
+static sd_boot_ini_status_t g_boot_ini_status = SD_BOOT_INI_OK;
+static char               g_boot_ini_err[64] = {0};
+static bool               g_boot_ini_parsed = false;
+
+#if USE_ILI9341
+// Registered with Frens::setPreDisplayHook() and called by initAll() between
+// initSDCard() and ili9341_init(). Also does the parse for the rest of main().
+static void applyBootPanelConfig(void)
+{
+    if (!g_boot_ini_parsed) {
+        g_boot_ini_status = sd_boot_ini_load("/boot.txt", &g_boot_ini,
+                                             g_boot_ini_err, sizeof(g_boot_ini_err));
+        g_boot_ini_parsed = true;
+    }
+    if (g_boot_ini_status != SD_BOOT_INI_OK) {
+        // The display is not up yet, so the fatal screen is raised later, in
+        // main(), once there is something to draw it on. The panel still gets
+        // compile-time defaults below -- showing *something* is better than a
+        // blank panel the user cannot diagnose.
+        LOG("boot_ini: parse failed (%s); using panel defaults", g_boot_ini_err);
+    }
+
+    // A malformed file leaves g_boot_ini zeroed, which would read as
+    // "ILI9341, no rotation, no inversion" even on a ST7789 console. Re-apply
+    // the compile-time defaults in that case.
+    if (g_boot_ini_status != SD_BOOT_INI_OK) {
+        const sd_boot_ini_t defaults = {0};
+        g_boot_ini = defaults;
+        g_boot_ini.screensaver   = SS_MODE_STARFIELD;
+        g_boot_ini.gui_graphical = true;
+        g_boot_ini.volume        = 3;
+#if DEFAULT_PANEL_ST7789
+        g_boot_ini.st7789 = true;
+#endif
+    }
+
+    // set_panel() must come first: the MADCTL table is per-panel, so the
+    // orientation the rotation resolves to depends on which controller is on
+    // the bus. Order here is load-bearing, not incidental.
+    ili9341_set_panel(g_boot_ini.st7789 ? DMG_PANEL_ST7789 : DMG_PANEL_ILI9341);
+    ili9341_set_invert(g_boot_ini.invert);
+    ili9341_set_gram_offset(g_boot_ini.st7789_xoff, g_boot_ini.st7789_yoff);
+    // ROTATE is a 180-degree flip of the landscape orientation, which is
+    // rotation 3 rather than rotation 1. The concrete MADCTL each resolves to
+    // is per-panel (0x68/0xA8 on the Core2350B's ST7789, 0x28/0xE8 on ILI9341).
+    ili9341_set_rotation(g_boot_ini.rotate ? 3 : 1);
+    // MADCTL, when present, wins outright: the user is correcting the mirror
+    // bits a particular ST7789 module disagrees on, and re-deriving from
+    // ROTATE would just re-apply the wrong value.
+    if (g_boot_ini.seen_madctl) {
+        ili9341_set_madctl(g_boot_ini.madctl);
+    }
+
+    uint8_t xo, yo;
+    ili9341_get_gram_offset(&xo, &yo);
+    LOG("panel: %s rotate=%u madctl-rot=%u madctl=0x%02X (%s) invert=%d offsets=%u,%u (from %s)",
+        g_boot_ini.st7789 ? "ST7789" : "ILI9341",
+        (unsigned)g_boot_ini.rotate, g_boot_ini.rotate ? 3u : 1u,
+        (unsigned)ili9341_get_madctl(),
+        g_boot_ini.seen_madctl ? "boot.txt" : "derived",
+        (int)g_boot_ini.invert, (unsigned)xo, (unsigned)yo,
+        g_boot_ini.file_present ? "/boot.txt" : "defaults");
+}
+#endif // USE_ILI9341
+
 void centerText(int row, const char *text, int fg, int bg)
 {
     int len = (int)strlen(text);
-    int x = (SCREEN_COLS - len) / 2;
-    if (x < 0) x = 0;
+    int x;
+    if (g_gb_mode) {
+        // DMG window is 266 px wide starting at x=45.
+        // In 8-pixel character cells: column 6 .. 38 (33 columns).
+        x = 6 + (33 - len) / 2;
+        if (x < 6) x = 6;
+    } else {
+        x = (SCREEN_COLS - len) / 2;
+        if (x < 0) x = 0;
+    }
     putText(x, row, text, fg, bg);
 }
 
@@ -231,7 +335,8 @@ void drawMenu(int sel, int top, int visible)
                  seld ? '>' : ' ',
                  flashMark,
                  name);
-        putText(1, row, line, fg, bg);
+        int item_col = g_gb_mode ? 6 : 1;
+        putText(item_col, row, line, fg, bg);
     }
 
     // buttonLabel1 is the label of the button that triggers Btn::A on the
@@ -241,15 +346,17 @@ void drawMenu(int sel, int top, int visible)
     getButtonLabels(buttonLabel1, buttonLabel2);
 
     char hint[SCREEN_COLS + 1];
-    centerText(SCREEN_ROWS - 4, "* in flash    ! SD differs (reflash)",
-               COL_FG, COL_BG);
-    centerText(SCREEN_ROWS - 3, "UP / DOWN : choose   SELECT : graphical", COL_FG, COL_BG);
-    // '_' rather than spaces for the gap: putText collapses whitespace runs,
-    // so a space-padded string would render shorter than centerText measured
-    // it with strlen() and the line would sit off-centre. putText turns '_'
-    // back into a literal space (menu.cpp:598).
-    snprintf(hint, sizeof(hint), "%s : start____START : help", buttonLabel1);
-    centerText(SCREEN_ROWS - 2, hint, COL_FG, COL_BG);
+    if (g_gb_mode) {
+        centerText(SCREEN_ROWS - 4, "* flash  ! diff", COL_FG, COL_BG);
+        centerText(SCREEN_ROWS - 3, "UP/DOWN: choose  SEL: GUI", COL_FG, COL_BG);
+        snprintf(hint, sizeof(hint), "%s: start   START: help", buttonLabel1);
+        centerText(SCREEN_ROWS - 2, hint, COL_FG, COL_BG);
+    } else {
+        centerText(SCREEN_ROWS - 4, "* in flash    ! SD differs (reflash)", COL_FG, COL_BG);
+        centerText(SCREEN_ROWS - 3, "UP / DOWN : choose   SELECT : graphical", COL_FG, COL_BG);
+        snprintf(hint, sizeof(hint), "%s : start____START : help", buttonLabel1);
+        centerText(SCREEN_ROWS - 2, hint, COL_FG, COL_BG);
+    }
 }
 
 void showMessage(const char *l1, const char *l2, const char *l3)
@@ -302,6 +409,8 @@ static uint16_t *getActiveFramebuffer()
 {
 #if HSTX
     return (uint16_t *)hstx_getframebuffer();
+#elif USE_ILI9341
+    return ili9341_get_framebuffer();
 #else
   #if FRAMEBUFFERISPOSSIBLE
     if (!Frens::isFrameBufferUsed()) return nullptr;
@@ -369,6 +478,246 @@ static void overlayErrorDecor()
     drawStripeBand(fb, 0,   16);     // top caution-tape band
     drawStripeBand(fb, 224, 16);     // bottom caution-tape band
     drawWarningDisk(fb, 160, 16, 22);  // breaks through the top band
+}
+
+// --- Splash screen rendering (ArcadeFun Logo + QR Code + YouTube URL) --------
+// --- Power-on intro ---------------------------------------------------------
+// Black screen; the logo fades in at the top and slides down at a steady speed
+// to the centre of the visible window, the chime plays as it lands, then it
+// holds. Any button skips it. The logo stays on the panel afterwards, while the
+// emulator scan runs, until the picker draws over it.
+//
+// Assets come from tools/make_boot_anim_assets.py (logo RGB565 blended over
+// black, chime 22.05 kHz mono). Each step sends only the logo's columns over
+// the rows it moves through (~150 x 40 px, ~2 ms), column by column, instead
+// of a full 25 ms frame.
+#define INTRO_DELAY_MS    250u    // black before the logo starts
+#define INTRO_DROP_MS     1150u   // top edge -> centre, linear
+#define INTRO_FADEIN_MS   350u    // fade-in at the start of the drop
+#define INTRO_HOLD_MS     1300u   // after landing (and until the chime ends)
+
+// Feed the chime into the I2S ring, upsampled 22.05 -> 44.1 kHz by linear
+// interpolation, followed by 50 ms of silence so the amp never stops on a
+// non-zero sample. Returns false once everything has been queued.
+static bool intro_chime_pump(uint32_t *frame, int gain_q8)
+{
+    const uint32_t total = 2u * BOOT_CHIME_LEN + 2205u;
+    if (gain_q8 <= 0) return false;
+    int room = EXT_AUDIO_GET_FREE();
+    while (room-- > 0 && *frame < total) {
+        const uint32_t k = *frame >> 1;
+        int v = 0;
+        if (k < BOOT_CHIME_LEN) {
+            v = boot_chime[k];
+            if ((*frame & 1u) && k + 1 < BOOT_CHIME_LEN) v = (v + boot_chime[k + 1]) / 2;
+            v = (v * gain_q8) >> 8;
+        }
+        EXT_AUDIO_ENQUEUE_SAMPLE((int16_t)v, (int16_t)v);
+        (*frame)++;
+    }
+    return *frame < total;
+}
+
+static inline uint16_t intro_scale565(uint16_t c, int a)
+{
+    if (a >= 256) return c;
+    const int r = ((c >> 11) & 0x1F) * a >> 8;
+    const int g = ((c >> 5)  & 0x3F) * a >> 8;
+    const int b = ( c        & 0x1F) * a >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+uint32_t readPads();   // defined below
+
+// Returns true when a button cut it short.
+static bool showBootIntro(uint8_t volume)
+{
+#if USE_ILI9341
+    uint16_t *fb = getActiveFramebuffer();
+    if (!fb) return false;
+
+    const bool gb    = ili9341_get_gb_mode();
+    const int  win_x = gb ? 45 : 0;
+    const int  win_w = gb ? 266 : SCREENWIDTH;
+    const int  lx    = win_x + (win_w - BOOT_LOGO_W) / 2;
+    const int  y_end = (SCREENHEIGHT - BOOT_LOGO_H) / 2;
+    const int  y_beg = -BOOT_LOGO_H;
+    static const int gains[6] = { 0, 40, 80, 130, 190, 256 };   // VOLUME= 0..5
+    const int  gain  = gains[volume > 5 ? 5 : volume];
+
+    // The intro composes in RGB565 and sends it as is.
+    ili9341_set_native_565(true);
+    memset(fb, 0, SCREENWIDTH * SCREENHEIGHT * sizeof(uint16_t));
+    ili9341_flush(true);
+
+    const uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    int  prev_y = INT32_MIN, prev_a = -1;
+    bool landed = false, chime_on = false, skipped = false;
+    uint32_t land_ms = 0, chime_frame = 0;
+
+    for (;;) {
+        watchdog_update();
+        tuh_task();
+        if (readPads()) { skipped = true; break; }
+
+        const uint32_t t = to_ms_since_boot(get_absolute_time()) - t0;
+        if (t >= INTRO_DELAY_MS) {
+            const uint32_t td = t - INTRO_DELAY_MS;
+            const uint32_t tc = td < INTRO_DROP_MS ? td : INTRO_DROP_MS;
+            const int y = y_beg + (int)((int64_t)(y_end - y_beg) * tc / INTRO_DROP_MS);
+            const int a = td >= INTRO_FADEIN_MS ? 256 : (int)(td * 256u / INTRO_FADEIN_MS);
+
+            if (y != prev_y || a != prev_a) {
+                // Black out the previous position, draw the new one, and send
+                // just the rows the two cover.
+                const int top = (prev_y == INT32_MIN) ? y : (prev_y < y ? prev_y : y);
+                const int bot = (prev_y == INT32_MIN ? y : (prev_y > y ? prev_y : y)) + BOOT_LOGO_H - 1;
+                for (int r = top; r <= bot; r++) {
+                    if (r < 0 || r >= SCREENHEIGHT) continue;
+                    memset(&fb[r * SCREENWIDTH + lx], 0, BOOT_LOGO_W * sizeof(uint16_t));
+                }
+                for (int r = 0; r < BOOT_LOGO_H; r++) {
+                    const int py = y + r;
+                    if (py < 0 || py >= SCREENHEIGHT) continue;
+                    const uint16_t *src = &boot_logo_565[r * BOOT_LOGO_W];
+                    uint16_t *dst = &fb[py * SCREENWIDTH + lx];
+                    for (int c = 0; c < BOOT_LOGO_W; c++) dst[c] = intro_scale565(src[c], a);
+                }
+                // Column by column, along the panel's scan axis: at most one
+                // vertical seam instead of a diagonal tear (see the driver).
+                ili9341_write_rect_by_columns(fb, lx, lx + BOOT_LOGO_W - 1,
+                                              top < 0 ? 0 : top, bot);
+                prev_y = y;
+                prev_a = a;
+            }
+
+            if (!landed && td >= INTRO_DROP_MS) {
+                landed   = true;
+                land_ms  = t;
+                chime_on = true;
+            }
+        }
+
+        if (chime_on) chime_on = intro_chime_pump(&chime_frame, gain);
+        if (landed && !chime_on && t - land_ms >= INTRO_HOLD_MS) break;
+        sleep_us(500);
+    }
+
+    ili9341_set_native_565(false);
+    return skipped;
+#else
+    (void)volume;
+    return false;
+#endif
+}
+
+// --- Flashing screen rendering (Logo + QR + YouTube + Platform + Warning) ---
+static void drawFlashScreen(const char *emuName)
+{
+    uint16_t *fb = getActiveFramebuffer();
+    if (!fb) return;
+
+    bool gb = false;
+#if USE_ILI9341
+    gb = ili9341_get_gb_mode();
+#endif
+    int win_x = gb ? 45 : 0;
+    int win_w = gb ? 266 : 320;
+    int win_center_x = win_x + win_w / 2;
+
+    // Fill white inside visible window, black on DMG borders
+    const uint16_t col_white = PB_COL_EMPTY;
+    for (int y = 0; y < SCREENHEIGHT; y++) {
+        uint16_t *row = &fb[y * SCREENWIDTH];
+        for (int x = 0; x < SCREENWIDTH; x++) {
+            if (gb && (x < win_x || x >= win_x + win_w)) {
+                row[x] = 0x0000;
+            } else {
+                row[x] = col_white;
+            }
+        }
+    }
+
+    // Top elements: Logo (left) and QR Code (right) at top_y = 16
+    const int top_y = 16;
+    const int total_w = SPLASH_LOGO_W + SPLASH_GAP + (SPLASH_QR_SIZE * SPLASH_QR_SCALE);
+    const int start_x = win_x + (win_w - total_w) / 2;
+
+    // Logo ArcadeFun (97x88), vertically centered with QR box (99x99)
+    const int logo_x = start_x;
+    const int logo_y = top_y + ((SPLASH_QR_SIZE * SPLASH_QR_SCALE) - SPLASH_LOGO_H) / 2;
+    for (int r = 0; r < SPLASH_LOGO_H; r++) {
+        int py = logo_y + r;
+        if (py < 0 || py >= SCREENHEIGHT) continue;
+        const uint16_t *src_row = &splash_logo_arcadefun[r * SPLASH_LOGO_W];
+        uint16_t *dst_row = &fb[py * SCREENWIDTH + logo_x];
+        for (int c = 0; c < SPLASH_LOGO_W; c++) {
+            dst_row[c] = src_row[c];
+        }
+    }
+
+    // QR Code (33x33 modules, scale 3x3)
+    const int qr_x = start_x + SPLASH_LOGO_W + SPLASH_GAP;
+    const int qr_y = top_y;
+    const uint16_t col_black = PB_COL_BORDER;
+    for (int r = 0; r < SPLASH_QR_SIZE; r++) {
+        for (int c = 0; c < SPLASH_QR_SIZE; c++) {
+            uint16_t col = splash_qr_arcadefun[r][c] ? col_black : col_white;
+            for (int dy = 0; dy < SPLASH_QR_SCALE; dy++) {
+                int py = qr_y + r * SPLASH_QR_SCALE + dy;
+                if (py < 0 || py >= SCREENHEIGHT) continue;
+                for (int dx = 0; dx < SPLASH_QR_SCALE; dx++) {
+                    int px = qr_x + c * SPLASH_QR_SCALE + dx;
+                    if (px >= 0 && px < SCREENWIDTH) {
+                        fb[py * SCREENWIDTH + px] = col;
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper lambda to draw centered 8x8 text
+    auto drawCenteredText8x8 = [&](int cx, int y, const char *txt, uint16_t col) {
+        if (!txt) return;
+        int len = (int)strlen(txt);
+        int total_txt_w = len * FONT_CHAR_WIDTH;
+        int x0 = cx - total_txt_w / 2;
+        for (int i = 0; i < len; i++) {
+            char ch = txt[i];
+            if (ch < FONT_FIRST_ASCII || ch >= FONT_FIRST_ASCII + FONT_N_CHARS) ch = ' ';
+            for (int r = 0; r < FONT_CHAR_HEIGHT; r++) {
+                char slice = getcharslicefrom8x8font(ch, r);
+                int py = y + r;
+                if (py < 0 || py >= SCREENHEIGHT) continue;
+                for (int b = 0; b < FONT_CHAR_WIDTH; b++) {
+                    int px = x0 + i * FONT_CHAR_WIDTH + b;
+                    if (px >= 0 && px < SCREENWIDTH) {
+                        if (slice & (1 << b)) {
+                            fb[py * SCREENWIDTH + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+#if HSTX
+    const uint16_t col_charcoal = 0x1084u; // #222222 in RGB555
+#else
+    const uint16_t col_charcoal = 0x0222u; // #222222 in RGB444
+#endif
+    const uint16_t col_brand_red = PB_COL_FILL;
+
+    // 2. "Scan QR to visit us on Youtube" at y = 120
+    drawCenteredText8x8(win_center_x, 120, "Scan QR to visit us on Youtube", col_charcoal);
+
+    // 3. Platform / emulator name at y = 152 (2 blank lines of space above)
+    if (emuName && emuName[0]) {
+        drawCenteredText8x8(win_center_x, 152, emuName, col_charcoal);
+    }
+
+    // 4. "DO NOT POWER OFF" in #BF0000 at y = 166
+    drawCenteredText8x8(win_center_x, 166, "DO NOT POWER OFF", col_brand_red);
 }
 
 // Charcell layout. Avoids rows 0..1 and 28..29 since those get overwritten
@@ -479,7 +828,9 @@ uint32_t readPads()
     nespad_read_start();
 #endif
     auto count =
-#if !HSTX
+#if USE_ILI9341
+    0;
+#elif !HSTX
     dvi_->getFrameCounter();
 #else
     hstx_getframecounter();
@@ -500,6 +851,29 @@ uint32_t readPads()
 #endif
     uint32_t btns = io::getCurrentGamePadState(0).buttons |
                     io::getCurrentGamePadState(1).buttons;
+
+#if USE_ILI9341
+    // Dodger-one PicoDMG pinout (direct GPIO buttons, active-low):
+    // UP: GP2, DOWN: GP3, LEFT: GP4, RIGHT: GP5
+    // A:  GP6, B:    GP7, SELECT: GP8, START: GP9
+    static bool picodmg_buttons_inited = false;
+    if (!picodmg_buttons_inited) {
+        for (int pin = 2; pin <= 9; pin++) {
+            gpio_init(pin);
+            gpio_set_dir(pin, GPIO_IN);
+            gpio_pull_up(pin);
+        }
+        picodmg_buttons_inited = true;
+    }
+    if (!gpio_get(2)) btns |= Btn::UP;
+    if (!gpio_get(3)) btns |= Btn::DOWN;
+    if (!gpio_get(4)) btns |= Btn::LEFT;
+    if (!gpio_get(5)) btns |= Btn::RIGHT;
+    if (!gpio_get(6)) btns |= Btn::A;
+    if (!gpio_get(7)) btns |= Btn::B;
+    if (!gpio_get(8)) btns |= Btn::SELECT;
+    if (!gpio_get(9)) btns |= Btn::START;
+#endif
     // nespad_states[] and wiipad_read() use their own bit layouts (NES
     // bus order / Wii nunchuk layout). Translate them into the same
     // io::GamePadState::Button bits the callers check via Btn::*.
@@ -863,6 +1237,8 @@ void drawUf2ErrorScreen(const char *filename, const uf2_diag_t *d, bool isAux)
     centerText(28, foot, COL_BAR_FG, COL_BAR_BG);
 }
 
+void idleFor(int ms);
+
 // Show the rejection page until the user dismisses it. Same pump as
 // showHelpScreen(): pure charcell, so redrawing every frame is idempotent.
 void showUf2ErrorScreen(const char *filename, const uf2_diag_t *d, bool isAux)
@@ -870,10 +1246,11 @@ void showUf2ErrorScreen(const char *filename, const uf2_diag_t *d, bool isAux)
     using Btn = io::GamePadState::Button;
 
     drawUf2ErrorScreen(filename, d, isAux);
+    DrawScreen(-1);
 
-    // ~0u so the A press that started the launch isn't immediately read as the
-    // press that dismisses this screen.
-    uint32_t prev = ~0u;
+    // Wait until initial button press is released plus a small grace period
+    idleFor(300);
+    uint32_t prev = readPads();
     for (;;) {
         uint32_t btns   = readPads();
         uint32_t pushed = btns & ~prev;
@@ -891,9 +1268,106 @@ void idleFor(int ms)
     for (int i = 0; i < ms / 16; i++) {
         tuh_task();
         DrawScreen(-1);
+#if USE_ILI9341
+        ili9341_flush(true);
+#endif
         sleep_ms(16);
     }
 }
+
+// Panel calibration.
+//
+// The MADCTL mirror bits are the one part of this driver that cannot be derived
+// from the datasheet: ST7789 modules disagree on which mirror combination their
+// panel is bonded in, and there is no way to tell from the register dump. The
+// only source of truth is what the user sees on the glass. Chasing that by
+// editing /boot.txt and rebooting costs a card round-trip per guess, and a
+// wrong MADCTL in the file also throws the rest of the file away (the parser
+// is strict), so a typo in an unrelated key silently discards a correct
+// orientation.
+//
+// So: hold SELECT at the splash to step through every plausible MADCTL and see
+// the result immediately, then A writes the winner to /boot.txt. Nothing is
+// persisted unless the user picks one, and cancelling leaves the card alone.
+#if USE_ILI9341
+static void drawPanelCalScreen(const uint8_t *mads, int n, int sel, bool saved)
+{
+    ClearScreen(COL_BG);
+    centerText(4, "PANEL CALIBRATION", COL_ERR_FG, COL_BG);
+    centerText(7, "UP/DOWN select   A save   B cancel", COL_FG, COL_BG);
+
+    char line[48];
+    for (int i = 0; i < n; i++) {
+        snprintf(line, sizeof(line), "%c MADCTL=0x%02X",
+                 (i == sel) ? '>' : ' ', (unsigned)mads[i]);
+        centerText(10 + i, line, (i == sel) ? COL_ERR_FG : COL_FG, COL_BG);
+    }
+    centerText(20, saved ? "Saved to /boot.txt" : "SELECT held to re-open", COL_FG, COL_BG);
+    centerText(22, DMG_BOOT_BUILD_ID, COL_FG, COL_BG);
+}
+
+static void runPanelCalibration(void)
+{
+    using Btn = io::GamePadState::Button;
+
+    // Landscape values first (MV set, which a 320x240 framebuffer needs), then
+    // portrait, then the RGB colour-order variants. The current effective value
+    // is pre-selected below, so this normally opens on the right answer and the
+    // user only has to confirm.
+    static const uint8_t kCands[] = {
+        0x68, 0xA8, 0x28, 0xE8,   // landscape, BGR
+        0x48, 0x88, 0x08, 0xC8,   // portrait,  BGR
+        0x60, 0xA0, 0x20, 0xE0,   // landscape, RGB
+        0x40, 0xC0, 0x00, 0x80,   // portrait,  RGB
+    };
+    const int n = (int)(sizeof(kCands) / sizeof(kCands[0]));
+
+    int sel = 0;
+    for (int i = 0; i < n; i++) {
+        if (kCands[i] == ili9341_get_madctl()) { sel = i; break; }
+    }
+
+    bool saved = false;
+    drawPanelCalScreen(kCands, n, sel, saved);
+    DrawScreen(-1);
+
+    idleFor(300);
+    uint32_t prev = readPads();
+    for (;;) {
+        uint32_t btns   = readPads();
+        uint32_t pushed = btns & ~prev;
+        prev = btns;
+
+        if (pushed & (Btn::UP | Btn::DOWN)) {
+            sel += (pushed & Btn::DOWN) ? 1 : -1;
+            while (sel < 0) sel += n;
+            while (sel >= n) sel -= n;
+            saved = false;
+        }
+        if (pushed & (Btn::A | Btn::B)) {
+            if (pushed & Btn::A) {
+                ili9341_set_madctl(kCands[sel]);
+                if (sd_boot_ini_load("/boot.txt", &g_boot_ini,
+                                     g_boot_ini_err, sizeof(g_boot_ini_err)) == SD_BOOT_INI_OK) {
+                    g_boot_ini.madctl = kCands[sel];
+                    g_boot_ini.seen_madctl = true;
+                    // A bare load leaves seen_* false for keys that defaulted,
+                    // which is correct: only MADCTL is being changed here.
+                    if (sd_boot_ini_save("/boot.txt", &g_boot_ini)) {
+                        saved = true;
+                    } else {
+                        saved = false;
+                    }
+                }
+            }
+            break;
+        }
+
+        drawPanelCalScreen(kCands, n, sel, saved);
+        DrawScreen(-1);
+    }
+}
+#endif // USE_ILI9341
 
 // Why did we boot? Useful breadcrumb for diagnosing the resume-vs-menu split.
 void logBootCause()
@@ -929,21 +1403,31 @@ void logAppPartitionState(const char *when)
 // restored at each callback boundary), and gives the user some "still alive"
 // feedback during the dark stretch. On HSTX configs the screen also stays up
 // so the LED is just bonus.
+// Combined percentage: erase contributes 0..10, write contributes 10..100.
 extern "C" void __not_in_flash_func(flashProgress)(int phase, uint32_t done, uint32_t total)
 {
-    // Combined percentage: erase contributes 0..10, write contributes 10..100.
     uint32_t pct;
     if (phase == UF2_PROGRESS_ERASE) {
         pct = (total > 0) ? (done * 10u / total) : 0;
     } else {
         uint32_t w = (total > 0) ? (done * 90u / total) : 0;
         pct = 10u + w;
-        // Throttle write-phase redraws: a 2 MB image is ~8192 pages, plenty
-        // of opportunity to skip frames where pct didn't move visibly.
-        bool boundary = (done == 0 || done == total);
-        if (!boundary && (done & 0x3F) != 0) return;
     }
+
+    // Only redraw when percentage advances by at least 2% or on phase boundaries (0 or total).
+    // This avoids redundant SPI transfers while keeping the bar smooth.
+    static uint32_t last_pct = 0xFFFFFFFF;
+    if (phase == UF2_PROGRESS_ERASE && done == 0) last_pct = 0xFFFFFFFF;
+    bool boundary = (done == 0 || done == total);
+    if (!boundary && (pct / 2) == (last_pct / 2)) return;
+    last_pct = pct;
+
     progress_bar_draw(pct, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+#if USE_ILI9341
+    // Flush only the rows containing the progress bar and percentage label (179..207)
+    // to complete in ~5 ms instead of ~50 ms per frame.
+    ili9341_flush_rows(179, 207);
+#endif
 
     // LED heartbeat -- toggle on every accepted callback so the user sees
     // activity even while the picoDVI signal is gone.
@@ -952,113 +1436,142 @@ extern "C" void __not_in_flash_func(flashProgress)(int phase, uint32_t done, uin
     Frens::blinkLed(led_on);
 }
 
-// Read the SD directory, parse each emulator's program_name from its binary_info,
+// Scan a single directory for .uf2 files and populate g_emus[].
+static void scanDirForUf2(const char *dir)
+{
+    FILINFO fi;
+    FRESULT fr = f_stat(dir, &fi);
+    bool dir_ok = (fr == FR_OK) && (fi.fattrib & AM_DIR);
+    if (!dir_ok) {
+        LOG("Directory %s not present (f_stat=%d, attr=0x%02x)",
+            dir, (int)fr, (unsigned)fi.fattrib);
+        return;
+    }
+
+    Frens::RomLister lister(32 * 1024, ".uf2");
+    lister.list(dir);
+    int count = (int)lister.Count();
+    auto *entries = lister.GetEntries();
+
+    int cap = (int)(sizeof(g_emus) / sizeof(g_emus[0]));
+    if (count > cap) {
+        LOG("WARNING: %d entries found, capping list at %d", count, cap);
+        count = cap;
+    }
+
+    int skipped = 0;
+    uint32_t flash_end = appFlashEnd();
+    for (int i = 0; i < count; i++) {
+        if (g_emu_count >= cap) break;
+
+        // Skip directories: only list files
+        if (entries[i].IsDirectory) {
+            continue;
+        }
+
+        // Strictly accept only files ending in .uf2 (case-insensitive)
+        size_t nlen = strlen(entries[i].Path);
+        if (nlen < 4 || strcasecmp(entries[i].Path + nlen - 4, ".uf2") != 0) {
+            continue;
+        }
+
+        g_emu_seen++;
+
+        SdEmu &e = g_emus[g_emu_count];
+        strncpy(e.filename, entries[i].Path, sizeof(e.filename) - 1);
+        e.filename[sizeof(e.filename) - 1] = '\0';
+
+        char full[FF_MAX_LFN];
+        snprintf(full, sizeof(full), "%s/%s", dir, e.filename);
+
+        e.prog_name[0]    = '\0';
+        e.image_key[0]    = '\0';
+        e.display_name[0] = '\0';
+        e.aux_uf2[0]      = '\0';
+        bool ok = program_name_from_uf2_file(full, e.prog_name, sizeof(e.prog_name));
+        if (!ok || !e.prog_name[0]) {
+            makeLabelFromFilename(e.filename, e.prog_name, sizeof(e.prog_name));
+        }
+        strncpy(e.label, e.prog_name, sizeof(e.label) - 1);
+        e.label[sizeof(e.label) - 1] = '\0';
+
+        // Optional lookup in emulators.txt (if index file was loaded)
+        bool matched = emulators_txt_lookup(e.prog_name,
+                                            e.image_key,    sizeof(e.image_key),
+                                            e.display_name, sizeof(e.display_name),
+                                            e.aux_uf2,      sizeof(e.aux_uf2));
+        if (!matched) {
+            // Not in emulators.txt (or emulators.txt not present): use label as display name
+            strncpy(e.display_name, e.label, sizeof(e.display_name) - 1);
+            e.display_name[sizeof(e.display_name) - 1] = '\0';
+
+            strncpy(e.image_key, e.label, sizeof(e.image_key) - 1);
+            e.image_key[sizeof(e.image_key) - 1] = '\0';
+            for (int k = 0; e.image_key[k]; k++) {
+                e.image_key[k] = (char)tolower((unsigned char)e.image_key[k]);
+            }
+            e.aux_uf2[0] = '\0';
+        }
+
+        // Size gate: hide entries whose image (or companion data image)
+        // extends past the end of the actual flash chip.
+        uint32_t lo, hi;
+        if (uf2_extent_from_file_family(full, UF2_FAMILY_RP2350_ARM_S,
+                                        &lo, &hi) && hi > flash_end) {
+            LOG("  SKIP %s (image 0x%08X-0x%08X exceeds flash end 0x%08X, %u KB over)",
+                e.filename, (unsigned)lo, (unsigned)hi, (unsigned)flash_end,
+                (unsigned)((hi - flash_end + 1023) / 1024));
+            skipped++;
+            continue;
+        }
+        if (e.aux_uf2[0]) {
+            char auxFull[FF_MAX_LFN];
+            snprintf(auxFull, sizeof(auxFull), "%s/%s", dir, e.aux_uf2);
+            if (uf2_extent_from_file_family(auxFull, UF2_FAMILY_RP2350_DATA,
+                                            &lo, &hi) && hi > flash_end) {
+                LOG("  SKIP %s (aux %s at 0x%08X-0x%08X exceeds flash end 0x%08X)",
+                    e.filename, e.aux_uf2, (unsigned)lo, (unsigned)hi,
+                    (unsigned)flash_end);
+                skipped++;
+                continue;
+            }
+        }
+        LOG("  [%2d] %-40s  prog_name=\"%s\"  img_key=\"%s\"  display=\"%s\"%s%s",
+            g_emu_count, e.filename, e.prog_name, e.image_key, e.display_name,
+            e.aux_uf2[0] ? "  aux=" : "", e.aux_uf2[0] ? e.aux_uf2 : "");
+        g_emu_count++;
+    }
+    LOG("Listed %d .uf2 file(s) from %s (%d skipped).",
+        g_emu_count, dir, skipped);
+}
+
+// Read the SD directory, parse each emulator from its .uf2 files,
 // build g_emus[], and locate the in-flash entry (g_flash_idx).
-//
-// Filtering: an .uf2 file is added to g_emus[] only if its program_name has a
-// matching row in /emu/emulators.txt. Files that aren't listed (third-party
-// builds, test images, .uf2 files for unrelated tools) are silently skipped --
-// the picker should show only emulators that the maintainer of this card has
-// curated as launchable.
 void scanEmulators()
 {
     g_emu_count = 0;
     g_emu_seen  = 0;
 
-    // f_stat first: RomLister::list() silently falls back to chdir("/") when
-    // its target directory doesn't exist (RomLister.cpp:118) and then lists
-    // the root, which would show whatever the user has at the top of the SD
-    // (e.g. 10 unrelated .uf2 files) as if they were emulators for this
-    // config. Skip the lister entirely when the config dir is missing so
-    // the post-scan path lands on the right "nothing here" error.
-    FILINFO fi;
-    FRESULT fr = f_stat(g_emuDir, &fi);
-    bool dir_ok = (fr == FR_OK) && (fi.fattrib & AM_DIR);
-    if (!dir_ok) {
-        LOG("Config dir %s not present (f_stat=%d, attr=0x%02x); leaving emu list empty.",
-            g_emuDir, (int)fr, (unsigned)fi.fattrib);
-    } else {
-        Frens::RomLister lister(32 * 1024, ".uf2");
-        lister.list(g_emuDir);
-        int count = (int)lister.Count();
-        auto *entries = lister.GetEntries();
+    // Scan primary directory (e.g. /emu/<HW_CONFIG> or /emu)
+    scanDirForUf2(g_emuDir);
 
-        int cap = (int)(sizeof(g_emus) / sizeof(g_emus[0]));
-        if (count > cap) {
-            LOG("WARNING: %d entries found, capping list at %d", count, cap);
-            count = cap;
-        }
-
-        g_emu_seen  = count;
-        int skipped = 0;
-        uint32_t flash_end = appFlashEnd();
-        for (int i = 0; i < count; i++) {
-            SdEmu &e = g_emus[g_emu_count];
-            strncpy(e.filename, entries[i].Path, sizeof(e.filename) - 1);
-            e.filename[sizeof(e.filename) - 1] = '\0';
-
-            char full[FF_MAX_LFN];
-            snprintf(full, sizeof(full), "%s/%s", g_emuDir, e.filename);
-
-            e.prog_name[0]    = '\0';
-            e.image_key[0]    = '\0';
-            e.display_name[0] = '\0';
-            e.aux_uf2[0]      = '\0';
-            bool ok = program_name_from_uf2_file(full, e.prog_name, sizeof(e.prog_name));
-            if (!ok || !e.prog_name[0]) {
-                LOG("  SKIP %s (binary_info parse failed; no program_name)", e.filename);
-                skipped++;
-                continue;
-            }
-            strncpy(e.label, e.prog_name, sizeof(e.label) - 1);
-            e.label[sizeof(e.label) - 1] = '\0';
-
-            // The emulators.txt match is mandatory: an unlisted .uf2 is not
-            // shown. This is how Frank curates which emulators are "supported"
-            // on this card -- the bootloader trusts the txt as the allow-list.
-            bool matched = emulators_txt_lookup(e.prog_name,
-                                                e.image_key,    sizeof(e.image_key),
-                                                e.display_name, sizeof(e.display_name),
-                                                e.aux_uf2,      sizeof(e.aux_uf2));
-            if (!matched) {
-                LOG("  SKIP %s (prog_name=\"%s\" not in emulators.txt)",
-                    e.filename, e.prog_name);
-                skipped++;
-                continue;
-            }
-
-            // Size gate: hide entries whose image (or companion data image)
-            // extends past the end of the actual flash chip. An extent probe
-            // failure is NOT a skip -- the flash-time validate in
-            // flashAndLaunch() remains the backstop for odd files.
-            uint32_t lo, hi;
-            if (uf2_extent_from_file_family(full, UF2_FAMILY_RP2350_ARM_S,
-                                            &lo, &hi) && hi > flash_end) {
-                LOG("  SKIP %s (image 0x%08X-0x%08X exceeds flash end 0x%08X, %u KB over)",
-                    e.filename, (unsigned)lo, (unsigned)hi, (unsigned)flash_end,
-                    (unsigned)((hi - flash_end + 1023) / 1024));
-                skipped++;
-                continue;
-            }
-            if (e.aux_uf2[0]) {
-                char auxFull[FF_MAX_LFN];
-                snprintf(auxFull, sizeof(auxFull), "%s/%s", g_emuDir, e.aux_uf2);
-                if (uf2_extent_from_file_family(auxFull, UF2_FAMILY_RP2350_DATA,
-                                                &lo, &hi) && hi > flash_end) {
-                    LOG("  SKIP %s (aux %s at 0x%08X-0x%08X exceeds flash end 0x%08X)",
-                        e.filename, e.aux_uf2, (unsigned)lo, (unsigned)hi,
-                        (unsigned)flash_end);
-                    skipped++;
-                    continue;
+    // If nothing found in a subfolder (e.g. /emu/15), fallback to parent directory (e.g. /emu)
+    if (g_emu_seen == 0) {
+        char *slash = strrchr(g_emuDir, '/');
+        if (slash && slash != g_emuDir) {
+            char parent[80];
+            size_t plen = (size_t)(slash - g_emuDir);
+            if (plen < sizeof(parent)) {
+                strncpy(parent, g_emuDir, plen);
+                parent[plen] = '\0';
+                LOG("No .uf2 files in %s; trying parent directory %s...", g_emuDir, parent);
+                scanDirForUf2(parent);
+                if (g_emu_count > 0) {
+                    strncpy(g_emuDir, parent, sizeof(g_emuDir) - 1);
+                    g_emuDir[sizeof(g_emuDir) - 1] = '\0';
                 }
             }
-            LOG("  [%2d] %-40s  prog_name=\"%s\"  img_key=\"%s\"  display=\"%s\"%s%s",
-                g_emu_count, e.filename, e.prog_name, e.image_key, e.display_name,
-                e.aux_uf2[0] ? "  aux=" : "", e.aux_uf2[0] ? e.aux_uf2 : "");
-            g_emu_count++;
         }
-        LOG("Listed %d of %d .uf2 file(s) in %s (%d skipped).",
-            g_emu_count, g_emu_seen, g_emuDir, skipped);
     }
 
     g_flash_prog_name[0] = '\0';
@@ -1166,8 +1679,16 @@ static AuxState computeAuxDrift(int idx, uf2_fingerprint_t *out_fp)
     multicore_reset_core1();   // hand HSTX over; emulator brings its own driver up
     Frens::markLaunchedFromBootloader();
     app_launch_run();          // VTOR jump; no return on success
-    LOG("app_launch_run() returned unexpectedly.");
-    watchdog_reboot(0, 0, 0);
+    watchdog_disable();
+    LOG("app_launch_run() returned unexpectedly (err=%d).", g_app_launch_error);
+    char err_buf[64];
+    snprintf(err_buf, sizeof(err_buf), "Launch failed (rc=%d)", g_app_launch_error);
+    showMessage("Launch Failed", err_buf, "Power cycle to reboot.");
+    DrawScreen(-1);
+#if USE_ILI9341
+    ili9341_set_backlight(true);
+    ili9341_flush(true);
+#endif
     for (;;) tight_loop_contents();
 }
 
@@ -1190,6 +1711,12 @@ void launchInFlash()
 //   flashAux=true  : write g_emus[idx].aux_uf2 at *auxFp's target address.
 // If both are false, callers should use launchInFlash() instead -- but this
 // function still handles that case gracefully by just jumping.
+// NOTE: Power switch monitoring is deliberately omitted throughout the entire
+// flash and handoff sequence. If the user flips the physical power switch to OFF
+// while the progress bar is active, flashing proceeds uninterrupted to 100%
+// completion and hands off to the emulator; the emulator's shared_menu will
+// enforce a 1-second delay after rendering its ROM menu before honoring the OFF state,
+// preventing Flash XIP data corruption.
 void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint_t *auxFp)
 {
     char full[FF_MAX_LFN];
@@ -1197,7 +1724,7 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
     LOG("Flash & launch: [%d] %s  flashEmu=%d flashAux=%d",
         idx, full, (int)flashEmu, (int)flashAux);
 
-    uf2_load_stats_t st;
+    uf2_load_stats_t st = {0};
 
     // Pre-flight the emulator UF2 first (display still alive). Skip if the
     // caller just wants the aux flashed.
@@ -1227,6 +1754,7 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
     // Pre-flight the aux UF2 too, using its own target range (derived from
     // the fingerprint pass, so we don't re-scan the file).
     char auxFull[FF_MAX_LFN] = {0};
+    uf2_load_stats_t astp = {0};
     if (flashAux) {
         if (!auxFp || !g_emus[idx].aux_uf2[0]) {
             LOG("BUG: flashAux=true but no aux fingerprint / column");
@@ -1236,7 +1764,6 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
         LOG("Pre-flight validating aux UF2 %s at [0x%08X..0x%08X)...",
             auxFull, (unsigned)auxFp->image_base,
             (unsigned)(auxFp->image_base + auxFp->image_size));
-        uf2_load_stats_t astp;
         uf2_load_result_t vr = uf2_validate_file_ex(auxFull,
             auxFp->image_base, auxFp->image_base + auxFp->image_size,
             UF2_FAMILY_RP2350_DATA, &astp);
@@ -1269,21 +1796,16 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
         line3 = "WAD + emulator...";
     }
 
-#if HSTX
-    // HSTX path: hardware-accelerated TMDS encoding gives microsecond IRQs
-    // on core1, so it keeps running cleanly through every flash erase/write
-    // window. The live progress bar updates in real time and the audit in
-    // framework-flash-while-running.md keeps core1 SRAM-only throughout.
-    showMessage(line1, line2, line3);
-    DrawScreen(-1);
-    idleFor(FLASH_NOTICE_MS);
-
-    // Paint an empty 0% bar so the user sees the bar's box appear before any
-    // flash writes start. Colours are compile-time literals (see PB_COL_*),
-    // so the flash callback never has to dereference flash for them.
+#if HSTX || USE_ILI9341
+    // HSTX & SPI TFT path: keeps running cleanly through every flash erase/write
+    // window. The live progress bar updates in real time.
+    drawFlashScreen(line2);
     progress_bar_draw(0, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+#if USE_ILI9341
+    ili9341_flush(true);
+#endif
 
-    LOG("Pre-flight OK. core1 left running; beginning flash sequence.");
+    LOG("Pre-flight OK. beginning flash sequence.");
 #else
     // picoDVI path: software TMDS encoding on core1 (PIO encoder) is too
     // timing-sensitive to survive multi-second flash ops -- the DVI
@@ -1305,7 +1827,7 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
     // boots and reads from it). See plan for the ordering rationale.
     if (flashAux) {
         LOG("Flashing aux blob %s ...", auxFull);
-        uf2_load_stats_t ast;
+        uf2_load_stats_t ast = astp;
         uf2_load_result_t r = uf2_load_file_ex(auxFull,
             auxFp->image_base, auxFp->image_base + auxFp->image_size,
             UF2_FAMILY_RP2350_DATA, &ast, flashProgress);
@@ -1320,10 +1842,15 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
         LOG("Aux flash OK: %u blocks written to 0x%08X..0x%08X",
             (unsigned)ast.programmed_blocks,
             (unsigned)ast.lowest_addr, (unsigned)ast.highest_addr);
-#if HSTX
+#if HSTX || USE_ILI9341
         // Reset the bar to 0% for the next phase so the second flash starts
         // fresh instead of finishing full-on-full.
-        if (flashEmu) progress_bar_draw(0, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+        if (flashEmu) {
+            progress_bar_draw(0, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+#if USE_ILI9341
+            ili9341_flush_rows(179, 207);
+#endif
+        }
 #endif
     }
 
@@ -1343,9 +1870,12 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
             (unsigned)st.lowest_addr, (unsigned)st.highest_addr);
     }
 
-#if HSTX
-    // Force a final 100% paint before we tear down core1.
+#if HSTX || USE_ILI9341
+    // Force a final 100% paint before we tear down.
     progress_bar_draw(100, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+#if USE_ILI9341
+    ili9341_flush_rows(179, 207);
+#endif
 #endif
     logAppPartitionState("after flash");
     if (app_launch_present()) {
@@ -1357,10 +1887,7 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
     // about to reboot into the menu. Say so first: an unexplained bounce back
     // to the picker right after a full progress bar is exactly the "it silently
     // did nothing" experience this screen work exists to remove.
-    //
-    // HSTX only -- the picoDVI path reset core1 before flashing, so there is no
-    // display left to draw on and the LED heartbeat is all the user gets.
-#if HSTX
+#if HSTX || USE_ILI9341
     showMessage("Flashed, but the app will",
                 "not start. Returning to menu.",
                 "Rebuild it for the bootloader.");
@@ -1379,11 +1906,108 @@ void flashAndLaunch(int idx, bool flashEmu, bool flashAux, const uf2_fingerprint
     for (;;) tight_loop_contents();
 }
 
+static void checkPowerSwitch(const sd_boot_ini_t &ini)
+{
+    if (!ini.power_switch) return;
+    bool pin_raw = gpio_get(ini.power_pin);
+    bool is_off = ini.power_active_low ? pin_raw : !pin_raw;
+    if (!is_off) return;
+
+    // Debounce: verify switch stays OFF for 30 ms
+    for (int i = 0; i < 3; i++) {
+        sleep_ms(10);
+        watchdog_update();
+        pin_raw = gpio_get(ini.power_pin);
+        bool check_off = ini.power_active_low ? pin_raw : !pin_raw;
+        if (!check_off) return;
+    }
+
+    LOG("Power switch OFF: entering standby (DORMANT)...");
+
+#if USE_ILI9341
+    // Backlight OFF
+    gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_SIO);
+    gpio_set_dir(ILI9341_PIN_BL, GPIO_OUT);
+    gpio_put(ILI9341_PIN_BL, 0);
+
+    // Sleep display (DISPOFF + SLPIN)
+    gpio_put(ILI9341_PIN_CS, 0); gpio_put(ILI9341_PIN_DC, 0);
+    uint8_t cmd_dispoff = 0x28; spi_write_blocking(ILI9341_SPI, &cmd_dispoff, 1);
+    gpio_put(ILI9341_PIN_CS, 1);
+    sleep_ms(5);
+    gpio_put(ILI9341_PIN_CS, 0); gpio_put(ILI9341_PIN_DC, 0);
+    uint8_t cmd_slpin = 0x10; spi_write_blocking(ILI9341_SPI, &cmd_slpin, 1);
+    gpio_put(ILI9341_PIN_CS, 1);
+#endif
+
+    uint32_t wake_event = ini.power_active_low ? GPIO_IRQ_LEVEL_LOW : GPIO_IRQ_LEVEL_HIGH;
+    gpio_set_input_enabled(ini.power_pin, true);
+    gpio_set_dormant_irq_enabled(ini.power_pin, wake_event, true);
+
+    clock_configure_undivided(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC, 0, XOSC_HZ);
+    clock_configure_undivided(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0, XOSC_HZ);
+    clock_stop(clk_adc);
+    clock_stop(clk_usb);
+#if HAS_HSTX
+    clock_stop(clk_hstx);
+#endif
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, XOSC_HZ, XOSC_HZ);
+    pll_deinit(pll_sys);
+    pll_deinit(pll_usb);
+    rosc_disable();
+
+    xosc_dormant();
+
+    gpio_acknowledge_irq(ini.power_pin, wake_event);
+    gpio_set_dormant_irq_enabled(ini.power_pin, wake_event, false);
+    sleep_ms(20);
+
+    // Bootloader clean wake: reboot into bootloader
+    watchdog_reboot(0, 0, 0);
+    while (true) tight_loop_contents();
+}
+
 } // namespace
+
+#if USE_ILI9341
+// SELECT + START + UP held while the console powers on -> USB BOOTSEL, so a new
+// pico-bootLoader.uf2 can be dropped onto the RPI-RP2 drive without opening the
+// case to reach the board's BOOTSEL button.
+//
+// Read straight off the button GPIOs, before anything else: before the resume
+// jump (which would hand control to the last emulator) and before the display,
+// SD and USB come up, so a bad image further down cannot lock the user out of
+// recovery. Sampled several times over ~30 ms so a bounce or a single noisy read
+// cannot reboot the console on its own.
+static void checkBootselComboAtPowerOn()
+{
+    static const uint PIN_UP = 2, PIN_SELECT = 8, PIN_START = 9;
+    const uint pins[] = { PIN_UP, PIN_SELECT, PIN_START };
+    for (uint p : pins) {
+        gpio_init(p);
+        gpio_set_dir(p, GPIO_IN);
+        gpio_pull_up(p);
+    }
+    sleep_ms(2);   // let the pull-ups charge the lines
+
+    for (int i = 0; i < 6; i++) {
+        const bool held = !gpio_get(PIN_UP) && !gpio_get(PIN_SELECT) && !gpio_get(PIN_START);
+        if (!held) return;
+        sleep_ms(5);
+    }
+
+    LOG("SELECT+START+UP held at power-on -> rebooting to USB BOOTSEL");
+    stdio_flush();
+    reset_usb_boot(0, 0);   // does not return
+}
+#endif
 
 int main()
 {
     Frens::setClocksAndStartStdio(CPUFREQ_KHZ, VREG_VOLTAGE_1_30);
+#if USE_ILI9341
+    checkBootselComboAtPowerOn();
+#endif
 
     // --- BANNER -------------------------------------------------------------
     LOG("---- Pico bootLoader booting ----");
@@ -1443,6 +2067,12 @@ int main()
     // could miss its control-block reload deadline, silently killing the
     // DMA chain. Fixed in pico_lib (SpinLockGuard etc.); the buffer size
     // only shifted the timing.)
+    // The panel must be configured from /boot.txt before initAll() powers it
+    // up, which is exactly what this hook is for. initAll() mounts the card
+    // first, so the parse cannot happen any earlier than this.
+#if USE_ILI9341
+    Frens::setPreDisplayHook(applyBootPanelConfig);
+#endif
     bool sdOk = Frens::initAll(dummyRom, CPUFREQ_KHZ, 0, 0, 1024, false, true);
     LOG("initAll done. SD mounted=%d  PSRAM=%d  framebufferUsed=%d",
         (int)sdOk, (int)Frens::isPsramEnabled(), (int)Frens::isFrameBufferUsed());
@@ -1469,6 +2099,9 @@ int main()
             (unsigned)Frens::storage_get_flash_capacity(), (unsigned)end);
     }
     screenBuffer = (charCell *)Frens::f_malloc(screenbufferSize);
+    if (screenBuffer) {
+        memset(screenBuffer, 0, screenbufferSize);
+    }
     LOG("Allocated %u-byte screenBuffer at %p", (unsigned)screenbufferSize, screenBuffer);
 
     if (!sdOk) {
@@ -1478,24 +2111,69 @@ int main()
                          nullptr);
     }
 
-    // Load /boot.txt. Missing file -> defaults ("/emu", "emulators.txt",
-    // STARFIELD). Present but malformed -> fatal, so the user knows the
-    // config didn't take effect instead of silently reverting to defaults.
-    sd_boot_ini_t ini;
-    char ini_err[64] = {0};
-    LOG("Loading /boot.txt (optional)...");
-    if (sd_boot_ini_load("/boot.txt", &ini, ini_err, sizeof(ini_err)) != SD_BOOT_INI_OK) {
-        fatalErrorScreen("BOOT.TXT INVALID",
-                         ini_err,
-                         "Fix /boot.txt and reset.",
-                         nullptr);
+    // /boot.txt was already parsed by applyBootPanelConfig() above (the
+    // pre-display hook), before the panel power-on sequence. Reuse that copy:
+    // reading it a second time would only risk the two disagreeing. Missing
+    // file -> defaults ("/emu", "emulators.txt", STARFIELD). Present but
+    // malformed -> fatal, so the user knows the config didn't take effect
+    // instead of silently reverting to defaults.
+    if (!g_boot_ini_parsed) {
+        // DVI build: no panel to pre-configure, so nothing parsed it yet.
+        g_boot_ini_status = sd_boot_ini_load("/boot.txt", &g_boot_ini,
+                                             g_boot_ini_err, sizeof(g_boot_ini_err));
+        g_boot_ini_parsed = true;
     }
-    LOG("boot_ini: BASEDIR=%s INDEX=%s SCREENSAVER=%s GUI=%d THEME=%u",
+    if (g_boot_ini_status != SD_BOOT_INI_OK) {
+        // The parse error alone is not enough to work with: there is no way to
+        // tell from it which firmware is actually running, nor whether the card
+        // holds the boot.txt the user thinks it does. Both have been mistaken
+        // for a panel problem already. So the build stamp and the file the
+        // loader really opened go on screen with the error.
+        char l2[96];
+        snprintf(l2, sizeof(l2), "build %s  file=%s",
+                 DMG_BOOT_BUILD_ID,
+                 g_boot_ini.file_present ? "/boot.txt" : "(none)");
+        fatalErrorScreen("BOOT.TXT INVALID",
+                         g_boot_ini_err,
+                         l2,
+                         "Fix /boot.txt and reset.");
+    }
+    sd_boot_ini_t &ini = g_boot_ini;
+    LOG("boot_ini: BASEDIR=%s INDEX=%s SCREENSAVER=%s GUI=%d THEME=%u GB_MODE=%d",
         ini.base_dir, ini.index_file,
         ini.screensaver == SS_MODE_STARFIELD ? "STARFIELD" : "BLOCKS",
-        (int)ini.gui_graphical, (unsigned)ini.theme);
+        (int)ini.gui_graphical, (unsigned)ini.theme, (int)ini.gb_mode);
 
-    snprintf(g_emuDir,       sizeof(g_emuDir),       "%s/%d",      ini.base_dir, HW_CONFIG);
+    if (ini.power_switch) {
+        gpio_init(ini.power_pin);
+        gpio_set_dir(ini.power_pin, GPIO_IN);
+        if (ini.power_active_low) {
+            gpio_pull_up(ini.power_pin);
+        } else {
+            gpio_pull_down(ini.power_pin);
+        }
+        LOG("boot_ini: POWER_SWITCH active on GP%u (active_%s, behavior=%s)",
+            (unsigned)ini.power_pin, ini.power_active_low ? "low" : "high",
+            ini.power_behavior);
+    }
+
+    g_gb_mode = ini.gb_mode;
+#if USE_ILI9341
+    ili9341_set_gb_mode(g_gb_mode);
+#endif
+
+    // Directory resolution: check if config-specific subdirectory (<base_dir>/<HW_CONFIG>) exists.
+    // Otherwise use <base_dir> (/emu) directly.
+    char hwDir[80];
+    snprintf(hwDir, sizeof(hwDir), "%s/%d", ini.base_dir, HW_CONFIG);
+    FILINFO fiHw;
+    if (f_stat(hwDir, &fiHw) == FR_OK && (fiHw.fattrib & AM_DIR)) {
+        strncpy(g_emuDir, hwDir, sizeof(g_emuDir) - 1);
+    } else {
+        strncpy(g_emuDir, ini.base_dir, sizeof(g_emuDir) - 1);
+    }
+    g_emuDir[sizeof(g_emuDir) - 1] = '\0';
+
     snprintf(g_index_path,   sizeof(g_index_path),   "%s/%s",      ini.base_dir, ini.index_file);
     snprintf(g_guimode_path, sizeof(g_guimode_path), "%s/.guimode", ini.base_dir);
     gui_set_asset_dir(ini.base_dir);
@@ -1549,23 +2227,58 @@ int main()
             (unsigned)themes_mask(), themes_count(), theme);
     }
 
-    // Pre-load the emulators.txt (or user-renamed) index. It's the allow-list
-    // that scanEmulators() filters SD .uf2 files against, so a missing or
-    // empty file means we'd hide every emulator and confuse the user with a
-    // "no matching emulators" screen. Name the real cause directly instead.
-    LOG("Loading %s...", g_index_path);
+    // Load emulators.txt index if available (optional)
+    LOG("Loading %s (optional)...", g_index_path);
     if (!emulators_txt_load(g_index_path)) {
-        fatalErrorScreen("INDEX FILE MISSING",
-                         "Place the index file at",
-                         g_index_path,
-                         "and reset.");
+        LOG("Notice: %s not found. Scanning .uf2 files directly from %s",
+            g_index_path, g_emuDir);
     }
 
     // Parse program_name from every .uf2 on SD and from the in-flash image.
     // Briefly tell the user what's happening (this can take a second or two
     // while we seek through 5+ files on slow SD cards).
-    showMessage("Scanning emulators...", g_emuDir, nullptr);
-    DrawScreen(-1);
+    // This splash is the only guaranteed-visible, always-drawn screen on the
+    // path to the menu, so it carries the build stamp and the panel state that
+    // was actually applied. Both are needed to tell "wrong firmware" and "wrong
+    // boot.txt" apart from a real panel problem, and neither is visible on the
+    // menu itself.
+    {
+        char p2[80];
+#if USE_ILI9341
+        snprintf(p2, sizeof(p2), "%s MADCTL=0x%02X %s",
+                 DMG_BOOT_BUILD_ID,
+                 (unsigned)ili9341_get_madctl(),
+                 ini.seen_madctl ? "(from boot.txt)" : "(derived from ROTATE)");
+#else
+        snprintf(p2, sizeof(p2), "%s DVI", DMG_BOOT_BUILD_ID);
+#endif
+        LOG("Panel: %s (dir=%s)", p2, g_emuDir);
+    }
+
+    // Power-on intro (logo drop + chime). Buttons held at power-on skip it at
+    // once, so the SELECT-hold calibrator check below still sees SELECT.
+    const bool intro_skipped = showBootIntro(ini.volume);
+
+#if USE_ILI9341
+    // Hold SELECT to open the panel calibrator (1 second continuous hold).
+    {
+        uint32_t hold = 0;
+        while (hold < 60) {
+            watchdog_update();
+            tuh_task();
+            if (readPads() & io::GamePadState::Button::SELECT) {
+                hold++;
+            } else {
+                break;
+            }
+            sleep_ms(16);
+        }
+        if (hold >= 60) {
+            runPanelCalibration();
+        }
+    }
+#endif
+
     LOG("Scanning %s for *.uf2 and parsing binary_info...", g_emuDir);
     scanEmulators();
 
@@ -1579,14 +2292,13 @@ int main()
                              "Copy emulator .uf2 files there",
                              "and reset.");
         } else {
-            // .uf2 files exist but none are listed in the index -- either
-            // the file is missing, or its entries don't match any prog_name.
+            // .uf2 files exist but none were usable / valid for RP2350
             snprintf(m, sizeof(m), "%d UF2 file(s) found in %s",
                      g_emu_seen, g_emuDir);
-            fatalErrorScreen("NO MATCHING EMULATORS",
+            fatalErrorScreen("NO VALID EMULATORS",
                              m,
-                             "but none listed in",
-                             g_index_path);
+                             "Check RP2350 compatibility",
+                             "and reset.");
         }
     }
 
@@ -1606,6 +2318,15 @@ int main()
         screensaver_convert_batch();
     }
 
+    // A press that skipped the intro must not also act in the picker.
+    if (intro_skipped) {
+        while (readPads() != 0) {
+            watchdog_update();
+            tuh_task();
+            sleep_ms(16);
+        }
+    }
+
     // --- PICKER LOOP --------------------------------------------------------
     LOG("Entering picker loop. D-pad: navigate, A: start, SELECT: toggle graphical, START: help.");
     const int visible = ENDROW - STARTROW + 1;
@@ -1621,6 +2342,17 @@ int main()
     bool buffers_ready  = false;
     int  slide_p        = 0;        // 0..SCREENWIDTH, pixels of the new image visible
     int  slide_dir      = 0;        // +1 = new enters from right, -1 = from left, 0 = idle
+    // Button-hint footer. Rebuilt on each call so the A-button label tracks
+    // pad hot-plug (NES "A", XInput "B", DualShock "O", ...). gui only caches
+    // the pointer, hence the static storage.
+    auto footer_text = []() -> const char * {
+        static char footer[SCREEN_COLS + 1];
+        char bl1[2], bl2[2];
+        getButtonLabels(bl1, bl2);
+        snprintf(footer, sizeof(footer),
+                 "L/R:app  U/D:theme  %s:go  START:help", bl1);
+        return footer;
+    };
 
     // Screensaver state. Activates after 30 s of no input; loads up to 5
     // small bouncing images from /emu/assets/screensaver/ and exits on any
@@ -1645,18 +2377,235 @@ int main()
         }
     };
 
+    auto fbDrawChar8x8 = [](uint16_t *fb, int x, int y, char c, uint16_t fg, uint16_t bg, int scale) {
+        if (c < FONT_FIRST_ASCII || c >= FONT_FIRST_ASCII + FONT_N_CHARS) c = ' ';
+        for (int r = 0; r < 8; r++) {
+            char slice = getcharslicefrom8x8font(c, r);
+            for (int sy = 0; sy < scale; sy++) {
+                int py = y + r * scale + sy;
+                if (py < 0 || py >= SCREENHEIGHT) continue;
+                for (int b = 0; b < 8; b++) {
+                    bool on = (slice & (1 << b)) != 0;
+                    if (!on && bg == 0) continue;
+                    uint16_t col = on ? fg : bg;
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = x + b * scale + sx;
+                        if (px >= 0 && px < SCREENWIDTH) {
+                            fb[py * SCREENWIDTH + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    auto fbDrawText = [&](uint16_t *fb, int cx, int y, const char *text, uint16_t fg, uint16_t bg, int scale) {
+        if (!text) return;
+        int len = (int)strlen(text);
+        int total_w = len * 8 * scale;
+        int x = cx - total_w / 2;
+        if (x < 0) x = 0;
+        for (int i = 0; i < len; i++) {
+            fbDrawChar8x8(fb, x + i * 8 * scale, y, text[i], fg, bg, scale);
+        }
+    };
+
+    auto fbDrawRect = [](uint16_t *fb, int x0, int y0, int w, int h, uint16_t color) {
+        for (int x = x0; x < x0 + w; x++) {
+            if (x >= 0 && x < SCREENWIDTH) {
+                if (y0 >= 0 && y0 < SCREENHEIGHT) fb[y0 * SCREENWIDTH + x] = color;
+                if (y0 + h - 1 >= 0 && y0 + h - 1 < SCREENHEIGHT) fb[(y0 + h - 1) * SCREENWIDTH + x] = color;
+            }
+        }
+        for (int y = y0; y < y0 + h; y++) {
+            if (y >= 0 && y < SCREENHEIGHT) {
+                if (x0 >= 0 && x0 < SCREENWIDTH) fb[y * SCREENWIDTH + x0] = color;
+                if (x0 + w - 1 >= 0 && x0 + w - 1 < SCREENWIDTH) fb[y * SCREENWIDTH + x0 + w - 1] = color;
+            }
+        }
+    };
+
     // Single loader that picks the full-res or half-res variant based on the
     // target buffer's size. Used for both cur (always full) and next (half
     // when no PSRAM, full otherwise).
-    auto load_image_into = [](int idx, uint16_t *dest, bool half_res) {
-        if (idx >= 0 && idx < g_emu_count && g_emus[idx].image_key[0]) {
-            bool ok = half_res
-                ? gui_load_image_half_res(g_emus[idx].image_key, dest)
-                : gui_load_image(g_emus[idx].image_key, dest);
-            if (ok) return;
+    auto load_image_raw = [&](int idx, uint16_t *dest, bool half_res) {
+        if (idx >= 0 && idx < g_emu_count) {
+            // Artwork keys, first hit wins: the .uf2 file name without its
+            // extension ("PicoNES.uf2" -> "PicoNES.565"), then the
+            // emulators.txt / derived image_key ("nes"), then the program name.
+            const SdEmu &e = g_emus[idx];
+            char stem[sizeof(e.filename)];
+            strncpy(stem, e.filename, sizeof(stem) - 1);
+            stem[sizeof(stem) - 1] = '\0';
+            char *dot = strrchr(stem, '.');
+            if (dot) *dot = '\0';
+            const char *keys[3] = { stem, e.image_key, e.prog_name };
+            for (int k = 0; k < 3; k++) {
+                if (!keys[k][0]) continue;
+                bool dup = false;
+                for (int j = 0; j < k; j++) dup |= strcasecmp(keys[j], keys[k]) == 0;
+                if (dup) continue;
+                bool ok = half_res ? gui_load_image_half_res(keys[k], dest)
+                                   : gui_load_image(keys[k], dest);
+                if (ok) return;
+            }
         }
-        if (half_res) gui_fill_solid_half_res(dest, 0);
-        else          gui_fill_solid(dest, 0);
+        if (half_res) {
+            gui_fill_solid_half_res(dest, 0);
+        } else {
+            gui_fill_solid(dest, 0);
+            if (idx >= 0 && idx < g_emu_count) {
+                // Card outline frame. gui_color(): the graphical buffers are
+                // RGB565 on SPI-panel builds, RGB444 elsewhere.
+                fbDrawRect(dest, 16, 16, SCREENWIDTH - 32, SCREENHEIGHT - 40, gui_color(0x0335));
+                fbDrawRect(dest, 20, 56, SCREENWIDTH - 40, 1, gui_color(0x0224));
+
+                char counter[32];
+                snprintf(counter, sizeof(counter), "[ %d of %d ]", idx + 1, g_emu_count);
+                fbDrawText(dest, SCREENWIDTH / 2, 34, counter, gui_color(0x0777), 0, 1);
+
+                const char *displayName = g_emus[idx].display_name[0] ?
+                                          g_emus[idx].display_name : g_emus[idx].label;
+                fbDrawText(dest, SCREENWIDTH / 2, 88, displayName, gui_color(0x0FFF), 0, 2);
+
+                fbDrawText(dest, SCREENWIDTH / 2, 130, g_emus[idx].filename, gui_color(0x0888), 0, 1);
+
+                if (idx == g_flash_idx) {
+                    fbDrawText(dest, SCREENWIDTH / 2, 162, "* CURRENTLY IN FLASH *", gui_color(0x00F0), 0, 1);
+                } else {
+                    fbDrawText(dest, SCREENWIDTH / 2, 162, "Press A to Launch", gui_color(0x0555), 0, 1);
+                }
+            }
+        }
+    };
+
+    // Decoded artwork cache, one full 320x240 buffer per entry, PSRAM only.
+    // Reading a 127 KB .565 off the card takes tens of ms, which is the pause
+    // before a slide even starts; a PSRAM copy is a few ms. Filled on first
+    // view and by preloading the neighbours while the menu is idle. Without
+    // PSRAM there is no room for it and every view reads the card.
+    static uint16_t *s_img_cache[32] = {};
+    static bool      s_img_cached[32] = {};
+    const size_t     img_bytes = SCREENWIDTH * SCREENHEIGHT * sizeof(uint16_t);
+
+    auto cache_invalidate = [&]() {
+        for (int i = 0; i < 32; i++) s_img_cached[i] = false;
+    };
+
+    // Make sure entry idx is in the cache. False when there is no PSRAM or no
+    // memory left for another buffer (f_malloc panics instead of failing).
+    auto cache_fill = [&](int idx) -> bool {
+        if (idx < 0 || idx >= g_emu_count || idx >= 32) return false;
+        if (s_img_cached[idx]) return true;
+        if (!Frens::isPsramEnabled()) return false;
+        if (!s_img_cache[idx]) {
+            if (Frens::GetAvailableMemory() < img_bytes + 512u * 1024u) return false;
+            s_img_cache[idx] = (uint16_t *)Frens::f_malloc(img_bytes);
+            if (!s_img_cache[idx]) return false;
+        }
+        load_image_raw(idx, s_img_cache[idx], false);
+        s_img_cached[idx] = true;
+        return true;
+    };
+
+    auto load_image_into = [&](int idx, uint16_t *dest, bool half_res) {
+        if (!half_res && cache_fill(idx)) {
+            memcpy(dest, s_img_cache[idx], img_bytes);
+            return;
+        }
+        load_image_raw(idx, dest, half_res);
+    };
+
+    static uint32_t s_boot_hud_expire = 0;
+    static uint8_t  s_boot_hud_volume = 3;
+    static bool     s_boot_hud_active = false;
+
+    auto boot_volume_hud_trigger = [&](uint8_t vol) {
+        s_boot_hud_volume = vol > 5 ? 5 : vol;
+        s_boot_hud_expire = to_ms_since_boot(get_absolute_time()) + 1000u;
+        s_boot_hud_active = true;
+    };
+
+    auto boot_volume_hud_is_active = [&]() -> bool {
+        if (!s_boot_hud_active) return false;
+        if (to_ms_since_boot(get_absolute_time()) >= s_boot_hud_expire) {
+            s_boot_hud_active = false;
+            return false;
+        }
+        return true;
+    };
+
+    auto boot_volume_hud_render = [&](uint8_t vol, bool flush_rows = false) {
+#if USE_ILI9341
+        bool gb = ili9341_get_gb_mode();
+        int w = gb ? 134 : 160;
+        int h = 20;
+        int wx = gb ? 45 : 0;
+        int ww = gb ? 266 : 320;
+        int x = wx + (ww - w) / 2;
+        int y = 180; /* 240 - 40 - 20 = 180 */
+
+        /* Native bootloader framebuffer is 16-bit RGB444 (0x0RGB), except
+         * while the graphical menu owns it: then it holds RGB565. */
+        const bool c565 = ili9341_get_native_565();
+        auto C = [c565](uint16_t c444) -> uint16_t { return c565 ? gui_color(c444) : c444; };
+        uint16_t col_border = C(0x0000); /* Black */
+        uint16_t col_bg     = C(0x0EEE); /* Clean Light Gray (#EEEEEE, matches Clean Light UI) */
+        uint16_t col_text   = C(0x0222); /* Charcoal (#222222) */
+        uint16_t col_fill   = C(0x03C6); /* Mint Green (#33CC66) */
+        uint16_t col_off    = C(0x0444); /* Dark Slate Gray (#444444) */
+        uint16_t col_err    = C(0x0F00); /* Pure Red (#FF0000) */
+
+        /* Rounded corners border (radius 3) */
+        ili9341_fill_rect(x + 3, y,          w - 6, 1, col_border);
+        ili9341_fill_rect(x + 1, y + 1,      w - 2, 1, col_border);
+        ili9341_fill_rect(x,     y + 2,      w,     h - 4, col_border);
+        ili9341_fill_rect(x + 1, y + h - 2,  w - 2, 1, col_border);
+        ili9341_fill_rect(x + 3, y + h - 1,  w - 6, 1, col_border);
+
+        /* Rounded inner background */
+        ili9341_fill_rect(x + 3, y + 1,      w - 6, 1, col_bg);
+        ili9341_fill_rect(x + 2, y + 2,      w - 4, 1, col_bg);
+        ili9341_fill_rect(x + 1, y + 3,      w - 2, h - 6, col_bg);
+        ili9341_fill_rect(x + 2, y + h - 3,  w - 4, 1, col_bg);
+        ili9341_fill_rect(x + 3, y + h - 2,  w - 6, 1, col_bg);
+
+        uint16_t *fb = ili9341_get_framebuffer();
+        if (vol == 0) {
+            const char *mute_txt = "[ MUTE ]";
+            int txt_x = x + (w - 64) / 2;
+            for (int i = 0; mute_txt[i]; i++) {
+                fbDrawChar8x8(fb, txt_x + i * 8, y + 6, mute_txt[i], col_err, col_bg, 1);
+            }
+        } else {
+            const char *vol_txt = "VOL";
+            for (int i = 0; vol_txt[i]; i++) {
+                fbDrawChar8x8(fb, x + 8 + i * 8, y + 6, vol_txt[i], col_text, col_bg, 1);
+            }
+
+            int blocks_x = x + 38;
+            int total_bw = (w - 46);
+            int block_gap = 3;
+            int block_w = (total_bw - (4 * block_gap)) / 5;
+            int block_h = 10;
+            int block_y = y + 5;
+
+            for (int i = 0; i < 5; i++) {
+                int bx = blocks_x + i * (block_w + block_gap);
+                uint16_t bcol = (i < vol) ? col_fill : col_off;
+                ili9341_fill_rect(bx, block_y, block_w, block_h, bcol);
+                /* Block border */
+                ili9341_fill_rect(bx, block_y, block_w, 1, col_border);
+                ili9341_fill_rect(bx, block_y + block_h - 1, block_w, 1, col_border);
+                ili9341_fill_rect(bx, block_y, 1, block_h, col_border);
+                ili9341_fill_rect(bx + block_w - 1, block_y, 1, block_h, col_border);
+            }
+        }
+
+        if (flush_rows) {
+            ili9341_flush_rows(180, 199);
+        }
+#endif
     };
 
     auto enter_graphical = [&]() {
@@ -1672,11 +2621,19 @@ int main()
     };
 
     // Restore the last mode the user left us in (/boot.txt GUI= key).
-    graphical_mode = ini.gui_graphical;
+    // If the user hasn't explicitly set GUI= in /boot.txt and no theme artwork is present,
+    // default to text mode so the list of apps is immediately visible on screen.
+    if (!ini.seen_gui && themes_count() == 0) {
+        graphical_mode = false;
+    } else {
+        graphical_mode = ini.gui_graphical;
+    }
     LOG("Initial menu mode: %s", graphical_mode ? "graphical" : "text");
     if (graphical_mode) enter_graphical();
+    g_bootloader_defer_flush = true;
 
     for (;;) {
+        checkPowerSwitch(ini);
         uint32_t btns   = readPads();
         uint32_t pushed = btns & ~prevButtons;
         prevButtons = btns;
@@ -1718,13 +2675,40 @@ int main()
             continue;            // repaint from scratch next frame
         }
 
-        // SELECT: toggle modes regardless. Persist so next boot lands the same way.
-        if (pushed & Btn::SELECT) {
-            graphical_mode = !graphical_mode;
-            LOG("SELECT -> mode=%s", graphical_mode ? "graphical" : "text");
-            ini.gui_graphical = graphical_mode;
-            persist_cfg();
-            if (graphical_mode) enter_graphical();
+        // SELECT combo & mode toggle:
+        // Hold SELECT + UP / DOWN to adjust global volume (0..5) and show OSD HUD.
+        // Standalone SELECT (pushed and released without UP/DOWN) toggles graphical/text mode.
+        static bool s_sel_held = false;
+        static bool s_sel_combo_used = false;
+
+        if (btns & Btn::SELECT) {
+            s_sel_held = true;
+            if (pushed & Btn::UP) {
+                s_sel_combo_used = true;
+                if (ini.volume < 5) ini.volume++;
+                boot_volume_hud_trigger(ini.volume);
+            }
+            if (pushed & Btn::DOWN) {
+                s_sel_combo_used = true;
+                if (ini.volume > 0) ini.volume--;
+                boot_volume_hud_trigger(ini.volume);
+            }
+            // Mask UP and DOWN so they do not trigger theme cycling or menu scrolling while SELECT is held
+            pushed &= ~(Btn::UP | Btn::DOWN);
+        } else {
+            if (s_sel_held) {
+                if (!s_sel_combo_used) {
+                    graphical_mode = !graphical_mode;
+                    LOG("SELECT -> mode=%s", graphical_mode ? "graphical" : "text");
+                    ini.gui_graphical = graphical_mode;
+                    persist_cfg();
+                    if (graphical_mode) enter_graphical();
+                } else {
+                    persist_cfg(); // Persist volume once when SELECT is released
+                }
+                s_sel_held = false;
+                s_sel_combo_used = false;
+            }
         }
 
         // Mode-specific navigation.
@@ -1742,6 +2726,40 @@ int main()
                     LOG("%s -> sel=%d (%s)",
                         right ? "RIGHT" : "LEFT", sel, g_emus[sel].label);
                     uint16_t *next_buf = gui_buf_next();
+#if USE_ILI9341
+                    // Hardware-scrolled slide: the old image is already in
+                    // panel GRAM, so the new one goes straight into cur and
+                    // only the revealed columns are sent each step. If the
+                    // panel orientation can't scroll horizontally, cur now
+                    // holds the new image and the next frame just snaps to it.
+                    (void)next_buf;
+                    load_image_into(sel, gui_buf_cur(), false);
+                    gui_set_footer(footer_text());
+                    if (gui_hw_slide_begin(gui_buf_cur())) {
+                        // Run to completion here (~220 ms): nothing else can
+                        // touch the panel while it is in scroll mode. The
+                        // ease-out is time based, so the speed doesn't depend
+                        // on how long a step takes: fast start, gentle stop.
+                        const int      W   = gui_hw_slide_width();
+                        const int      dir = right ? +1 : -1;
+                        const uint32_t t0  = time_us_32();
+                        int p = 0;
+                        while (p < W) {
+                            uint32_t dt = time_us_32() - t0;
+                            int p_new = W;
+                            if (dt < GUI_HW_SLIDE_US) {
+                                float t = 1.0f - (float)dt / (float)GUI_HW_SLIDE_US;
+                                p_new = (int)((float)W * (1.0f - t * t * t) + 0.5f);
+                            }
+                            if (p_new > p) {
+                                gui_hw_slide_step(p, p_new, dir);
+                                p = p_new;
+                            }
+                        }
+                        gui_hw_slide_end();
+                        prevButtons = readPads();   // presses during the slide don't queue
+                    }
+#else
                     if (next_buf) {
                         load_image_into(sel, next_buf, gui_next_is_half_res());
                         slide_dir = right ? +1 : -1;
@@ -1750,6 +2768,7 @@ int main()
                         // No slide buffer at all: just reload cur with the new image.
                         load_image_into(sel, gui_buf_cur(), false);
                     }
+#endif
                 }
 
                 // UP/DOWN cycles the artwork theme (they do nothing else in
@@ -1768,6 +2787,7 @@ int main()
                         LOG("%s -> theme=%d", tdn ? "DOWN" : "UP", t);
                         ini.theme = (uint8_t)t;
                         persist_cfg();
+                        cache_invalidate();
                         load_image_into(sel, gui_buf_cur(), false);
                         slide_p   = 0;
                         slide_dir = 0;
@@ -1775,8 +2795,21 @@ int main()
                 }
             } else {
                 // Mid-slide: advance progress. Ignore further LEFT/RIGHT until done.
-                slide_p += GUI_SLIDE_PX_PER_FRAME;
-                if (slide_p > SCREENWIDTH) slide_p = SCREENWIDTH;
+                {
+                    slide_p += GUI_SLIDE_PX_PER_FRAME;
+                    if (slide_p > SCREENWIDTH) slide_p = SCREENWIDTH;
+                }
+            }
+
+            // Idle: warm the cache with the neighbours so the next LEFT/RIGHT
+            // starts sliding at once. One load per frame, only with no button
+            // held, so it never delays a press.
+            if (slide_dir == 0 && !btns && g_emu_count > 1) {
+                const int nb[2] = { (sel + 1) % g_emu_count,
+                                    (sel + g_emu_count - 1) % g_emu_count };
+                for (int k = 0; k < 2; k++) {
+                    if (nb[k] < 32 && !s_img_cached[nb[k]]) { cache_fill(nb[k]); break; }
+                }
             }
         } else {
             // Text mode (also the fallback when GUI buffers can't be allocated).
@@ -1808,9 +2841,16 @@ int main()
             // launches and can show the right message immediately.
             const char *dispName = g_emus[sel].display_name[0] ?
                                    g_emus[sel].display_name : g_emus[sel].label;
-            if (emuDrift) showMessage("Flashing", dispName, "Do not power off.");
-            else          showMessage("Starting", dispName, nullptr);
-            DrawScreen(-1);
+            if (emuDrift) {
+                drawFlashScreen(dispName);
+                progress_bar_draw(0, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+#if USE_ILI9341
+                ili9341_flush(true);
+#endif
+            } else {
+                showMessage("Starting", dispName, nullptr);
+                DrawScreen(-1);
+            }
 
             uf2_fingerprint_t auxFp;
             AuxState auxState = computeAuxDrift(sel, &auxFp);
@@ -1833,12 +2873,7 @@ int main()
             // (NES "A", XInput "B", DualShock "O", ...). gui only caches
             // the pointer so the stack buffer must live across the call,
             // which it does -- we set it immediately before gui_draw_frame.
-            char bl1[2], bl2[2];
-            getButtonLabels(bl1, bl2);
-            char footer[SCREEN_COLS + 1];
-            snprintf(footer, sizeof(footer),
-                     "L/R:app  U/D:theme  %s:go  START:help", bl1);
-            gui_set_footer(footer);
+            gui_set_footer(footer_text());
             gui_draw_frame(gui_buf_cur(),
                            slide_dir != 0 ? gui_buf_next() : nullptr,
                            slide_p, slide_dir,
@@ -1857,9 +2892,27 @@ int main()
                 slide_dir = 0;
                 slide_p   = 0;
             }
+#if USE_ILI9341
+            // The artwork buffers are RGB565: send them unconverted, and only
+            // for this frame -- every other screen still draws RGB444.
+            ili9341_set_native_565(true);
+#endif
+            if (boot_volume_hud_is_active()) {
+                boot_volume_hud_render(ini.volume, false);
+            }
+#if USE_ILI9341
+            ili9341_flush(true);
+            ili9341_set_native_565(false);
+#endif
         } else {
             drawMenu(sel, top, visible);
             DrawScreen(-1);
+            if (boot_volume_hud_is_active()) {
+                boot_volume_hud_render(ini.volume, false);
+            }
+#if USE_ILI9341
+            ili9341_flush(true);
+#endif
         }
     }
 }

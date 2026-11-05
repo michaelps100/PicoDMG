@@ -1,7 +1,28 @@
-# pico-bootLoader - resident .uf2 bootloader frontend for the RP2350 emulators.
-# IMPORTANT: Use the latest version of tinyusb and pico pio USB.
-# Build/USB structure mirrors pico-infonesPlus (the up-to-date PIO-USB pattern).
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.3.1)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.1)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
 
+set(CMAKE_TRY_COMPILE_TARGET_TYPE "STATIC_LIBRARY")
+set(CMAKE_OBJECT_PATH_MAX 260)
+
+# Força o uso de arquivos de resposta para C, C++ e ASM em absolutamente todos os drivers
+set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS 1 CACHE INTERNAL "")
+set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS 1 CACHE INTERNAL "")
+set(CMAKE_ASM_USE_RESPONSE_FILE_FOR_OBJECTS 1 CACHE INTERNAL "")
+set(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
+
+# pico-bootLoader - resident .uf2 bootloader frontend for the RP2350 emulators.
 cmake_minimum_required(VERSION 3.13)
 
 set(projectname pico-bootLoader)
@@ -18,47 +39,42 @@ message("* Current build type is : ${CMAKE_BUILD_TYPE}")
 # ---------------------------------------------------------------------------
 # Hardware / board selection
 # ---------------------------------------------------------------------------
-if(NOT HW_CONFIG)
-    set(HW_CONFIG 2 CACHE STRING "Select the hardware configuration for your board")
+if(NOT DEFINED USE_ILI9341)
+    set(USE_ILI9341 0 CACHE STRING "Use ILI9341 SPI TFT display instead of DVI/HSTX")
 endif()
+
+if(NOT HW_CONFIG)
+    if(USE_ILI9341)
+        set(HW_CONFIG 15 CACHE STRING "Select the hardware configuration for your board")
+    else()
+        set(HW_CONFIG 2 CACHE STRING "Select the hardware configuration for your board")
+    endif()
+endif()
+
 if(NOT USE_HSTX)
     set(USE_HSTX 1 CACHE STRING "Use HSTX for display output when possible")
 endif()
 
 include("pico_shared/BoardConfigs.cmake")
 
-if(NOT PICO_BOARD)
-    set(PICO_BOARD pico2 CACHE STRING "Board type")
-    message("PICO_BOARD not set, using default: ${PICO_BOARD}")
+# O botão quebrado da barra do VS Code reescreve PICO_BOARD no cache, então
+# travamos a placa por HW_CONFIG. HW_CONFIG 16 já fixou a sua própria placa em
+# BoardConfigs.cmake (waveshare_core2350b) e precisa ganhar: um RP2350A não
+# tem o GPIO 47 que é o chip select da PSRAM.
+if(NOT HW_CONFIG EQUAL 16)
+    set(PICO_BOARD waveshare_rp2350_plus_16mb CACHE STRING "Board type" FORCE)
+endif()
+message("Placa travada para compilação: ${PICO_BOARD}")
+
+# Painel assumido quando não há /boot.txt no cartão (cartão removido, cartão
+# novo). 0 = ILI9341 mantém o comportamento das placas existentes; a Placa 16
+# compila com -DDEFAULT_PANEL_ST7789=1.
+if(NOT DEFINED DEFAULT_PANEL_ST7789)
+    set(DEFAULT_PANEL_ST7789 0 CACHE STRING "Painel padrão quando /boot.txt está ausente: 0=ILI9341 1=ST7789")
 endif()
 
 add_definitions(-DNDEBUG)
-
-# A failed malloc must return NULL -- every Frens::f_malloc call site handles
-# that and degrades gracefully (image conversion skips, GUI falls back to text
-# mode). The SDK default panics inside malloc instead, turning a tight-heap
-# situation on no-PSRAM boards into a boot loop. Directory-scoped so it also
-# reaches pico_malloc's check_alloc wherever it is compiled (pico_shared).
 add_definitions(-DPICO_MALLOC_PANIC=0)
-
-# This image must fit the 512 KB resident bootloader partition. A -O3 (Release)
-# build overflows it outright: on this DVI/PNGdec/JPEGDEC-heavy code -O3's
-# inlining and loop unrolling bloat .text/.rodata far past what the region
-# holds. Force -Os for the whole image so it fits no matter which
-# CMAKE_BUILD_TYPE is selected (bld.sh forces Release, VSCode defaults to Debug).
-# Directory-scoped and placed before the TinyUSB/SDK includes so it reaches every
-# translation unit; as a trailing compile option the -Os wins over the build
-# type's -O level. Measured flash use, HW_CONFIG 1 / pico2_w (the worst case):
-#   -O3 110.9% (overflows by 56 KB) | -O2 101.6% (overflows by 8 KB)
-#   -Os  97.0% (fits, ~15 KB margin)
-# -Os is no longer merely preferable here: -O2 used to fit with ~6 KB to spare
-# and no longer does, so -Os is the only level that links. Re-measure this
-# configuration when adding code.
-# -Os is safe for the display: the real-time TMDS path is hand-written assembly
-# (pico_lib/dvi/tmds_encode.S, RAM-resident .scratch_x/y) and HSTX encodes in
-# hardware -- neither is affected by the C optimization level. Only per-scanline
-# C orchestration sees -Os, and it has microseconds of slack. Speed is otherwise
-# irrelevant for a menu/loader, so optimizing for size has no downside here.
 add_compile_options(-Os)
 
 # ---------------------------------------------------------------------------
@@ -92,6 +108,11 @@ message("PIO USB support: ${ENABLE_PIO_USB}, using PIO: ${PIO_USB_USE_PIO}")
 # Shared bootloader/app flash map (single source of truth for both this
 # bootloader and the emulators relinked with -DBUILD_FOR_BOOTLOADER=ON).
 include("pico_shared/BootPartition.cmake")
+
+# ---------------------------------------------------------------------------
+# Drivers (ILI9341 SPI TFT)
+# ---------------------------------------------------------------------------
+add_subdirectory(src/drivers)
 
 # ---------------------------------------------------------------------------
 # Executable
@@ -146,7 +167,6 @@ pico_set_program_name(${projectname} "${projectname}")
 pico_set_program_version(${projectname} "0.1")
 
 if(UART_ENABLED EQUAL 0)
-    message("Disabling UART output for this board.")
     pico_enable_stdio_uart(${projectname} 0)
 else()
     pico_enable_stdio_uart(${projectname} 1)
@@ -162,6 +182,7 @@ target_compile_options(${projectname} PRIVATE
     -Wno-unused-function
     -Wno-cast-function-type
     -Wno-maybe-uninitialized
+    -Wno-incompatible-pointer-types
 )
 
 # ---------------------------------------------------------------------------
@@ -187,6 +208,14 @@ target_compile_definitions(${projectname} PRIVATE
     WII_PIN_SCL=${WII_SCL}
     LED_GPIO_PIN=${LED_GPIO_PIN}
     HW_CONFIG=${HW_CONFIG}
+    ILI9341_SPI_INST=${ILI9341_SPI_INST}
+    ILI9341_PIN_CS=${ILI9341_PIN_CS}
+    ILI9341_PIN_SCK=${ILI9341_PIN_SCK}
+    ILI9341_PIN_MOSI=${ILI9341_PIN_MOSI}
+    ILI9341_PIN_DC=${ILI9341_PIN_DC}
+    ILI9341_PIN_RST=${ILI9341_PIN_RST}
+    ILI9341_PIN_BL=${ILI9341_PIN_BL}
+    DEFAULT_PANEL_ST7789=${DEFAULT_PANEL_ST7789}
     WIIPAD_I2C=${WIIPAD_I2C}
     USE_I2S_AUDIO=${USE_I2S_AUDIO}
     PICO_AUDIO_I2S_DATA_PIN=${PICO_AUDIO_I2S_DATA_PIN}
@@ -209,6 +238,7 @@ target_compile_definitions(${projectname} PRIVATE
     WIIPAD_DELAYED_START=${WIIPAD_DELAYED_START}
     ENABLEDVI=1
     DOUBLEFRAMEBUFFER=0
+    USE_ILI9341=${USE_ILI9341}
     # Flash map for src/boot_config.h (kept in sync with BootPartition.cmake).
     BOOTLOADER_SIZE=${FRENS_BOOTLOADER_SIZE}
     FLASH_TOTAL_SIZE=${FRENS_FLASH_TOTAL}
@@ -264,6 +294,8 @@ target_link_libraries(${projectname} PRIVATE
     hardware_interp
     hardware_timer
     hardware_clocks
+    hardware_xosc
+    hardware_rosc
     hardware_pwm
     hardware_flash
     cmsis_core
@@ -284,6 +316,7 @@ target_include_directories(${projectname} PRIVATE
     pico_shared
     tusb_xinput
     src
+    src/drivers
     .
 )
 

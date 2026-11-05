@@ -36,7 +36,7 @@ static bool block_is_program(const uf2_block_t *b, uint32_t expected_family)
     if (b->flags & UF2_FLAG_NOT_MAIN_FLASH)  return false;
     if (b->flags & UF2_FLAG_EXT_TAGS_PRESENT) return false;
     if (b->flags & UF2_FLAG_FAMILY_ID_PRESENT) {
-        if (b->file_size_or_family != expected_family) return false;
+        if (!uf2_family_matches(b->file_size_or_family, expected_family)) return false;
     }
     if (b->payload_size == 0 || b->payload_size > UF2_MAX_PAYLOAD) return false;
     return true;

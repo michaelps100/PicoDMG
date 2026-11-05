@@ -37,6 +37,9 @@ namespace {
 #if HSTX
 #define GUI_FOOTER_FG  0x7FFFu
 #define GUI_FOOTER_BG  0x0000u
+#elif USE_ILI9341
+#define GUI_FOOTER_FG  0xFFFFu          // graphical buffers are RGB565 here
+#define GUI_FOOTER_BG  0x0000u
 #else
 #define GUI_FOOTER_FG  0x0FFFu
 #define GUI_FOOTER_BG  0x0000u
@@ -147,14 +150,13 @@ void gui_fill_solid_half_res(uint16_t *dest, uint16_t color)
     for (size_t i = 0; i < pixels; i++) dest[i] = color;
 }
 
-// Open "<theme>/<image_key><FILEXTFORSEARCH>", converting a same-named PNG/JPG
-// on demand (streaming, works on both PSRAM and SRAM-only builds). When the
-// active theme has no artwork for this key, falls back to the theme-0 dir.
-// Returns true with *fil open and positioned at offset 0.
-//
-// Both loaders below share this; before themes existed each of them built the
-// same two paths inline, verbatim.
-static bool gui_open_asset(const char *image_key, FIL *fil)
+// Open the artwork for image_key. On SPI-panel builds a native RGB565
+// "<dir>/<key>.565" is tried first in each theme dir (no conversion, any size
+// up to 320x240 -- 266x240 fills the GB_MODE window exactly). Otherwise
+// "<dir>/<key><FILEXTFORSEARCH>", converting a same-named PNG/JPG on demand.
+// When the active theme has no artwork for this key, falls back to theme 0.
+// Returns true with *fil open at offset 0; *is_565 says which format it is.
+static bool gui_open_asset(const char *image_key, FIL *fil, bool *is_565)
 {
     const char *dirs[2] = { s_theme_dir, s_theme_fb_dir };
     char path[FF_MAX_LFN + 1];
@@ -164,9 +166,13 @@ static bool gui_open_asset(const char *image_key, FIL *fil)
         if (!dir || !*dir) continue;
         if (i == 1 && strcmp(dir, dirs[0]) == 0) break;   // fallback == active
 
+#if USE_ILI9341
+        snprintf(path, sizeof(path), "%s/%s.565", dir, image_key);
+        if (f_open(fil, path, FA_READ) == FR_OK) { *is_565 = true; return true; }
+#endif
         image_convert_ensure(dir, image_key, SCREENWIDTH, SCREENHEIGHT, /*letterbox=*/true);
         snprintf(path, sizeof(path), "%s/%s%s", dir, image_key, FILEXTFORSEARCH);
-        if (f_open(fil, path, FA_READ) == FR_OK) return true;
+        if (f_open(fil, path, FA_READ) == FR_OK) { *is_565 = false; return true; }
     }
 
     printf("[bootLoader] gui: no artwork for '%s' in %s (or theme 0)\n",
@@ -174,12 +180,68 @@ static bool gui_open_asset(const char *image_key, FIL *fil)
     return false;
 }
 
-bool gui_load_image(const char *image_key, uint16_t *dest)
+uint16_t gui_color(uint16_t c444)
+{
+#if USE_ILI9341
+    // The graphical-menu buffers hold RGB565 on SPI-panel builds.
+    const uint16_t r = (c444 >> 8) & 0x0F, g = (c444 >> 4) & 0x0F, b = c444 & 0x0F;
+    return (uint16_t)((((r << 1) | (r >> 3)) << 11) |
+                      (((g << 2) | (g >> 2)) << 5)  |
+                       ((b << 1) | (b >> 3)));
+#else
+    return c444;
+#endif
+}
+
+// Read a w x h RGB565 image (fil positioned just past the header) and place it
+// centred in the visible window of a 320x240 screen, black around it. The
+// window is x=45..310 in GB_MODE, the full width otherwise. With half_res the
+// screen is decimated 2:1 into a 160x120 dest on the fly. Reads one source
+// row at a time, so no large scratch buffer is needed.
+static bool gui_read_565(FIL *fil, const char *image_key, int w, int h,
+                         uint16_t *dest, bool half_res)
+{
+    int vx = 0, vw = SCREENWIDTH;
+#if USE_ILI9341
+    if (ili9341_get_gb_mode()) { vx = 45; vw = 266; }
+#endif
+    if (w > vw) { vx = 0; vw = SCREENWIDTH; }   // wider than the window: centre on screen
+    const int x0 = vx + (vw - w) / 2;
+    const int y0 = (SCREENHEIGHT - h) / 2;
+
+    if (half_res) gui_fill_solid_half_res(dest, 0);
+    else          gui_fill_solid(dest, 0);
+
+    uint16_t row[SCREENWIDTH];   // 640 bytes on the stack
+    const UINT row_bytes = (UINT)w * sizeof(uint16_t);
+    for (int r = 0; r < h; r++) {
+        UINT br = 0;
+        FRESULT fr = f_read(fil, row, row_bytes, &br);
+        if (fr != FR_OK || br != row_bytes) {
+            printf("[bootLoader] gui: '%s' short read row %d\n", image_key, r);
+            return false;
+        }
+        const int y = y0 + r;
+        if (!half_res) {
+            memcpy(dest + y * SCREENWIDTH + x0, row, row_bytes);
+        } else if ((y & 1) == 0) {
+            uint16_t *out = dest + (y >> 1) * GUI_HALF_W;
+            for (int xo = (x0 + 1) >> 1; 2 * xo < x0 + w; xo++) out[xo] = row[2 * xo - x0];
+        }
+    }
+    return true;
+}
+
+// Shared by both loaders: open the asset, validate the header, then read it
+// either as native RGB565 (placed in the window) or as the legacy full-screen
+// .444/.555 format.
+static bool gui_load_any(const char *image_key, uint16_t *dest, bool half_res)
 {
     if (!dest || !image_key || !*image_key) return false;
 
     FIL fil;
-    if (!gui_open_asset(image_key, &fil)) return false;
+    bool is_565 = false;
+    if (!gui_open_asset(image_key, &fil, &is_565)) return false;
 
     uint16_t hdr[2];
     UINT br = 0;
@@ -190,6 +252,20 @@ bool gui_load_image(const char *image_key, uint16_t *dest)
         f_close(&fil);
         return false;
     }
+
+    if (is_565) {
+        const int w = hdr[0], h = hdr[1];
+        if (w < 1 || h < 1 || w > SCREENWIDTH || h > SCREENHEIGHT) {
+            printf("[bootLoader] gui: '%s.565' is %d x %d, max %d x %d\n",
+                   image_key, w, h, SCREENWIDTH, SCREENHEIGHT);
+            f_close(&fil);
+            return false;
+        }
+        bool ok = gui_read_565(&fil, image_key, w, h, dest, half_res);
+        f_close(&fil);
+        return ok;
+    }
+
     if (hdr[0] != SCREENWIDTH || hdr[1] != SCREENHEIGHT) {
         printf("[bootLoader] gui: '%s' is %u x %u, expected %d x %d\n",
                image_key, (unsigned)hdr[0], (unsigned)hdr[1], SCREENWIDTH, SCREENHEIGHT);
@@ -197,62 +273,54 @@ bool gui_load_image(const char *image_key, uint16_t *dest)
         return false;
     }
 
-    const UINT want = SCREENWIDTH * SCREENHEIGHT * sizeof(uint16_t);
-    fr = f_read(&fil, dest, want, &br);
-    f_close(&fil);
-    if (fr != FR_OK || br != want) {
-        printf("[bootLoader] gui: '%s' pixel read short (fr=%d br=%u/%u)\n",
-               image_key, (int)fr, (unsigned)br, (unsigned)want);
-        return false;
+    size_t pixels;
+    if (!half_res) {
+        const UINT want = SCREENWIDTH * SCREENHEIGHT * sizeof(uint16_t);
+        fr = f_read(&fil, dest, want, &br);
+        if (fr != FR_OK || br != want) {
+            printf("[bootLoader] gui: '%s' pixel read short (fr=%d br=%u/%u)\n",
+                   image_key, (int)fr, (unsigned)br, (unsigned)want);
+            f_close(&fil);
+            return false;
+        }
+        pixels = SCREENWIDTH * SCREENHEIGHT;
+    } else {
+        // Downsample 2:1 in each axis, one scanline at a time.
+        uint16_t row[SCREENWIDTH];
+        const UINT row_bytes = SCREENWIDTH * sizeof(uint16_t);
+        for (int y = 0; y < SCREENHEIGHT; y++) {
+            fr = f_read(&fil, row, row_bytes, &br);
+            if (fr != FR_OK || br != row_bytes) {
+                printf("[bootLoader] gui: '%s' short read row %d\n", image_key, y);
+                f_close(&fil);
+                return false;
+            }
+            if (y & 1) continue;   // nearest-neighbour vertical decimation
+            uint16_t *out = dest + (y >> 1) * GUI_HALF_W;
+            for (int x = 0; x < GUI_HALF_W; x++) out[x] = row[2 * x];
+        }
+        pixels = GUI_HALF_W * GUI_HALF_H;
     }
+    f_close(&fil);
+
+#if USE_ILI9341
+    // Legacy RGB444 artwork: widen to RGB565 so every graphical-menu buffer
+    // has the same format and the panel gets it through unchanged.
+    for (size_t i = 0; i < pixels; i++) dest[i] = gui_color(dest[i]);
+#else
+    (void)pixels;
+#endif
     return true;
 }
 
-// Load + downsample 2:1 in each axis on the fly. Reads the file scanline by
-// scanline (640-byte stack scratch) so it never needs a large temporary
-// buffer -- the half-res path exists exactly to avoid one of those.
+bool gui_load_image(const char *image_key, uint16_t *dest)
+{
+    return gui_load_any(image_key, dest, false);
+}
+
 bool gui_load_image_half_res(const char *image_key, uint16_t *dest)
 {
-    if (!dest || !image_key || !*image_key) return false;
-
-    FIL fil;
-    if (!gui_open_asset(image_key, &fil)) return false;
-
-    uint16_t hdr[2];
-    UINT br = 0;
-    FRESULT fr = f_read(&fil, hdr, sizeof(hdr), &br);
-    if (fr != FR_OK || br != sizeof(hdr) ||
-        hdr[0] != SCREENWIDTH || hdr[1] != SCREENHEIGHT) {
-        printf("[bootLoader] gui: '%s' header bad (fr=%d br=%u, %ux%u)\n",
-               image_key, (int)fr, (unsigned)br, (unsigned)hdr[0], (unsigned)hdr[1]);
-        f_close(&fil);
-        return false;
-    }
-
-    uint16_t row[SCREENWIDTH];   // 640 bytes on the stack
-    const UINT row_bytes = SCREENWIDTH * sizeof(uint16_t);
-
-    for (int y_out = 0; y_out < GUI_HALF_H; y_out++) {
-        // Read the even source row, downsample horizontally into dest.
-        fr = f_read(&fil, row, row_bytes, &br);
-        if (fr != FR_OK || br != row_bytes) {
-            printf("[bootLoader] gui: '%s' short read row %d\n", image_key, 2 * y_out);
-            f_close(&fil);
-            return false;
-        }
-        uint16_t *out = dest + y_out * GUI_HALF_W;
-        for (int x = 0; x < GUI_HALF_W; x++) out[x] = row[2 * x];
-
-        // Read and discard the odd row (nearest-neighbour vertical decimation).
-        fr = f_read(&fil, row, row_bytes, &br);
-        if (fr != FR_OK || br != row_bytes) {
-            printf("[bootLoader] gui: '%s' short read row %d\n", image_key, 2 * y_out + 1);
-            f_close(&fil);
-            return false;
-        }
-    }
-    f_close(&fil);
-    return true;
+    return gui_load_any(image_key, dest, true);
 }
 
 // Helper: write n pixels of b's scanline into dst, starting at b-column
@@ -344,6 +412,84 @@ static inline void compose_row(uint16_t *dst, int y,
     }
 }
 
+#if USE_ILI9341
+// ---------------------------------------------------------------------------
+// Hardware-scrolled slide. The old image is already in panel GRAM, so the
+// incoming image only needs to be in one buffer, and each step sends just the
+// columns it reveals (a few KB) instead of the whole frame. The panel offset
+// changes in one register write, so a step tears at most along one line by a
+// few pixels, instead of the staircase a 25 ms full-frame write produced.
+// ---------------------------------------------------------------------------
+namespace {
+    int             s_hw_x   = 0;      // window left edge on screen
+    int             s_hw_w   = SCREENWIDTH;
+    const uint16_t *s_hw_img = nullptr;
+}
+
+// Footer pixel for screen column x of footer row y, same layout as
+// overlay_footer_row() so the strips match the static frame exactly.
+static inline uint16_t footer_px(int x, int y, const char *text, int len, int x_start)
+{
+    const int i = (x - x_start) >> 3;
+    if (x < x_start || i >= len) return GUI_FOOTER_BG;
+    unsigned char c = (unsigned char)text[i];
+    if (c < FONT_FIRST_ASCII || c >= FONT_FIRST_ASCII + FONT_N_CHARS) c = '?';
+    const char slice = getcharslicefrom8x8font((char)c, y - GUI_FOOTER_Y0);
+    return ((slice >> ((x - x_start) & 7)) & 1) ? GUI_FOOTER_FG : GUI_FOOTER_BG;
+}
+
+static void hw_slide_row(int y, uint16_t *dst, int x0, int n, void *)
+{
+    memcpy(dst, s_hw_img + y * SCREENWIDTH + x0, (size_t)n * sizeof(uint16_t));
+    if (s_footer && *s_footer && y >= GUI_FOOTER_Y0) {
+        const int len = (int)strlen(s_footer);
+        const int tw  = len * FONT_CHAR_WIDTH;
+        if (tw > SCREENWIDTH) {
+            for (int i = 0; i < n; i++) dst[i] = GUI_FOOTER_BG;
+            return;
+        }
+        const int xs = (SCREENWIDTH - tw) / 2;
+        for (int i = 0; i < n; i++) dst[i] = footer_px(x0 + i, y, s_footer, len, xs);
+    }
+}
+
+bool gui_hw_slide_begin(const uint16_t *incoming)
+{
+    if (!incoming) return false;
+    s_hw_x = 0; s_hw_w = SCREENWIDTH;
+    if (ili9341_get_gb_mode()) { s_hw_x = 45; s_hw_w = 266; }
+    if (!ili9341_hscroll_begin(s_hw_x, s_hw_w)) return false;
+    s_hw_img = incoming;
+    return true;
+}
+
+int gui_hw_slide_width(void) { return s_hw_w; }
+
+void gui_hw_slide_step(int p_old, int p_new, int direction)
+{
+    if (!s_hw_img || p_new <= p_old) return;
+    if (p_new > s_hw_w) p_new = s_hw_w;
+    const int W = s_hw_w;
+    // Point the panel at the new offset first: the strip about to be written
+    // then sits at the edge the new image enters from, never on the side the
+    // old image is still showing.
+    ili9341_hscroll_set(direction > 0 ? p_new : W - p_new);
+    if (direction > 0) {
+        ili9341_write_cols_565(s_hw_x + p_old, s_hw_x + p_new - 1, hw_slide_row, nullptr);
+    } else {
+        ili9341_write_cols_565(s_hw_x + W - p_new, s_hw_x + W - p_old - 1, hw_slide_row, nullptr);
+    }
+}
+
+void gui_hw_slide_end(void)
+{
+    // At p == W the window holds the incoming image at its natural columns,
+    // so dropping the offset back to 0 changes nothing on screen.
+    ili9341_hscroll_end();
+    s_hw_img = nullptr;
+}
+#endif
+
 void gui_draw_frame(const uint16_t *a, const uint16_t *b,
                     int slide_px, int direction, bool b_half_res)
 {
@@ -353,7 +499,9 @@ void gui_draw_frame(const uint16_t *a, const uint16_t *b,
 
     for (int y = 0; y < SCREENHEIGHT; y++) {
         uint16_t *dst;
-#if !HSTX
+#if USE_ILI9341
+        dst = &Frens::framebuffer[y * SCREENWIDTH];
+#elif !HSTX
         dvi::DVI::LineBuffer *lb = nullptr;
 #if FRAMEBUFFERISPOSSIBLE
         if (Frens::isFrameBufferUsed()) {
@@ -376,13 +524,16 @@ void gui_draw_frame(const uint16_t *a, const uint16_t *b,
             overlay_footer_row(dst, y, s_footer);
         }
 
-#if !HSTX
+#if !HSTX && !USE_ILI9341
 #if FRAMEBUFFERISPOSSIBLE
         if (!Frens::isFrameBufferUsed())
 #endif
             dvi_->setLineBuffer(y, lb);
 #endif
     }
+    // Note: On ILI9341, ili9341_flush(true) is invoked by the caller (main.cpp)
+    // after any active overlays (such as the volume OSD HUD) are composited onto Frens::framebuffer,
+    // avoiding double-flush flickering.
 }
 
 } // extern "C"
