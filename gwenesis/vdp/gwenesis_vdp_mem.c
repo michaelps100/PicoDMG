@@ -125,7 +125,7 @@ extern bool sprite_collision;
  *
  ******************************************************************************/
 
-int m68k_irq_acked(int irq) {
+int GW_SRAM_FUNC(m68k_irq_acked)(int irq) {
 
   /* VINT has higher priority (Fatal Rewind) */
   if (REG1_VBLANK_INTERRUPT && (gwenesis_vdp_status & STATUS_VIRQPENDING))
@@ -301,6 +301,7 @@ static inline __attribute__((always_inline)) void gwenesis_vdp_register_w(int re
     // (see sonic3d intro wrong colors, and vdpfifotesting)
     code_reg &= ~0x3;
     address_reg &= ~0x3FFF;
+    command_word_pending = 0;
 
     switch (reg)
     {
@@ -750,7 +751,12 @@ unsigned int gwenesis_vdp_read_data_port_16()
 static inline __attribute__((always_inline))
 void gwenesis_vdp_control_port_write(unsigned int value)
 {
-    //vdpm_log(__FUNCTION__,"%04x",value);
+    // Register writes (bits 15..14 == 2) take immediate precedence on Genesis hardware
+    if ((value >> 14) == 2) {
+        command_word_pending = 0;
+        gwenesis_vdp_register_w((value >> 8) & 0x1F, value & 0xFF);
+        return;
+    }
 
   if (command_word_pending == 1) {
     // second half of the command word
@@ -789,11 +795,6 @@ void gwenesis_vdp_control_port_write(unsigned int value)
         break;
       }
     }
-    return;
-  }
-      if ((value >> 14) == 2) {
-
-    gwenesis_vdp_register_w((value >> 8) & 0x1F, value & 0xFF);
     return;
   }
 

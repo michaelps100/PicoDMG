@@ -73,6 +73,12 @@ void gwsram_release(void);
 void *gwsram_port_psram_alloc(size_t size);
 void gwsram_port_psram_free(void *p);
 
+/* True when a PSRAM window was mapped, so gwsram_port_psram_alloc() can
+   succeed. Worth testing first: the underlying Frens::f_malloc enters panic()
+   (an infinite loop, seen as a hung MCU) on an oversized request, so a caller
+   that wants "PSRAM if present, SRAM otherwise" has to know before asking. */
+int gwsram_port_psram_available(void);
+
 /* $A130F1 (the /TIME region): bit 0 maps save RAM in over the ROM, bit 1 write
    protects it. Only meaningful for carts whose ROM reaches past gwsram_start. */
 void gwsram_time_write(unsigned int address, unsigned int value);

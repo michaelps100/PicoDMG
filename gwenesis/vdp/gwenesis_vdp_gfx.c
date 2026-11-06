@@ -169,71 +169,65 @@ void gwenesis_vdp_set_buffer(unsigned short *ptr_screen_buffer)
  #define PIX6(P) ( ((P) & 0xF0000000 ) >>  28 )
  #define PIX7(P) ( ((P) & 0x0F000000 ) >>  24 )
 
+typedef struct { uint32_t v; } __attribute__((packed)) unaligned_u32;
+
 static inline __attribute__((always_inline))
 void draw_pattern_nofliph_sprite(uint8_t *scr, uint32_t p, uint8_t attrs)
 {
   if (p == 0) return;
-
-  /*  not transparent pixel to write AND not already a sprite*/
-  if (((PIX0(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | (PIX0(p));
-  if (((PIX1(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | (PIX1(p));
-  if (((PIX2(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | (PIX2(p));
-  if (((PIX3(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | (PIX3(p));
-  if (((PIX4(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | (PIX4(p));
-  if (((PIX5(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | (PIX5(p));
-  if (((PIX6(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | (PIX6(p));
-  if (((PIX7(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | (PIX7(p));
+  uint8_t px;
+  if (((px = PIX0(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | px;
+  if (((px = PIX1(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | px;
+  if (((px = PIX2(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | px;
+  if (((px = PIX3(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | px;
+  if (((px = PIX4(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | px;
+  if (((px = PIX5(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | px;
+  if (((px = PIX6(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | px;
+  if (((px = PIX7(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | px;
 }
 
 static inline __attribute__((always_inline))
 void draw_pattern_fliph_sprite(uint8_t *scr, uint32_t p, uint8_t attrs)
 {
   if (p == 0) return;
-
-  /*  not transparent pixel to write AND not already a sprite*/
-  if (((PIX7(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | (PIX7(p));
-  if (((PIX6(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | (PIX6(p));
-  if (((PIX5(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | (PIX5(p));
-  if (((PIX4(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | (PIX4(p));
-  if (((PIX3(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | (PIX3(p));
-  if (((PIX2(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | (PIX2(p));
-  if (((PIX1(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | (PIX1(p));
-  if (((PIX0(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | (PIX0(p));
-
+  uint8_t px;
+  if (((px = PIX7(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | px;
+  if (((px = PIX6(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | px;
+  if (((px = PIX5(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | px;
+  if (((px = PIX4(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | px;
+  if (((px = PIX3(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | px;
+  if (((px = PIX2(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | px;
+  if (((px = PIX1(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | px;
+  if (((px = PIX0(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | px;
 }
 
 static inline __attribute__((always_inline))
 void draw_pattern_nofliph_sprite_over_planes(uint8_t *scr, uint32_t p, uint8_t attrs)
 {
   if (p == 0) return; 
+  uint8_t px;
 
   /* High priority */
   if (attrs & PIXATTR_HIPRI) {
-
-  /*  not transparent pixel to write AND not already a sprite*/
-  if (((PIX0(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | (PIX0(p));
-  if (((PIX1(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | (PIX1(p));
-  if (((PIX2(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | (PIX2(p));
-  if (((PIX3(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | (PIX3(p));
-  if (((PIX4(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | (PIX4(p));
-  if (((PIX5(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | (PIX5(p));
-  if (((PIX6(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | (PIX6(p));
-  if (((PIX7(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | (PIX7(p));
-
+    if (((px = PIX0(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | px;
+    if (((px = PIX1(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | px;
+    if (((px = PIX2(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | px;
+    if (((px = PIX3(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | px;
+    if (((px = PIX4(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | px;
+    if (((px = PIX5(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | px;
+    if (((px = PIX6(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | px;
+    if (((px = PIX7(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | px;
   }
   /* Low priority */
   else {
-
-  /*  not transparent pixel to write AND not already a sprite or higher priority*/
-  if (((PIX0(p))) && ((scr[0] & PIXATTR_SPRITE_HIPRI) == 0)) scr[0] = attrs | (PIX0(p));
-  if (((PIX1(p))) && ((scr[1] & PIXATTR_SPRITE_HIPRI) == 0)) scr[1] = attrs | (PIX1(p));
-  if (((PIX2(p))) && ((scr[2] & PIXATTR_SPRITE_HIPRI) == 0)) scr[2] = attrs | (PIX2(p));
-  if (((PIX3(p))) && ((scr[3] & PIXATTR_SPRITE_HIPRI) == 0)) scr[3] = attrs | (PIX3(p));
-  if (((PIX4(p))) && ((scr[4] & PIXATTR_SPRITE_HIPRI) == 0)) scr[4] = attrs | (PIX4(p));
-  if (((PIX5(p))) && ((scr[5] & PIXATTR_SPRITE_HIPRI) == 0)) scr[5] = attrs | (PIX5(p));
-  if (((PIX6(p))) && ((scr[6] & PIXATTR_SPRITE_HIPRI) == 0)) scr[6] = attrs | (PIX6(p));
-  if (((PIX7(p))) && ((scr[7] & PIXATTR_SPRITE_HIPRI) == 0)) scr[7] = attrs | (PIX7(p));
-  
+    if (((px = PIX0(p))) && ((scr[0] & PIXATTR_SPRITE_HIPRI) == 0)) scr[0] = attrs | px;
+    if (((px = PIX1(p))) && ((scr[1] & PIXATTR_SPRITE_HIPRI) == 0)) scr[1] = attrs | px;
+    if (((px = PIX2(p))) && ((scr[2] & PIXATTR_SPRITE_HIPRI) == 0)) scr[2] = attrs | px;
+    if (((px = PIX3(p))) && ((scr[3] & PIXATTR_SPRITE_HIPRI) == 0)) scr[3] = attrs | px;
+    if (((px = PIX4(p))) && ((scr[4] & PIXATTR_SPRITE_HIPRI) == 0)) scr[4] = attrs | px;
+    if (((px = PIX5(p))) && ((scr[5] & PIXATTR_SPRITE_HIPRI) == 0)) scr[5] = attrs | px;
+    if (((px = PIX6(p))) && ((scr[6] & PIXATTR_SPRITE_HIPRI) == 0)) scr[6] = attrs | px;
+    if (((px = PIX7(p))) && ((scr[7] & PIXATTR_SPRITE_HIPRI) == 0)) scr[7] = attrs | px;
   }
 }
 
@@ -241,36 +235,30 @@ static inline __attribute__((always_inline))
 void draw_pattern_fliph_sprite_over_planes(uint8_t *scr, uint32_t p, uint8_t attrs)
 {
   if (p == 0) return;
+  uint8_t px;
 
   /* High priority */
   if (attrs & PIXATTR_HIPRI) {
-
-  /*  not transparent pixel to write AND not already a sprite*/
-  if (((PIX7(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | (PIX7(p));
-  if (((PIX6(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | (PIX6(p));
-  if (((PIX5(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | (PIX5(p));
-  if (((PIX4(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | (PIX4(p));
-  if (((PIX3(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | (PIX3(p));
-  if (((PIX2(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | (PIX2(p));
-  if (((PIX1(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | (PIX1(p));
-  if (((PIX0(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | (PIX0(p));
-
+    if (((px = PIX7(p))) && ((scr[0] & PIXATTR_SPRITE) == 0)) scr[0] = attrs | px;
+    if (((px = PIX6(p))) && ((scr[1] & PIXATTR_SPRITE) == 0)) scr[1] = attrs | px;
+    if (((px = PIX5(p))) && ((scr[2] & PIXATTR_SPRITE) == 0)) scr[2] = attrs | px;
+    if (((px = PIX4(p))) && ((scr[3] & PIXATTR_SPRITE) == 0)) scr[3] = attrs | px;
+    if (((px = PIX3(p))) && ((scr[4] & PIXATTR_SPRITE) == 0)) scr[4] = attrs | px;
+    if (((px = PIX2(p))) && ((scr[5] & PIXATTR_SPRITE) == 0)) scr[5] = attrs | px;
+    if (((px = PIX1(p))) && ((scr[6] & PIXATTR_SPRITE) == 0)) scr[6] = attrs | px;
+    if (((px = PIX0(p))) && ((scr[7] & PIXATTR_SPRITE) == 0)) scr[7] = attrs | px;
   }
   /* Low priority */
   else {
-
-  /*  not transparent pixel to write AND not already a sprite or higher priority*/
-  if (((PIX7(p))) && ((scr[0] & PIXATTR_SPRITE_HIPRI) == 0)) scr[0] = attrs | (PIX7(p));
-  if (((PIX6(p))) && ((scr[1] & PIXATTR_SPRITE_HIPRI) == 0)) scr[1] = attrs | (PIX6(p));
-  if (((PIX5(p))) && ((scr[2] & PIXATTR_SPRITE_HIPRI) == 0)) scr[2] = attrs | (PIX5(p));
-  if (((PIX4(p))) && ((scr[3] & PIXATTR_SPRITE_HIPRI) == 0)) scr[3] = attrs | (PIX4(p));
-  if (((PIX3(p))) && ((scr[4] & PIXATTR_SPRITE_HIPRI) == 0)) scr[4] = attrs | (PIX3(p));
-  if (((PIX2(p))) && ((scr[5] & PIXATTR_SPRITE_HIPRI) == 0)) scr[5] = attrs | (PIX2(p));
-  if (((PIX1(p))) && ((scr[6] & PIXATTR_SPRITE_HIPRI) == 0)) scr[6] = attrs | (PIX1(p));
-  if (((PIX0(p))) && ((scr[7] & PIXATTR_SPRITE_HIPRI) == 0)) scr[7] = attrs | (PIX0(p));
-  
+    if (((px = PIX7(p))) && ((scr[0] & PIXATTR_SPRITE_HIPRI) == 0)) scr[0] = attrs | px;
+    if (((px = PIX6(p))) && ((scr[1] & PIXATTR_SPRITE_HIPRI) == 0)) scr[1] = attrs | px;
+    if (((px = PIX5(p))) && ((scr[2] & PIXATTR_SPRITE_HIPRI) == 0)) scr[2] = attrs | px;
+    if (((px = PIX4(p))) && ((scr[3] & PIXATTR_SPRITE_HIPRI) == 0)) scr[3] = attrs | px;
+    if (((px = PIX3(p))) && ((scr[4] & PIXATTR_SPRITE_HIPRI) == 0)) scr[4] = attrs | px;
+    if (((px = PIX2(p))) && ((scr[5] & PIXATTR_SPRITE_HIPRI) == 0)) scr[5] = attrs | px;
+    if (((px = PIX1(p))) && ((scr[6] & PIXATTR_SPRITE_HIPRI) == 0)) scr[6] = attrs | px;
+    if (((px = PIX0(p))) && ((scr[7] & PIXATTR_SPRITE_HIPRI) == 0)) scr[7] = attrs | px;
   }
-
 }
 
 /******************************************************************************
@@ -285,121 +273,100 @@ void draw_pattern_fliph_sprite_over_planes(uint8_t *scr, uint32_t p, uint8_t att
 static inline __attribute__((always_inline)) void
 draw_pattern_nofliph_planeB(uint8_t *scr, uint32_t p, uint8_t attrs) {
 
-  const uint8_t back = gwenesis_vdp_regs[7];
+  const uint8_t back = gwenesis_vdp_regs[7] & 0x3F;
 
   if (p == 0) {
-
-    scr[0] = back;
-    scr[1] = back;
-    scr[2] = back;
-    scr[3] = back;
-    scr[4] = back;
-    scr[5] = back;
-    scr[6] = back;
-    scr[7] = back;
-
+    uint32_t b4 = back | (back << 8) | (back << 16) | (back << 24);
+    ((unaligned_u32 *)scr)[0].v = b4;
+    ((unaligned_u32 *)scr)[1].v = b4;
     return;
   }
 
-  scr[0] = PIX0(p) ? attrs | (PIX0(p)) : back;
-  scr[1] = PIX1(p) ? attrs | (PIX1(p)) : back;
-  scr[2] = PIX2(p) ? attrs | (PIX2(p)) : back;
-  scr[3] = PIX3(p) ? attrs | (PIX3(p)) : back;
-  scr[4] = PIX4(p) ? attrs | (PIX4(p)) : back;
-  scr[5] = PIX5(p) ? attrs | (PIX5(p)) : back;
-  scr[6] = PIX6(p) ? attrs | (PIX6(p)) : back;
-  scr[7] = PIX7(p) ? attrs | (PIX7(p)) : back;
+  uint8_t px;
+  scr[0] = (px = PIX0(p)) ? (attrs | px) : back;
+  scr[1] = (px = PIX1(p)) ? (attrs | px) : back;
+  scr[2] = (px = PIX2(p)) ? (attrs | px) : back;
+  scr[3] = (px = PIX3(p)) ? (attrs | px) : back;
+  scr[4] = (px = PIX4(p)) ? (attrs | px) : back;
+  scr[5] = (px = PIX5(p)) ? (attrs | px) : back;
+  scr[6] = (px = PIX6(p)) ? (attrs | px) : back;
+  scr[7] = (px = PIX7(p)) ? (attrs | px) : back;
 }
 
 static inline __attribute__((always_inline)) void
 draw_pattern_fliph_planeB(uint8_t *scr, uint32_t p, uint8_t attrs) {
 
-  const uint8_t back = gwenesis_vdp_regs[7];
+  const uint8_t back = gwenesis_vdp_regs[7] & 0x3F;
   if (p == 0) {
-
-    scr[0] = back;
-    scr[1] = back;
-    scr[2] = back;
-    scr[3] = back;
-    scr[4] = back;
-    scr[5] = back;
-    scr[6] = back;
-    scr[7] = back;
-
+    uint32_t b4 = back | (back << 8) | (back << 16) | (back << 24);
+    ((unaligned_u32 *)scr)[0].v = b4;
+    ((unaligned_u32 *)scr)[1].v = b4;
     return;
   }
 
-  scr[0] = PIX7(p) ? attrs | (PIX7(p)) : back;
-  scr[1] = PIX6(p) ? attrs | (PIX6(p)) : back;
-  scr[2] = PIX5(p) ? attrs | (PIX5(p)) : back;
-  scr[3] = PIX4(p) ? attrs | (PIX4(p)) : back;
-  scr[4] = PIX3(p) ? attrs | (PIX3(p)) : back;
-  scr[5] = PIX2(p) ? attrs | (PIX2(p)) : back;
-  scr[6] = PIX1(p) ? attrs | (PIX1(p)) : back;
-  scr[7] = PIX0(p) ? attrs | (PIX0(p)) : back;
-
-
+  uint8_t px;
+  scr[0] = (px = PIX7(p)) ? (attrs | px) : back;
+  scr[1] = (px = PIX6(p)) ? (attrs | px) : back;
+  scr[2] = (px = PIX5(p)) ? (attrs | px) : back;
+  scr[3] = (px = PIX4(p)) ? (attrs | px) : back;
+  scr[4] = (px = PIX3(p)) ? (attrs | px) : back;
+  scr[5] = (px = PIX2(p)) ? (attrs | px) : back;
+  scr[6] = (px = PIX1(p)) ? (attrs | px) : back;
+  scr[7] = (px = PIX0(p)) ? (attrs | px) : back;
 }
 
 static inline __attribute__((always_inline)) void
 draw_pattern_nofliph_planeAoverB(uint8_t *scr, uint32_t p, uint8_t attrs) {
 
   if (p == 0) return;
+  uint8_t px;
 
   if (attrs & PIXATTR_HIPRI) {
-
-    if (PIX0(p)) scr[0] = attrs | (PIX0(p));
-    if (PIX1(p)) scr[1] = attrs | (PIX1(p));
-    if (PIX2(p)) scr[2] = attrs | (PIX2(p));
-    if (PIX3(p)) scr[3] = attrs | (PIX3(p));
-    if (PIX4(p)) scr[4] = attrs | (PIX4(p));
-    if (PIX5(p)) scr[5] = attrs | (PIX5(p));
-    if (PIX6(p)) scr[6] = attrs | (PIX6(p));
-    if (PIX7(p)) scr[7] = attrs | (PIX7(p));
-
+    if ((px = PIX0(p))) scr[0] = attrs | px;
+    if ((px = PIX1(p))) scr[1] = attrs | px;
+    if ((px = PIX2(p))) scr[2] = attrs | px;
+    if ((px = PIX3(p))) scr[3] = attrs | px;
+    if ((px = PIX4(p))) scr[4] = attrs | px;
+    if ((px = PIX5(p))) scr[5] = attrs | px;
+    if ((px = PIX6(p))) scr[6] = attrs | px;
+    if ((px = PIX7(p))) scr[7] = attrs | px;
   } else {
-
-    if (PIX0(p) && ((scr[0] & PIXATTR_HIPRI) == 0)) scr[0] = attrs | (PIX0(p));
-    if (PIX1(p) && ((scr[1] & PIXATTR_HIPRI) == 0)) scr[1] = attrs | (PIX1(p));
-    if (PIX2(p) && ((scr[2] & PIXATTR_HIPRI) == 0)) scr[2] = attrs | (PIX2(p));
-    if (PIX3(p) && ((scr[3] & PIXATTR_HIPRI) == 0)) scr[3] = attrs | (PIX3(p));
-    if (PIX4(p) && ((scr[4] & PIXATTR_HIPRI) == 0)) scr[4] = attrs | (PIX4(p));
-    if (PIX5(p) && ((scr[5] & PIXATTR_HIPRI) == 0)) scr[5] = attrs | (PIX5(p));
-    if (PIX6(p) && ((scr[6] & PIXATTR_HIPRI) == 0)) scr[6] = attrs | (PIX6(p));
-    if (PIX7(p) && ((scr[7] & PIXATTR_HIPRI) == 0)) scr[7] = attrs | (PIX7(p));
-
+    if ((px = PIX0(p)) && ((scr[0] & PIXATTR_HIPRI) == 0)) scr[0] = attrs | px;
+    if ((px = PIX1(p)) && ((scr[1] & PIXATTR_HIPRI) == 0)) scr[1] = attrs | px;
+    if ((px = PIX2(p)) && ((scr[2] & PIXATTR_HIPRI) == 0)) scr[2] = attrs | px;
+    if ((px = PIX3(p)) && ((scr[3] & PIXATTR_HIPRI) == 0)) scr[3] = attrs | px;
+    if ((px = PIX4(p)) && ((scr[4] & PIXATTR_HIPRI) == 0)) scr[4] = attrs | px;
+    if ((px = PIX5(p)) && ((scr[5] & PIXATTR_HIPRI) == 0)) scr[5] = attrs | px;
+    if ((px = PIX6(p)) && ((scr[6] & PIXATTR_HIPRI) == 0)) scr[6] = attrs | px;
+    if ((px = PIX7(p)) && ((scr[7] & PIXATTR_HIPRI) == 0)) scr[7] = attrs | px;
   }
 }
 
 static inline __attribute__((always_inline)) void
 draw_pattern_fliph_planeAoverB(uint8_t *scr, uint32_t p, uint8_t attrs) {
 
-    if (p == 0) return;
+  if (p == 0) return;
+  uint8_t px;
 
-    if (attrs & PIXATTR_HIPRI) {
-
-    if (PIX7(p)) scr[0] = attrs | (PIX7(p));
-    if (PIX6(p)) scr[1] = attrs | (PIX6(p));
-    if (PIX5(p)) scr[2] = attrs | (PIX5(p));
-    if (PIX4(p)) scr[3] = attrs | (PIX4(p));
-    if (PIX3(p)) scr[4] = attrs | (PIX3(p));
-    if (PIX2(p)) scr[5] = attrs | (PIX2(p));
-    if (PIX1(p)) scr[6] = attrs | (PIX1(p));
-    if (PIX0(p)) scr[7] = attrs | (PIX0(p));
-
+  if (attrs & PIXATTR_HIPRI) {
+    if ((px = PIX7(p))) scr[0] = attrs | px;
+    if ((px = PIX6(p))) scr[1] = attrs | px;
+    if ((px = PIX5(p))) scr[2] = attrs | px;
+    if ((px = PIX4(p))) scr[3] = attrs | px;
+    if ((px = PIX3(p))) scr[4] = attrs | px;
+    if ((px = PIX2(p))) scr[5] = attrs | px;
+    if ((px = PIX1(p))) scr[6] = attrs | px;
+    if ((px = PIX0(p))) scr[7] = attrs | px;
   } else {
-
-    if (PIX7(p) && ((scr[0] & PIXATTR_HIPRI) == 0)) scr[0] = attrs | (PIX7(p));
-    if (PIX6(p) && ((scr[1] & PIXATTR_HIPRI) == 0)) scr[1] = attrs | (PIX6(p));
-    if (PIX5(p) && ((scr[2] & PIXATTR_HIPRI) == 0)) scr[2] = attrs | (PIX5(p));
-    if (PIX4(p) && ((scr[3] & PIXATTR_HIPRI) == 0)) scr[3] = attrs | (PIX4(p));
-    if (PIX3(p) && ((scr[4] & PIXATTR_HIPRI) == 0)) scr[4] = attrs | (PIX3(p));
-    if (PIX2(p) && ((scr[5] & PIXATTR_HIPRI) == 0)) scr[5] = attrs | (PIX2(p));
-    if (PIX1(p) && ((scr[6] & PIXATTR_HIPRI) == 0)) scr[6] = attrs | (PIX1(p));
-    if (PIX0(p) && ((scr[7] & PIXATTR_HIPRI) == 0)) scr[7] = attrs | (PIX0(p));
-
+    if ((px = PIX7(p)) && ((scr[0] & PIXATTR_HIPRI) == 0)) scr[0] = attrs | px;
+    if ((px = PIX6(p)) && ((scr[1] & PIXATTR_HIPRI) == 0)) scr[1] = attrs | px;
+    if ((px = PIX5(p)) && ((scr[2] & PIXATTR_HIPRI) == 0)) scr[2] = attrs | px;
+    if ((px = PIX4(p)) && ((scr[3] & PIXATTR_HIPRI) == 0)) scr[3] = attrs | px;
+    if ((px = PIX3(p)) && ((scr[4] & PIXATTR_HIPRI) == 0)) scr[4] = attrs | px;
+    if ((px = PIX2(p)) && ((scr[5] & PIXATTR_HIPRI) == 0)) scr[5] = attrs | px;
+    if ((px = PIX1(p)) && ((scr[6] & PIXATTR_HIPRI) == 0)) scr[6] = attrs | px;
+    if ((px = PIX0(p)) && ((scr[7] & PIXATTR_HIPRI) == 0)) scr[7] = attrs | px;
   }
-
 }
 
 /******************************************************************************
@@ -737,9 +704,9 @@ void GW_SRAM_FUNC(draw_sprites_over_planes)(int line)
     // This is both the size of the table as seen by the VDP
     // *and* the maximum number of sprites that are processed
     // (important in case of infinite loops in links).
-    const int SPRITE_TABLE_SIZE     = (screen_width == 320) ?  80 :  64;
-    const int MAX_SPRITES_PER_LINE  = (screen_width == 320) ?  20 :  16;
-    const int MAX_PIXELS_PER_LINE   = (screen_width == 320) ? 320 : 256;
+    const int SPRITE_TABLE_SIZE     = mode_h40 ?  80 :  64;
+    const int MAX_SPRITES_PER_LINE  = mode_h40 ?  20 :  16;
+    const int MAX_PIXELS_PER_LINE   = screen_width;
 
     bool masking = false, one_sprite_nonzero = false; // overdraw = false;
     int sidx = 0, num_sprites = 0, num_pixels = 0;
@@ -747,7 +714,6 @@ void GW_SRAM_FUNC(draw_sprites_over_planes)(int line)
     {
         uint8_t *table = start_table + sidx*8;
         uint8_t *cache = SAT_CACHE + sidx*8;
-        //uint8_t *cache = start_table + sidx*8;
         
 
         int sy = ((cache[0] & 0x3) << 8) | cache[1];
@@ -845,9 +811,9 @@ void GW_SRAM_FUNC(draw_sprites)(int line)
   // This is both the size of the table as seen by the VDP
   // *and* the maximum number of sprites that are processed
   // (important in case of infinite loops in links).
-  const int SPRITE_TABLE_SIZE = (screen_width == 320) ? 80 : 64;
-  const int MAX_SPRITES_PER_LINE = (screen_width == 320) ? 20 : 16;
-  const int MAX_PIXELS_PER_LINE = (screen_width == 320) ? 320 : 256;
+  const int SPRITE_TABLE_SIZE = mode_h40 ? 80 : 64;
+  const int MAX_SPRITES_PER_LINE = mode_h40 ? 20 : 16;
+  const int MAX_PIXELS_PER_LINE = screen_width;
 
   bool masking = false, one_sprite_nonzero = false; // overdraw = false;
   int sidx = 0, num_sprites = 0, num_pixels = 0;
@@ -1026,8 +992,13 @@ GW_SRAM_FUNC(blit_4to5_line)(uint16_t *in, uint16_t *out) {
   }
 }
 
+extern uint8_t md_line_active[240];
+
 void GW_SRAM_FUNC(gwenesis_vdp_render_line)(int line)
 {
+  if (line >= 0 && line < 240 && !md_line_active[line])
+    return;
+
   mode_h40 = REG12_MODE_H40;
   //mode_pal = REG1_PAL;
 
@@ -1102,94 +1073,36 @@ void GW_SRAM_FUNC(gwenesis_vdp_render_line)(int line)
 
 #if GWENESIS_16BIT_RENDER
 
-  if (screen_width == 320) {
-    /* Mode Highlight/shadow is enabled */
-    if (MODE_SHI) {
-      for (int x = 0; x < screen_width; x++) {
-        uint8_t plane = pb[x];
-        uint8_t sprite = ps[x];
+  /* Mode Highlight/shadow is enabled */
+  if (MODE_SHI) {
+    for (int x = 0; x < screen_width; x++) {
+      uint8_t plane = pb[x];
+      uint8_t sprite = ps[x];
 
-        if ((plane & 0xC0) < (sprite & 0xC0)) {
-          switch (sprite & 0x3F) {
-          // Palette=3, Sprite=14 :> draw plane, force highlight
-          case 0x3E:
-            screen_buffer_line[x] = GWENESIS_PIX_HIGHLIGHT_MASK | CRAM565[plane] >> 1;
-            break;
-          // Palette=3, Sprite=15 :> draw plane, force shadow
-          case 0x3F:
-            screen_buffer_line[x] = CRAM565[plane] >> 1;
-            break;
-          // draw sprite, normal
-          default:
-            screen_buffer_line[x] = CRAM565[sprite];
-            break;
-          }
-        } else {
-          screen_buffer_line[x] = CRAM565[plane];
+      if ((plane & 0xC0) < (sprite & 0xC0)) {
+        switch (sprite & 0x3F) {
+        // Palette=3, Sprite=14 :> draw plane, force highlight
+        case 0x3E:
+          screen_buffer_line[x] = GWENESIS_PIX_HIGHLIGHT_MASK | (CRAM565[plane] >> 1);
+          break;
+        // Palette=3, Sprite=15 :> draw plane, force shadow
+        case 0x3F:
+          screen_buffer_line[x] = CRAM565[plane] >> 1;
+          break;
+        // draw sprite, normal
+        default:
+          screen_buffer_line[x] = CRAM565[sprite];
+          break;
         }
-      }
-
-      /* Normal mode*/
-    } else {
-
-      uint32_t *video_out = (uint32_t *)&screen_buffer_line[0];
-
-      for (int x = 0; x < screen_width; x += 2) {
-
-        // screen_buffer_line[x] = CRAM565[pb[x]];
-        //  2 pixels : 32 bits write  access is faster
-        *video_out++ = CRAM565[pb[x]] | CRAM565[pb[x + 1]] << 16;
+      } else {
+        screen_buffer_line[x] = CRAM565[plane];
       }
     }
-    /* upscale mode H32 to H40 */
   } else {
-
-    static uint16_t buffer_line_H32[256]; /* static: core0 stack is 3 KB */
-
-    /* Mode Highlight/shadow is enabled */
-    if (MODE_SHI) {
-      for (int x = 0; x < screen_width; x++) {
-        uint8_t plane = pb[x];
-        uint8_t sprite = ps[x];
-
-        if ((plane & 0xC0) < (sprite & 0xC0)) {
-          switch (sprite & 0x3F) {
-          // Palette=3, Sprite=14 :> draw plane, force highlight
-          case 0x3E:
-            buffer_line_H32[x] = GWENESIS_PIX_HIGHLIGHT_MASK | CRAM565[plane] >> 1;
-            break;
-          // Palette=3, Sprite=15 :> draw plane, force shadow
-          case 0x3F:
-            buffer_line_H32[x] = CRAM565[plane] >> 1;
-            break;
-          // draw sprite, normal
-          default:
-            buffer_line_H32[x] = CRAM565[sprite];
-            break;
-          }
-        } else {
-          buffer_line_H32[x] = CRAM565[plane];
-        }
-      }
-
-      /* Normal mode*/
-    } else {
-
-      for (int x = 0; x < screen_width; x++)
-        buffer_line_H32[x] = CRAM565[pb[x]];
-    }
-
-    static uint16_t scaled_buffer_line[320]; /* static: core0 stack is 3 KB */
-    
-    blit_4to5_line(buffer_line_H32, scaled_buffer_line);
-
+    /* Normal mode: 2 pixels at a time via fast 32-bit stores */
     uint32_t *video_out = (uint32_t *)&screen_buffer_line[0];
-
-    for (int x = 0; x < 320; x += 2) {
-
-      // screen_buffer_line[x] = CRAM565[pb[x]];
-      //  2 pixels : 32 bits write  access is faster
-      *video_out++ = scaled_buffer_line[x] | scaled_buffer_line[x + 1] << 16;
+    for (int x = 0; x < screen_width; x += 2) {
+      *video_out++ = CRAM565[pb[x]] | ((uint32_t)CRAM565[pb[x + 1]] << 16);
     }
   }
 #else

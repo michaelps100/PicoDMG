@@ -27,9 +27,13 @@ Cross-core rules kept here:
 #include "gwenesis_bus.h"
 #include "ym2612.h"
 #include "gwenesis_sn76489.h"
+#include "gwsram.h"
 #include "gwsnd.h"
 #include "gwsnd_fifo.h"
 #include "video_output.h"
+#if USE_ILI9341
+#include "ili9341.h"
+#endif
 
 /* implemented in gwsnd_core0.c */
 extern int (*gwsnd_fill_query_fn)(void);
@@ -56,8 +60,8 @@ static uint32_t core1_epoch; /* core1 writes (FRAME_END event) */
 /* ---------------- core1 -> core0 sample bridge (I2S / VU) ------------- */
 
 /* Stereo frames, power of two. Drained per scanline by gwsnd_line_tick,
-   so it holds a few samples at a time; 1024 (4 KB) is already generous. */
-#define GWSND_BRIDGE_LEN 1024
+   so it holds only a few samples at a time; 512 (2 KB) is ample headroom. */
+#define GWSND_BRIDGE_LEN 512
 static int16_t *bridge; /* [GWSND_BRIDGE_LEN][2] */
 static volatile uint32_t bridge_head, bridge_tail;
 static volatile uint32_t bridge_drops; /* silently discarded samples */
@@ -131,9 +135,7 @@ static void GW_SRAM_FUNC(gwsnd_core1_task)(void)
     uint32_t wm_word = line_watermark;
 
     gwsnd_event_t e;
-    /* Bound the number of events per invocation so the scanout loop's
-       other duties never starve; the task is re-entered immediately. */
-    int budget = 256;
+    int budget = 512;
     while (budget-- > 0 && gwsnd_fifo_pop(&fifo, &e)) {
         switch (e.kind) {
         case GWSND_EV_YM_W0:
@@ -170,12 +172,9 @@ static void GW_SRAM_FUNC(gwsnd_core1_task)(void)
     }
 
     /* With the FIFO fully drained, both chips may synthesize up to the
-       published per-line watermark of the current frame — this is what
-       keeps the sink fed continuously (~3.4 samples per scanline). A
-       partially drained FIFO (budget exhausted) may still hold events at
-       or below the watermark, so skip and catch up next invocation. */
-    if (budget > 0 &&
-        (wm_word >> GWSND_WM_CLOCK_BITS) ==
+       published per-line watermark of the current frame — keeping the sink
+       fed continuously (~3.4 samples per scanline). */
+    if ((wm_word >> GWSND_WM_CLOCK_BITS) ==
             (core1_epoch & ((1u << (32 - GWSND_WM_CLOCK_BITS)) - 1))) {
         int wm = (int)(wm_word & ((1u << GWSND_WM_CLOCK_BITS) - 1));
         ym2612_run(wm);
@@ -214,6 +213,9 @@ int gwsnd_offload_start(int is_pal)
     gwsnd_shadow_reset();
     gwsnd_dmb();
     engine_attached = 1;
+#if USE_ILI9341
+    ili9341_set_background_task(gwsnd_core1_task);
+#endif
     video_output_set_background_task(gwsnd_core1_task);
     return 1;
 }
@@ -225,6 +227,9 @@ void gwsnd_offload_stop(void)
        wait for an invocation already past the gate to finish. */
     engine_attached = 0;
     gwsnd_dmb();
+#if USE_ILI9341
+    ili9341_set_background_task(NULL);
+#endif
     video_output_set_background_task(NULL);
 
     absolute_time_t deadline = make_timeout_time_ms(250);
@@ -260,6 +265,7 @@ static inline void GW_SRAM_FUNC(push_event)(int32_t ts, uint8_t kind, uint8_t va
     while (absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         if (gwsnd_fifo_push(&fifo, ts, kind, val))
             return;
+        gwsnd_bridge_drain();
         tight_loop_contents();
     }
     fifo.drop_count++;

@@ -25,6 +25,7 @@ __license__ = "GPLv3"
 #include "m68k.h"
 
 #include "ym2612.h"
+#include "Z80.h"
 #include "z80inst.h"
 #include "gwenesis_bus.h"
 #include "gwenesis_io.h"
@@ -426,9 +427,9 @@ unsigned int gwenesis_bus_map_address(unsigned int address) {
   else if (range == 0xA1) //                  IO ADDRESS  0xA10000 - 0xA1FFFF
     return gwenesis_bus_map_io_address(address);
 
-  else if (range == 0xC0) // VDP ADDRESS 0xC00000 - 0xDFFFFFF
+  else if (range >= 0xC0 && range < 0xE0) // VDP ADDRESS 0xC00000 - 0xDFFFFF
     return VDP_ADDR;
-  else if (range == 0xFF) // RAM ADDRESS 0xE00000 - 0xFFFFFFF
+  else if (range >= 0xE0) // RAM ADDRESS 0xE00000 - 0xFFFFFFF
     return RAM_ADDR;
   // If not a valid address return 0
   bus_log(__FUNCTION__,"M68K > ?? unnmap address %x", address);
@@ -443,6 +444,16 @@ unsigned int gwenesis_bus_map_address(unsigned int address) {
  ******************************************************************************/
 static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
  bus_log(__FUNCTION__,"read8  %x", address);
+
+  if (address >= 0xE00000)
+    return FETCH8RAM(address);
+  if (address < 0x400000) {
+    if (!gwsram_hit(address))
+      return FETCH8ROM(address);
+    return gwsram_read8(address);
+  }
+  if ((address & 0xE00000) == 0xC00000)
+    return gwenesis_vdp_read_memory_8(address);
 
   switch (gwenesis_bus_map_address(address)) {
   
@@ -495,6 +506,17 @@ static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
 
 static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
    bus_log(__FUNCTION__,"read16 %x", address);
+
+  if (address >= 0xE00000)
+    return FETCH16RAM(address);
+  if (address < 0x400000) {
+    if (!gwsram_hit(address))
+      return FETCH16ROM(address);
+    return gwsram_read16(address);
+  }
+  if ((address & 0xE00000) == 0xC00000)
+    return gwenesis_vdp_read_memory_16(address);
+
    unsigned int ret_value;
 
   switch (gwenesis_bus_map_address(address)) {
@@ -554,6 +576,15 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
                                               unsigned int value) {
   bus_log(__FUNCTION__,"write8  @%x:%x", address,value);
 
+  if (address >= 0xE00000) {
+    WRITE8RAM(address, value);
+    return;
+  }
+  if ((address & 0xE00000) == 0xC00000) {
+    gwenesis_vdp_write_memory_16(address & ~1, (value << 8) | value);
+    return;
+  }
+
   switch (gwenesis_bus_map_address(address)) {
 
   case VDP_ADDR:
@@ -583,6 +614,7 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
     ZRAM[address & 0x1FFF] = value;
+    z80_break_idle();
     return;
 
   case Z80_YM2612_ADDR:
@@ -622,6 +654,15 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
                                                unsigned int value) {
   bus_log(__FUNCTION__,"write16  @%x:%x", address,value);
 
+  if (address >= 0xE00000) {
+    WRITE16RAM(address, value);
+    return;
+  }
+  if ((address & 0xE00000) == 0xC00000) {
+    gwenesis_vdp_write_memory_16(address, value);
+    return;
+  }
+
   switch (gwenesis_bus_map_address(address)) {
 
   case VDP_ADDR:
@@ -644,6 +685,7 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:
     ZRAM[address & 0X1FFF]= value >> 8;
+    z80_break_idle();
     return;
 
   case IO_CTRL:
@@ -682,8 +724,8 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
  ******************************************************************************/
 unsigned int GW_SRAM_FUNC(m68k_read_memory_8)(unsigned int address)
 {
-      //  if ((address &  0xFF0000 ) == 0xFF0000) return FETCH8RAM(address);
-    return gwenesis_bus_read_memory_8(address);
+  bus_log(__FUNCTION__,"R8 %x", address);
+  return gwenesis_bus_read_memory_8(address);
 }
 
 /******************************************************************************
@@ -692,10 +734,10 @@ unsigned int GW_SRAM_FUNC(m68k_read_memory_8)(unsigned int address)
  *   Read an address from memory mapped and return value as word
  *
  ******************************************************************************/
- unsigned int GW_SRAM_FUNC(m68k_read_memory_16)(unsigned int address)
+unsigned int GW_SRAM_FUNC(m68k_read_memory_16)(unsigned int address)
 {
-     //   if ((address &  0xFF0000 ) == 0xFF0000) return FETCH16RAM(address);
-    return gwenesis_bus_read_memory_16(address);
+  bus_log(__FUNCTION__,"R16 %x", address);
+  return gwenesis_bus_read_memory_16(address);
 }
 
 /******************************************************************************
@@ -704,10 +746,10 @@ unsigned int GW_SRAM_FUNC(m68k_read_memory_8)(unsigned int address)
  *   Read an address from memory mapped and return value as long
  *
  ******************************************************************************/
- unsigned int GW_SRAM_FUNC(m68k_read_memory_32)(unsigned int address)
+unsigned int GW_SRAM_FUNC(m68k_read_memory_32)(unsigned int address)
 {
-  //  if ((address &  0xFF0000 ) == 0xFF0000) return FETCH32RAM(address);
-    return (gwenesis_bus_read_memory_16(address) << 16) | gwenesis_bus_read_memory_16(address + 2);
+  bus_log(__FUNCTION__,"R32 %x", address);
+  return (gwenesis_bus_read_memory_16(address) << 16) | gwenesis_bus_read_memory_16(address + 2);
 }
 
 /******************************************************************************
@@ -717,10 +759,7 @@ unsigned int GW_SRAM_FUNC(m68k_read_memory_8)(unsigned int address)
  *
  ******************************************************************************/
 void GW_SRAM_FUNC(m68k_write_memory_8)(unsigned int address, unsigned int value) {
-  // if ((address & 0xFF0000) == 0xFF0000) {
-  //   WRITE8RAM(address, value);
-  //   return;
-  // }
+  bus_log(__FUNCTION__,"W8 %x = %x", address, value);
   gwenesis_bus_write_memory_8(address, value);
   return;
 }
@@ -732,10 +771,7 @@ void GW_SRAM_FUNC(m68k_write_memory_8)(unsigned int address, unsigned int value)
  *
  ******************************************************************************/
 void GW_SRAM_FUNC(m68k_write_memory_16)(unsigned int address, unsigned int value) {
-  // if ((address & 0xFF0000) == 0xFF0000) {
-  //   WRITE16RAM(address, value);
-  //   return;
-  // }
+  bus_log(__FUNCTION__,"W16 %x = %x", address, value);
   gwenesis_bus_write_memory_16(address, value);
   return;
 }
@@ -746,14 +782,9 @@ void GW_SRAM_FUNC(m68k_write_memory_16)(unsigned int address, unsigned int value
  *
  ******************************************************************************/
 void GW_SRAM_FUNC(m68k_write_memory_32)(unsigned int address, unsigned int value) {
-
-  // if ((address & 0xFF0000) == 0xFF0000) {
-  //   WRITE32RAM(address, value);
-  //   return;
-  // }
+  bus_log(__FUNCTION__,"W32 %x = %x ", address, value);
   gwenesis_bus_write_memory_16(address, (value >> 16) & 0xffff);
   gwenesis_bus_write_memory_16(address + 2, (value)&0xffff);
-
   return;
 }
 

@@ -23,6 +23,7 @@ against the real chip on every read and asserts equality.
 #include <string.h>
 #include "gwenesis_bus.h"
 #include "gwsnd.h"
+#include "ym2612.h"
 
 typedef struct {
     unsigned int address; /* 9-bit latched register address */
@@ -48,6 +49,19 @@ void gwsnd_shadow_reset(void)
     sh.TAL = 1024;
     sh.TBL = 256 << 4;
     sh.mode = 0x30;
+}
+
+/* After a save state was loaded: the chip's timers came back with it, but this
+ * replica still held the pre-load values (or the post-reset ones). The game
+ * reads the YM status through here -- SGDK/XGM drivers pace on the timer A
+ * flag -- so a stale shadow made the sound driver run against timers the chip
+ * no longer had: audio kept playing but stopped following the game. */
+void gwsnd_shadow_sync_from_chip(void)
+{
+    gwenesis_ym2612_get_timer_state(&sh.address, &sh.mode, &sh.TA, &sh.TAL, &sh.TAC,
+                                    &sh.TB, &sh.TBL, &sh.TBC, &sh.status);
+    sh.clock = ym2612_clock;
+    sh.index = ym2612_index;
 }
 
 void gwsnd_shadow_frame_reset(void)

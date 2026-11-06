@@ -59,5 +59,5 @@ set_source_files_properties(
     ${CMAKE_CURRENT_LIST_DIR}/vdp/gwenesis_vdp_mem.c
     ${CMAKE_CURRENT_LIST_DIR}/vdp/gwenesis_vdp_gfx.c
     ${CMAKE_CURRENT_LIST_DIR}/bus/gwenesis_bus.c
-    PROPERTIES COMPILE_OPTIONS "-O2"
+    PROPERTIES COMPILE_OPTIONS "-O3;-fno-strict-aliasing"
 )

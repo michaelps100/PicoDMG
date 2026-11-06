@@ -55,6 +55,10 @@ void gwsnd_line_tick(int system_clock);
 /* Output attenuation: samples are (ym + psg) >> shift, saturated. */
 void gwsnd_set_volume_shift(int shift);
 
+/* Audio rate mode: 0 = Full 53 kHz (divisor 1009), 1 = Fast 26 kHz (divisor 2018). */
+void gwsnd_set_audio_rate(int fast_mode);
+int gwsnd_get_audio_rate(void);
+
 /* Sink feedback for drift trim: current fill of the output queue in
    permille of its target (1000 = exactly on target). The resampler nudges
    its step up/down within +/-0.5% to keep the queue level stable. */
@@ -80,6 +84,7 @@ void gwsnd_set_pal(int is_pal);
 void gwsnd_bridge_push(int16_t l, int16_t r);
 void gwsnd_set_bridge_sink(void (*fn)(int16_t l, int16_t r));
 void gwsnd_bridge_drain(void);
+int gwsnd_is_offload_active(void);
 
 /* Perf diagnostics (offload mode): event-FIFO high-water mark since the
    last call (self-resetting) and total dropped events. */
@@ -92,6 +97,7 @@ unsigned int gwsnd_stats_bridge_drops(void);
 
 /* --- core0 shadow of the YM2612 timers/status (gwsnd_shadow.c) ------ */
 void gwsnd_shadow_reset(void);
+void gwsnd_shadow_sync_from_chip(void);
 void gwsnd_shadow_frame_reset(void);
 void gwsnd_shadow_run(int target_mclk);
 void gwsnd_shadow_write(unsigned int a, unsigned int v, int target_mclk);

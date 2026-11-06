@@ -542,16 +542,17 @@ static const UINT8 lfo_pm_output[7*8][8]={
 
 };
 
-/* all 128 LFO PM waveforms */
+/* all 128 LFO PM waveforms
+ *
+ * Deliberately NOT copied to RAM, unlike tl_tab and sin_tab above.
+ * update_phase_lfo_slot() is reached only under `if (CH->pms)`, so this is the
+ * one LUT of the three that is not read once per operator per sample -- and at
+ * 16 KB it is the entire margin between fitting the two hot tables in fast SRAM
+ * and not (see the budget in port/buffers.c). The price is an XIP flash read on
+ * the channels that do use pitch modulation; the return is that the two tables
+ * the synthesis actually hammers stay at SRAM speed. */
 #if GWENESIS_CONST_LUTS
-#if defined(GWENESIS_LUTS_IN_RAM) && GWENESIS_LUTS_IN_RAM != 0
-#define lfo_pm_table lfo_pm_table_flash
 #include "luts/lfo_pm_table.h"
-#undef lfo_pm_table
-static const UINT8 *lfo_pm_table; /* -> RAM copy */
-#else
-#include "luts/lfo_pm_table.h"
-#endif
 #elif GW_TARGET
 static UINT8 lfo_pm_table[128*8*16];  /* 128 combinations of 7 bits meaningful (of F-NUMBER), 8 LFO depths, 32 LFO output levels per one depth */
 #else
@@ -2010,17 +2011,17 @@ static void init_tables(void)
 }
 
 #if GWENESIS_CONST_LUTS && defined(GWENESIS_LUTS_IN_RAM) && GWENESIS_LUTS_IN_RAM != 0
-/* Point the synthesis at RAM working copies of the three big LUTs.
+/* Point the synthesis at RAM working copies of the two hot LUTs.
    Buffers are provided by the port (heap, per game — see port/buffers.c)
-   and must be at least YM2612_*_BYTES (ym2612.h) big. */
-void ym2612_luts_init_ram(void *tl, void *sin_, void *lfo)
+   and must be YM2612_TL_TAB_BYTES / YM2612_SIN_TAB_BYTES big. lfo_pm_table
+   is read straight from flash and needs no buffer. */
+void ym2612_luts_init_ram(void *tl, void *sin_)
 {
   memcpy(tl, tl_tab_flash, sizeof(tl_tab_flash));
   memcpy(sin_, sin_tab_flash, sizeof(sin_tab_flash));
-  memcpy(lfo, lfo_pm_table_flash, sizeof(lfo_pm_table_flash));
   tl_tab = (const signed int *)tl;
   sin_tab = (const unsigned int *)sin_;
-  lfo_pm_table = (const UINT8 *)lfo;
+  /* lfo_pm_table is read straight from flash; see its declaration. */
 }
 #endif
 
@@ -2320,6 +2321,11 @@ void YM2612Config(unsigned char dac_bits) //,unsigned int AUDIO_FREQ_DIVISOR)
   ym2612.divisor = AUDIO_FREQ_DIVISOR;
 }
 
+void YM2612SetDivisor(int div)
+{
+  ym2612.divisor = div;
+}
+
 void YM2612SaveRegs(uint8_t *regs)
 {
   memcpy(regs, OPNREGS, sizeof(OPNREGS));
@@ -2414,6 +2420,23 @@ void gwenesis_ym2612_save_state() {
   saveGwenesisStateSetBuffer(state, "out_fm", out_fm, sizeof(out_fm));
   saveGwenesisStateSet(state, "bitmask", bitmask);
   saveGwenesisStateSetBuffer(state, "OPNREGS", OPNREGS, sizeof(OPNREGS));
+}
+
+/* Timer/status registers, for the core0 shadow (port/gwsnd_shadow.c) to be
+ * resynced after a save state replaced the chip. */
+void gwenesis_ym2612_get_timer_state(unsigned int *address, unsigned int *mode,
+                                     int *TA, int *TAL, int *TAC,
+                                     int *TB, int *TBL, int *TBC,
+                                     unsigned int *status) {
+  *address = ym2612.OPN.ST.address;
+  *mode    = ym2612.OPN.ST.mode;
+  *TA      = ym2612.OPN.ST.TA;
+  *TAL     = ym2612.OPN.ST.TAL;
+  *TAC     = ym2612.OPN.ST.TAC;
+  *TB      = ym2612.OPN.ST.TB;
+  *TBL     = ym2612.OPN.ST.TBL;
+  *TBC     = ym2612.OPN.ST.TBC;
+  *status  = ym2612.OPN.ST.status;
 }
 
 void gwenesis_ym2612_load_state() {

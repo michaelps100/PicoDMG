@@ -56,7 +56,10 @@ __license__ = "GPLv3"
 #define VDP_CYCLES_PER_LINE 3420// VDP Cycles per Line
 #define SCREEN_WIDTH 320
 
-#define AUDIO_FREQ_DIVISOR 1009
+#define AUDIO_FREQ_DIVISOR_FULL 1009
+#define AUDIO_FREQ_DIVISOR_FAST 2018
+extern int gwenesis_audio_divisor;
+#define AUDIO_FREQ_DIVISOR gwenesis_audio_divisor
 #define GWENESIS_AUDIO_BUFFER_LENGTH_NTSC 888
 /* Upstream said 1056, but a PAL frame generates up to
    313*3420/1009 = 1060.9 samples — the end-of-frame top-up overflowed

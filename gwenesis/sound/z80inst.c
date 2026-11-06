@@ -89,6 +89,7 @@ void z80_start() {
 }
 
 void z80_pulse_reset() {
+  z80_break_idle();
   ResetZ80(&cpu);
 }
 
@@ -114,7 +115,7 @@ current_timeslice = 0;
   zclk = target - rem * Z80_FREQ_DIVISOR;
 }
 
-void z80_sync(void) {
+void GW_SRAM_FUNC(z80_sync)(void) {
   /*
   get M68K cycles 
   Execute cycles on z80 to sync with m68K
@@ -129,7 +130,8 @@ void z80_set_memory(unsigned char *buffer)
     initialized = 1;
 }
 
-void z80_write_ctrl(unsigned int address, unsigned int value) {
+void GW_SRAM_FUNC(z80_write_ctrl)(unsigned int address, unsigned int value) {
+  z80_break_idle();
   z80_sync();
 
   if (address == 0x1100) // BUSREQ
@@ -167,7 +169,7 @@ void z80_write_ctrl(unsigned int address, unsigned int value) {
   }
 }
 
-unsigned int z80_read_ctrl(unsigned int address) {
+unsigned int GW_SRAM_FUNC(z80_read_ctrl)(unsigned int address) {
 
   z80_sync();
 
@@ -190,7 +192,7 @@ unsigned int z80_read_ctrl(unsigned int address) {
   return 0xFF;
 }
 
-void z80_irq_line(unsigned int value)
+void GW_SRAM_FUNC(z80_irq_line)(unsigned int value)
 {
     if (reset_once == 0) return;
 
@@ -298,6 +300,7 @@ byte GW_SRAM_FUNC(RdZ80)(register word Addr) {
 extern int system_clock;
 
 void GW_SRAM_FUNC(WrZ80)(register word Addr, register byte Value) {
+  z80_break_idle();
 
   // ZRAM & mirror
   if (Addr < 0x4000) {

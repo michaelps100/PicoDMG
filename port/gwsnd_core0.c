@@ -26,6 +26,21 @@ static int gwsnd_offload_active = 0;
 static int gwsnd_cur_pal = 0;
 static void (*gwsnd_frame_tap)(const int16_t *ym, const int16_t *psg, int samples);
 
+int gwenesis_audio_divisor = AUDIO_FREQ_DIVISOR_FULL;
+
+void gwsnd_set_audio_rate(int fast_mode)
+{
+    gwenesis_audio_divisor = fast_mode ? AUDIO_FREQ_DIVISOR_FAST : AUDIO_FREQ_DIVISOR_FULL;
+    YM2612SetDivisor(gwenesis_audio_divisor);
+    gwenesis_SN76489_SetDivisor(gwenesis_audio_divisor);
+    gwsnd_resample_reset(gwsnd_cur_pal);
+}
+
+int gwsnd_get_audio_rate(void)
+{
+    return (gwenesis_audio_divisor == AUDIO_FREQ_DIVISOR_FAST) ? 1 : 0;
+}
+
 /* Read by gwsnd_core1.c (drift trim runs on core1 in offload mode). */
 int (*gwsnd_fill_query_fn)(void);
 
@@ -82,6 +97,11 @@ void gwsnd_init(int is_pal, int offload)
 #endif
     if (verify_enabled())
         gwsnd_shadow_reset();
+}
+
+int gwsnd_is_offload_active(void)
+{
+    return gwsnd_offload_active;
 }
 
 void gwsnd_shutdown(void)
@@ -168,7 +188,7 @@ void GW_SRAM_FUNC(gwsnd_psg_write)(unsigned int v, int target_mclk)
     gwenesis_SN76489_Write(v, target_mclk);
 }
 
-void gwsnd_frame_end(int system_clock)
+void GW_SRAM_FUNC(gwsnd_frame_end)(int system_clock)
 {
 #if GWSND_OFFLOAD
     if (gwsnd_offload_active) {

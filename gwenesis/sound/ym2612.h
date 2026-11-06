@@ -29,7 +29,7 @@ extern int ym2612_clock;
 #define YM2612_TL_TAB_BYTES (13 * 2 * 256 * sizeof(int))
 #define YM2612_SIN_TAB_BYTES (1024 * sizeof(unsigned int))
 #define YM2612_LFO_PM_TABLE_BYTES (128 * 8 * 16)
-extern void ym2612_luts_init_ram(void *tl, void *sin_, void *lfo);
+extern void ym2612_luts_init_ram(void *tl, void *sin_);
 #endif
 
 extern void YM2612Init(void);
@@ -39,6 +39,7 @@ extern void YM2612ResetChip(void);
 extern void YM2612Write(unsigned int a, unsigned int v, int target);
 extern void ym2612_run(int target);
 extern unsigned int YM2612Read(int target);
+extern void YM2612SetDivisor(int div);
 
 #if 0
 extern int YM2612LoadContext(unsigned char *state);
@@ -50,5 +51,9 @@ extern int YM2612SaveContext(unsigned char *state);
 
 void gwenesis_ym2612_save_state();
 void gwenesis_ym2612_load_state();
+void gwenesis_ym2612_get_timer_state(unsigned int *address, unsigned int *mode,
+                                     int *TA, int *TAL, int *TAC,
+                                     int *TB, int *TBL, int *TBC,
+                                     unsigned int *status);
 
 #endif /* _YM2612_ */

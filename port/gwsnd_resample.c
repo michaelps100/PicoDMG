@@ -62,11 +62,13 @@ void gwsnd_set_fill_permille(int permille)
        for full authority when the level is far off target, so the pitch
        deviation is a transient during recovery rather than a steady
        detune. */
-    int err = permille - 1000;
-    if (err > 500) err = 500;
-    if (err < -500) err = -500;
-    /* base/1000 * err/500 * 10 => max +/-1% */
-    int32_t trim = (int32_t)((int64_t)base_step_q16 * err / 50000);
+    /* For I2S audio, target 500 permille (half-full buffer) to provide
+       equal 512-sample headroom against both underrun and overflow. */
+    int err = permille - 500;
+    if (err > 400) err = 400;
+    if (err < -400) err = -400;
+    /* base/1000 * err/400 * 10 => max +/-1% */
+    int32_t trim = (int32_t)((int64_t)base_step_q16 * err / 40000);
     step_q16 = base_step_q16 + trim;
 }
 

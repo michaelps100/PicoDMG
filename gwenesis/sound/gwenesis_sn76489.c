@@ -80,6 +80,13 @@ void gwenesis_SN76489_Init( int PSGClockValue, int SamplingRate,int freq_divisor
     gwenesis_SN76489_Reset();
 }
 
+void gwenesis_SN76489_SetDivisor(int div)
+{
+    gwenesis_SN76489.divisor = div;
+    int sampling_rate = (div >= 2018) ? (444 * 60) : (888 * 60);
+    gwenesis_SN76489.dClock = (float)3579545 / 16 / sampling_rate;
+}
+
 void gwenesis_SN76489_Reset()
 {
     int i;

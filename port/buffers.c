@@ -42,8 +42,15 @@ int system_clock;
    them on every sample; leaving them in XIP flash makes core1 (offload)
    or core0 (sync) contend with the 68000 dispatch tables and the PSRAM
    ROM on the shared QMI port — measured as frame drops in DAC-heavy
-   games. Heap-allocated per game like everything else here. */
-static void *ym_tl_ram, *ym_sin_ram, *ym_lfo_ram;
+   games. Heap-allocated per game like everything else here.
+
+   These MUST stay in SRAM, and the QMI note above is why: on a console build
+   the cartridge ROM lives in PSRAM, and the PSRAM window is behind the same
+   QMI port. Moving the LUTs there too puts a second QMI client on the port,
+   and Castlevania Bloodlines drops 60 -> 51 fps from it alone. Tried, measured
+   on the console, reverted. The console build finds the memory elsewhere -- the
+   ROM and the cart save RAM are the cold buffers that moved to PSRAM. */
+static void *ym_tl_ram, *ym_sin_ram;
 #endif
 
 /* Called by the sound chips when a caller-supplied timestamp would have
@@ -75,9 +82,51 @@ typedef struct {
     const char *name;
 } tracked_buf_t;
 
-static tracked_buf_t tracked[10];
+static tracked_buf_t tracked[16];
 static int tracked_count;
 
+static void track(void *p, size_t size, const char *what)
+{
+    if (tracked_count < (int)(sizeof(tracked) / sizeof(tracked[0]))) {
+        tracked[tracked_count].ptr = p;
+        tracked[tracked_count].size = size;
+        tracked[tracked_count].name = what;
+        tracked_count++;
+    }
+}
+
+/* Emulation memory, in SRAM.
+ *
+ * These are the buffers the 68000 and the VDP touch on every access, so they
+ * stay in SRAM. Their real cost (read off the headers, not estimated) is:
+ *
+ *   m68k 65536 + z80 8192 + vram 65536 + audio 4288 = 143556
+ *
+ * and the link leaves a 197488 byte heap, so 53932 remain for everything else.
+ * The layout of that 53932 is the whole ballgame:
+ *
+ *   tl_tab  26624   read per operator per sample   -> SRAM
+ *   sin_tab  4096   read per operator per sample   -> SRAM
+ *   FIFO      8192   gwsnd, 1024 x gwsnd_event_t(8) -> SRAM
+ *   bridge    4096   gwsnd, 1024 stereo frames      -> SRAM
+ *   ----------------------------------------------
+ *   total    43008                                 -> 10924 to spare
+ *
+ * lfo_pm_table (16384) used to be a fourth SRAM entry and did not fit: the
+ * deficit was 5460 bytes, and gwsnd_offload_start() simply failed its
+ * allocation, so the game came up silent and the failure presented as a black
+ * screen after the ROM loaded rather than as an error. The ROM list was
+ * unaffected, which is what made it hard to read.
+ *
+ * lfo_pm_table is now left in flash because it is the only one of the three not
+ * read per operator per sample -- update_phase_lfo_slot() is reached only under
+ * `if (CH->pms)`, i.e. only on channels that use pitch modulation. That buys the
+ * two hot tables fast SRAM, which is worth 9 fps on a DAC-heavy game (Castlevania,
+ * 60 -> 51 when all three sat in PSRAM sharing the QMI port with the ROM).
+ *
+ * A failed malloc() is reported rather than stepped over: the SDK's malloc
+ * panics, and panic is an infinite loop, which is exactly how a game that will
+ * not start presents itself. */
 static void *alloc_or_report(size_t size, const char *what)
 {
     void *p = malloc(size + GUARD_BYTES);
@@ -87,12 +136,7 @@ static void *alloc_or_report(size_t size, const char *what)
         return NULL;
     }
     *(volatile uint32_t *)((uint8_t *)p + size) = GUARD_MAGIC;
-    if (tracked_count < (int)(sizeof(tracked) / sizeof(tracked[0]))) {
-        tracked[tracked_count].ptr = p;
-        tracked[tracked_count].size = size;
-        tracked[tracked_count].name = what;
-        tracked_count++;
-    }
+    track(p, size, what);
     return p;
 }
 
@@ -131,14 +175,16 @@ bool init_emulator_mem(void)
     }
 
 #if defined(GWENESIS_LUTS_IN_RAM) && GWENESIS_LUTS_IN_RAM != 0
-    ym_tl_ram = alloc_or_report(YM2612_TL_TAB_BYTES, "ym tl_tab");
+    /* In SRAM, so the synthesis reads them at full speed. lfo_pm_table (16 KB)
+     * is not among them: it is only reached under `if (CH->pms)` and stays in
+     * flash, which is what leaves room for these two plus the sound FIFO. */
+    ym_tl_ram  = alloc_or_report(YM2612_TL_TAB_BYTES, "ym tl_tab");
     ym_sin_ram = alloc_or_report(YM2612_SIN_TAB_BYTES, "ym sin_tab");
-    ym_lfo_ram = alloc_or_report(YM2612_LFO_PM_TABLE_BYTES, "ym lfo_pm_table");
-    if (!ym_tl_ram || !ym_sin_ram || !ym_lfo_ram) {
+    if (!ym_tl_ram || !ym_sin_ram) {
         free_emulator_mem();
         return false;
     }
-    ym2612_luts_init_ram(ym_tl_ram, ym_sin_ram, ym_lfo_ram);
+    ym2612_luts_init_ram(ym_tl_ram, ym_sin_ram);
 #endif
 
     /* Cartridge save RAM is deliberately NOT allocated here: its size comes
@@ -178,9 +224,8 @@ void free_emulator_mem(void)
     gwenesis_ym2612_buffer = NULL;
     gwenesis_sn76489_buffer = NULL;
 #if defined(GWENESIS_LUTS_IN_RAM) && GWENESIS_LUTS_IN_RAM != 0
-    free(ym_tl_ram);
-    free(ym_sin_ram);
-    free(ym_lfo_ram);
-    ym_tl_ram = ym_sin_ram = ym_lfo_ram = NULL;
+        free(ym_tl_ram);
+        free(ym_sin_ram);
+        ym_tl_ram = ym_sin_ram = NULL;
 #endif
 }

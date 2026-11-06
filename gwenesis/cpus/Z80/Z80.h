@@ -179,9 +179,10 @@ word LoopZ80(register Z80 *R);
 /** Z80 emulation calls this function when it executes a    **/
 /** JP, JR, CALL, RST, or RET. You can use JumpZ80() to     **/
 /** trap these opcodes and switch memory layout.            **/
-/************************************ TO BE WRITTEN BY USER **/
+static inline void z80_break_idle(void) {}
+
 #ifndef JUMPZ80
-#define JumpZ80(PC)
+#define JumpZ80(target_pc) ((void)0)
 #else
 void JumpZ80(word PC);
 #endif

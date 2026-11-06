@@ -36,9 +36,8 @@ typedef struct {
 
 /* Power of two. Core1 drains this every scanline (gwsnd_line_tick
    publishes a watermark ~3.4 samples apart), so only a handful of events
-   are ever in flight; 1024 leaves ~2 frames of worst-case headroom at
-   8 KB. Watch gwsnd_stats_fifo_highwater() before shrinking further. */
-#define GWSND_FIFO_LEN 1024
+   are ever in flight; 512 leaves ample worst-case headroom at 4 KB. */
+#define GWSND_FIFO_LEN 512
 #define GWSND_FIFO_MASK (GWSND_FIFO_LEN - 1)
 
 typedef struct {
@@ -53,9 +52,11 @@ static inline int gwsnd_fifo_level(const gwsnd_fifo_t *f)
     return (int)((f->head - f->tail) & 0xffffffffu);
 }
 
-/* Producer (core0). Returns 0 when the FIFO was full and the event dropped. */
+/* Producer (core0). Returns 0 when the FIFO was full or unallocated. */
 static inline int gwsnd_fifo_push(gwsnd_fifo_t *f, int32_t ts, uint8_t kind, uint8_t val)
 {
+    if (!f || !f->ev)
+        return 0;
     uint32_t head = f->head;
     if (head - f->tail >= GWSND_FIFO_LEN) {
         return 0;
@@ -69,9 +70,11 @@ static inline int gwsnd_fifo_push(gwsnd_fifo_t *f, int32_t ts, uint8_t kind, uin
     return 1;
 }
 
-/* Consumer (core1). Returns 0 when empty. */
+/* Consumer (core1). Returns 0 when empty or unallocated. */
 static inline int gwsnd_fifo_pop(gwsnd_fifo_t *f, gwsnd_event_t *out)
 {
+    if (!f || !f->ev || !out)
+        return 0;
     uint32_t tail = f->tail;
     if (tail == f->head)
         return 0;

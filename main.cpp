@@ -1,29 +1,44 @@
+/**
+ * PicoMD for Raspberry Pi RP2350 + ILI9341 SPI TFT + MAX98357A I2S
+ *
+ * Sega Mega Drive / Genesis Emulator with Clean Light UI,
+ * In-Game Pause Menu, Save/Load States, Scanlines Effect,
+ * 60 FPS Interpolated Display Pipeline, and SD Card Storage.
+ */
+
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <algorithm>
+
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/divider.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
 #include "hardware/watchdog.h"
-#include "util/work_meter.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "hardware/pwm.h"
+#include "hardware/pll.h"
+
 #include "ff.h"
-#include "tusb.h"
-#include "gamepad.h"
-#include "menu.h"
-#include "nespad.h"
-#include "wiipad.h"
 #include "FrensHelpers.h"
 #include "settings.h"
-#include "FrensFonts.h"
-#include "vumeter.h"
-#include "menu_settings.h"
-#if PICO_RP2350 && PSRAM_CS_PIN
-#include "PicoPlusPsram.h"
+#include "external_audio.h"
+#include "state.h"
+#include "dmg_menu.h"
+#include "dmg_combo.h"
+#include "dmg_resume.h"
+#include "dmg_boot_intro.h"
+
+#if USE_ILI9341
+#include "ili9341.h"
 #endif
 
-/* Gwenesis emulator core (vendored upstream + port patches, see
-   gwenesis/PORTING.md) and the port layer around it. */
-extern "C"
-{
+/* Gwenesis emulator core headers */
+extern "C" {
 #include "gwenesis_bus.h"
 #include "gwenesis_vdp.h"
 #include "gwenesis_io.h"
@@ -35,1484 +50,1400 @@ extern "C"
 #include "gwsnd.h"
 #include "buffers.h"
 #include "gwsram.h"
+
+extern unsigned char gwenesis_vdp_regs[];
+extern unsigned short gwenesis_vdp_status;
+extern int screen_width;
+extern int screen_height;
+extern int hint_pending;
+extern int scan_line;
+extern int frame_counter;
+extern int system_clock;
+extern unsigned char button_state[3];
 }
 
-bool isFatalError = false;
-char *romName;
-bool showSettings = false;
-static uint64_t start_tick_us = 0;
-static uint64_t fps = 0;
-static int fpsFrameCount = 0;
-static char fpsString[16] = "00";
-static int fpsStringLen = 2;
-#if HSTX
-#define fpsfgcolor 0      // black (RGB555)
-#define fpsbgcolor 0x7FFF // white (RGB555)
+/* =========================================================================
+ * Build Target Configuration (PicoMD)
+ * ========================================================================= */
+#define APP_TITLE            "PicoMD"
+#define CONFIG_MAGIC         0x4D445350u /* "PSMD" */
+#define CONFIG_PATH          "0:/saves/md/picomd.cfg"
+#define CONFIG_PATH_FALLBACK "/saves/md/picomd.cfg"
+#define SAVES_DIR            "0:/saves/md"
+#define SAVES_DIR_FALLBACK   "/saves/md"
+#define ROMS_DIR             "0:/roms/md"
+#define ROMS_DIR_FALLBACK    "/roms/md"
+
+#define MD_ROM_CACHE_HEADROOM 0x100000u /* 1 MB offset, 64KB aligned, safe beyond ~750KB code */
+#define MD_ROM_CACHE_MAX      0x800000u /* 8 MB ROM cache */
+#define MD_ROM_CACHE_ABS      (0x10080000u + MD_ROM_CACHE_HEADROOM)
+#define MD_ROM_CACHE_OFF      (MD_ROM_CACHE_ABS - 0x10000000u)
+
+#if PICO_RP2350
+#define EMULATOR_CLOCKFREQ_KHZ 378000
+#include "hardware/structs/qmi.h"
 #else
-#define fpsfgcolor 0     // black (RGB444)
-#define fpsbgcolor 0xFFF // white (RGB444)
-#endif
-
-#define MARGINTOP 0
-#define MARGINBOTTOM 0
-
-#define FPSSTART (((MARGINTOP + 7) / 8) * 8)
-#define FPSEND ((FPSSTART) + 8)
-
-static bool reset = false;
-static bool resetGame = false;
-
-extern "C" unsigned char button_state[3];
-
-static unsigned int drawFrame = 1;
-static int frame = 0;
-static bool limit_fps = true;
-static uint64_t next_frame_time = 0; // next deadline for the FPS limiter
-int audio_enabled = 1;
-bool toggleDebugFPS = false;
-#if WII_PIN_SDA >= 0 and WII_PIN_SCL >= 0
-// Cached Wii pad state updated once per frame in ProcessAfterFrameIsRendered()
-static uint16_t wiipad_raw_cached = 0;
-#endif
-#define AUDIOBUFFERSIZE (1024 * 4)
-/* Core clock experiment log (values in kHz):
- * Stable (video + USB OK):
- *   252000 : Baseline; allows exact 60.00 Hz PicoDVI timing.
- *   266000 : Stable, slight refresh deviation.
- *   280000 : Stable.
- *   294000 : Stable.
- *   308000 : Stable.
- *   324000 : Stable; chosen for PicoDVI build (≈77.2 Hz observed refresh).
- * Unstable / rejected:
- *   322000 : PLL cannot lock exactly (SDK panic: “System clock ... cannot be exactly achieved”).
- *   325000 : Same PLL precision failure.
- *   326000 : Same PLL precision failure.
- *   350000 : Same PLL precision failure.
- * Not supported by specific display (Samsung TV):
- *   328000, 330000, 340000 : TMDS mode not accepted (PicoDVI); HSTX path OK at 340000.
- * Untested / partial:
- *   360000 : Listed; no result logged.
- * HSTX high overclocks:
- *   378000 : Works with HSTX (stable video); supports exact 126 MHz pixel clock for 60.00 Hz.
- * Notes:
- * - “Not supported signal” indicates monitor rejected generated video timing.
- * - “Panic” entries are from clock config failing to derive an exact integer divider chain.
- * - Selected EMULATOR_CLOCKFREQ_KHZ below depends on PicoDVI vs HSTX build.
- */
-#if !HSTX // Using PicoDVI
-/* PicoDVI timing note:
- * For a true 60.00 Hz output the RP2350 system clock must be exactly 252 MHz.
- * Any deviation changes the derived TMDS / pixel clock and shifts the display refresh rate.
- *
- * We overclock to 324 MHz for acceptable emulator performance; at this frequency
- * the observed monitor refresh becomes ~77.2 Hz instead of 60 Hz. Most displays
- * tolerate this higher rate, but some may reject the signal.
- *
- * The current PicoDVI implementation cannot produce an exact 60 Hz mode at arbitrary
- * higher core clocks because we lack a suitable integer divisor chain for the pixel clock.
- * See: https://github.com/Wren6991/PicoDVI/issues/56
- */
-#define EMULATOR_CLOCKFREQ_KHZ 324000 // Overclock frequency in kHz when using Emulator
-#define VOLTAGE VREG_VOLTAGE_1_30
-#else
-/* HSTX overclock notes:
- * Tested core clocks:
- *   340000 kHz: Video OK, TinyUSB unstable (PIO USB still works)
- *   378000 kHz: Stable; allows exact 126 MHz HSTX pixel clock for 60.00 Hz output
- *
- * At both tested values the HSTX (serial video) clock can be tuned so display refresh stays 60 Hz.
- * Debug quirk: At 378 MHz a hard fault (signal trap) may occur when starting a debug session.
- * Mitigation: Enter BOOTSEL mode before attaching the debugger at 378 MHz.
- *
- * Voltage: 1.50 V, matching the FlashParams overclock limits
- * (pico_shared/FlashParams.cpp pairs 378000 kHz with VREG_VOLTAGE_1_50).
- */
-#define EMULATOR_CLOCKFREQ_KHZ 378000 //  Overclock frequency in kHz when using HSTX
-                                      // May cause artifacts on some screens, 336000 seems stable
-                                      // https://github.com/fhoedemakers/retroJam/issues/7
-#define VOLTAGE VREG_VOLTAGE_1_50
+#define EMULATOR_CLOCKFREQ_KHZ 252000
 #endif
 static uint32_t CPUFreqKHz = EMULATOR_CLOCKFREQ_KHZ;
 
-// Visibility configuration for options menu
-// 1 = show option line, 0 = hide, -1 = always hidden.
-// Designated initializers, like g_settings_descriptions in menu_settings.h: a
-// positional list silently leaves every option appended to the enum at zero,
-// which is how MOPT_RECENT_GAMES came to depend on menu.cpp forcing it visible.
-const int8_t g_settings_visibility_md[MOPT_COUNT] = {
-    [MOPT_EXIT_GAME]                 = 0,  // Always visible when in-game.
-    [MOPT_RESET_GAME]                = 0,  // Always visible when in-game.
-    [MOPT_REBOOT_TO_LOADER]          = BOOTLOADER_BUILD, // Only when built for the loader
-    [MOPT_SAVE_RESTORE_STATE]        = 0,  // Savestates are not implemented in this port
-    [MOPT_SCREENMODE]                = 1,
-    [MOPT_SCANLINES]                 = 0,  // Superseded by Screen Mode
-    [MOPT_SCANLINE_TYPE]             = HSTX,
-    [MOPT_FPS_OVERLAY]               = 1,
-    [MOPT_AUDIO_ENABLE]              = 1,
-    [MOPT_FRAMESKIP]                 = 1,
-    [MOPT_DISPLAY_MODE]              = HSTX && ENABLEDVI, // non-HSTX builds always use HDMI
-    [MOPT_EXTERNAL_AUDIO]            = (EXT_AUDIO_IS_ENABLED),
-    [MOPT_FONT_COLOR]                = 1,
-    [MOPT_FONT_BACK_COLOR]           = 1,
-    [MOPT_FRUITJAM_VUMETER]          = ENABLE_VU_METER,
-    [MOPT_FRUITJAM_VOLUME_CONTROL]   = (HW_CONFIG == 8),
-    [MOPT_DMG_PALETTE]               = 0,  // Game Boy only
-    [MOPT_BORDER_MODE]               = 0,  // NES only
-    [MOPT_RAPID_FIRE_ON_A]           = 0,
-    [MOPT_RAPID_FIRE_ON_B]           = 0,
-    [MOPT_AUTO_INSERT_FDS_DISK_A]    = 0,  // FDS (NES) only
-    [MOPT_AUTO_SWAP_FDS_DISK]        = 0,  // FDS (NES) only
-    [MOPT_FDS_DISK_SWAP]             = 0,  // FDS (NES) only
-    [MOPT_OVERCLOCK]                 = 0,  // Fixed clock, see setOverclockLimits() below
-    [MOPT_FM_AUDIO]                  = 0,  // SMS only
-    [MOPT_ENTER_BOOTSEL_MODE]        = 1,
-    [MOPT_CONTROLLER_TEST]           = 1,
-    [MOPT_RECENT_GAMES]              = 1,  // Rom browser only; menu.cpp gates in-game
-    [MOPT_USB_DRIVE_MODE]            = 0,  // USB drive mode (menu.cpp force-shows this in the rom browser)
-};
-
-const uint8_t g_available_screen_modes_md[] = {
-    0, // SCANLINE_8_7,
-    0, // NOSCANLINE_8_7
-    1, // SCANLINE_1_1,
-    1  // NOSCANLINE_1_1
-};
-
-/* ------------------------------------------------------------------ */
-/* Cartridge save RAM persistence                                      */
-/*                                                                     */
-/* One file per game in /SAVES, named after the rom, as in             */
-/* pico-infonesPlus and pico-smsplus. The file is always 64 KB and     */
-/* laid out the way Genesis Plus GX and Kega write .srm — file offset  */
-/* = address & 0xFFFF, with 0xFF wherever the cart drives nothing — so */
-/* saves can be carried between this emulator and a PC one. The in-RAM */
-/* buffer is packed (see port/gwsram.h), so both directions interleave */
-/* through a small chunk buffer instead of a 64 KB temporary.          */
-/*                                                                     */
-/* Scratch is static rather than automatic: PICO_STACK_SIZE is 3 KB    */
-/* and saveCartSram() runs from ProcessAfterFrameIsRendered(), i.e.    */
-/* from inside the frame loop.                                         */
-/* ------------------------------------------------------------------ */
-#define SRM_FILE_SIZE 0x10000
-
-static FIL srmFile;
-static char srmPath[FF_MAX_LFN + 16];
-static uint8_t srmChunk[512];
-
-static void buildSrmPath()
-{
-    /* GetfileNameFromFullPath() returns a pointer into romName and
-       stripextensionfromfilename() edits in place, so strip the copy. */
-    snprintf(srmPath, sizeof(srmPath) - 5, GAMESAVEDIR "/%s",
-             Frens::GetfileNameFromFullPath(romName));
-    Frens::stripextensionfromfilename(srmPath + sizeof(GAMESAVEDIR));
-    strcat(srmPath, ".srm");
+#if PICO_RP2350
+static void __no_inline_not_in_flash_func(apply_safe_qmi_timing)(void) {
+    const uint32_t max_flash_khz = 94500;
+    uint32_t flash_div = (CPUFreqKHz + max_flash_khz - 1) / max_flash_khz;
+    if (flash_div < 4)
+        flash_div = 4;
+    uint32_t rxdelay = (3 * CPUFreqKHz + 189000) / 378000;
+    if (rxdelay > 7)
+        rxdelay = 7;
+    uint32_t ints = save_and_disable_interrupts();
+    qmi_hw->m[0].timing = 0x60000000u | (14u << 11) | (rxdelay << 8) | flash_div;
+    __asm volatile("nop\nnop\nnop\nnop");
+    restore_interrupts(ints);
 }
 
-/* n bytes of 0xFF: the gaps in the file the cart does not back. */
-static FRESULT writeSrmFiller(uint32_t n)
-{
-    memset(srmChunk, 0xFF, sizeof(srmChunk));
-    while (n)
-    {
-        UINT want = n < sizeof(srmChunk) ? (UINT)n : (UINT)sizeof(srmChunk);
-        UINT put = 0;
-        FRESULT fr = f_write(&srmFile, srmChunk, want, &put);
-        if (fr != FR_OK)
-            return fr;
-        if (put != want)
-            return FR_DISK_ERR;
-        n -= want;
-    }
-    return FR_OK;
+static void __no_inline_not_in_flash_func(safe_flash_range_erase)(uint32_t offset, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(offset, count);
+    apply_safe_qmi_timing();
+    restore_interrupts(ints);
 }
 
-/* The mapped range, expanded from the packed buffer back to the flat layout. */
-static FRESULT writeSrmSpan()
-{
-    uint32_t produced = 0; /* bytes of the range emitted so far */
-
-    while (produced < gwsram_span)
-    {
-        uint32_t left = gwsram_span - produced;
-        UINT want = left < sizeof(srmChunk) ? (UINT)left : (UINT)sizeof(srmChunk);
-        UINT put = 0;
-        FRESULT fr;
-
-        gwsram_export(produced, srmChunk, want);
-        fr = f_write(&srmFile, srmChunk, want, &put);
-        if (fr != FR_OK)
-            return fr;
-        if (put != want)
-            return FR_DISK_ERR;
-        produced += want;
-    }
-    return FR_OK;
+static void __no_inline_not_in_flash_func(safe_flash_range_program)(uint32_t offset, const uint8_t *data, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(offset, data, count);
+    apply_safe_qmi_timing();
+    restore_interrupts(ints);
 }
-
-/* Non-panicking PSRAM allocator for port/gwsram.c. Frens::f_malloc panics on
-   failure, which is no use as a fallback, so go through PicoPlusPsram
-   directly. Returns nullptr when the board has no PSRAM. */
-extern "C" void *gwsram_port_psram_alloc(size_t size)
-{
-#if PICO_RP2350 && PSRAM_CS_PIN
-    if (Frens::isPsramEnabled())
-    {
-        return PicoPlusPsram::getInstance().Malloc(size);
-    }
-#endif
-    (void)size;
-    return nullptr;
-}
-
-extern "C" void gwsram_port_psram_free(void *p)
-{
-#if PICO_RP2350 && PSRAM_CS_PIN
-    if (p && Frens::isPsramEnabled())
-    {
-        PicoPlusPsram::getInstance().Free(p);
-    }
 #else
-    (void)p;
+static inline void apply_safe_qmi_timing(void) {}
+static inline void safe_flash_range_erase(uint32_t offset, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(offset, count);
+    restore_interrupts(ints);
+}
+static inline void safe_flash_range_program(uint32_t offset, const uint8_t *data, size_t count) {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(offset, data, count);
+    restore_interrupts(ints);
+}
+#endif
+
+static bool isFatalError = false;
+static char selectedRom[FF_MAX_LFN];
+static uint32_t last_flashed_rom_size = 0;
+
+static uint32_t fps = 0;
+static char fpsString[8] = "60";
+
+static uint32_t s_audio_batch[1024];
+static uint64_t s_audio_sample_accum = 0;
+
+static uint16_t s_scanline_buffer[320];
+
+/* =========================================================================
+ * Persistent Configuration Structure
+ * ========================================================================= */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t scale_mode;        /* 0 = Fit, 1 = Stretch, 2 = Integer */
+    uint32_t effect_enabled;    /* 0 = None, 1 = Scanlines */
+    uint32_t display_fps;       /* 0 = Off, 1 = On */
+    uint32_t volume_level;      /* 1..5, default 3 */
+    uint32_t brightness_level;  /* 1..5, default 5 */
+    uint32_t turbo_mode;        /* 0 = Normal 1x, 1 = Turbo 2x */
+    uint32_t save_slot;         /* 1..4, default 1 */
+    uint32_t load_slot;
+    uint32_t interleave;         /* 1..4, default 1 */
+} emulator_config_t;
+
+static ili9341_scale_mode_t persistent_scale_mode = SCALE_FIT;
+static bool persistent_scanlines_enabled = false;
+static bool persistent_shimmerless_enabled = true;
+static bool persistent_interleave = true;
+static bool persistent_display_fps = false;
+static uint8_t persistent_volume_level = 3;     /* 1..5 */
+static uint8_t persistent_brightness_level = 5; /* 1..5 */
+static uint8_t persistent_turbo_mode = 0;       /* 0 = 1x, 1 = 2x */
+static uint8_t persistent_save_slot = 1;        /* 1..4 */
+static uint8_t persistent_load_slot = 1;        /* 1..4 */
+
+enum md_frameskip_mode_t {
+    FRAMESKIP_OFF  = 0,
+    FRAMESKIP_AUTO = 1,
+    FRAMESKIP_ON   = 2
+};
+static uint8_t persistent_frameskip_mode = FRAMESKIP_AUTO;
+static bool persistent_force_h32 = false;
+static bool persistent_fast_audio = false;
+
+static bool s_request_pause_menu = false;
+static bool s_request_exit_game = false;
+static bool reset = false;
+
+/* =========================================================================
+ * UI & Button Aliases via shared_menu
+ * ========================================================================= */
+#define init_ui_buttons                  dmg_init_ui_buttons
+#define read_ui_buttons                  dmg_read_ui_buttons
+#define wait_for_all_ui_buttons_released dmg_wait_for_all_buttons_released
+
+/* =========================================================================
+ * Display Backlight & Sound Volume Controls
+ * ========================================================================= */
+static void set_backlight_brightness(uint8_t level) {
+    if (level < 1) level = 1;
+    if (level > 5) level = 5;
+    persistent_brightness_level = level;
+#if USE_ILI9341
+    if (level >= 5) {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_SIO);
+        gpio_set_dir(ILI9341_PIN_BL, GPIO_OUT);
+        gpio_put(ILI9341_PIN_BL, 1);
+    } else {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_PWM);
+        uint slice_num = pwm_gpio_to_slice_num(ILI9341_PIN_BL);
+        pwm_config config = pwm_get_default_config();
+        pwm_config_set_clkdiv(&config, 4.0f);
+        pwm_config_set_wrap(&config, 1000);
+        pwm_init(slice_num, &config, true);
+        static const uint16_t duty_table[6] = { 0, 200, 400, 600, 800, 1000 };
+        pwm_set_gpio_level(ILI9341_PIN_BL, duty_table[level]);
+    }
 #endif
 }
 
-static void loadCartSram()
-{
-    if (!gwsram_span)
-    {
-        return;
-    }
-    buildSrmPath();
+static void set_sound_volume_level(uint8_t level) {
+    if (level > 5) level = 5;
+    persistent_volume_level = level;
+}
 
-    FRESULT fr = f_open(&srmFile, srmPath, FA_READ);
-    if (fr == FR_NO_FILE || fr == FR_NO_PATH)
-    {
-        /* Nothing saved yet: the buffer keeps the 0xFF an unwritten chip has. */
-        printf("No save file %s, cartridge RAM starts empty\n", srmPath);
+static void ensure_save_directories(void) {
+    f_mkdir("0:/saves");
+    f_mkdir(SAVES_DIR);
+    f_mkdir("/saves");
+    f_mkdir(SAVES_DIR_FALLBACK);
+}
+
+/* Static buffers to prevent stack overflow */
+static char current_rom_dir[64] = ROMS_DIR;
+/* Standby by save state (shared_menu/dmg_power.h). */
+static bool s_request_power_off = false;
+static uint8_t s_power_reason = 0;
+static bool s_resume_pending = false;
+static char s_full_path[FF_MAX_LFN + 32];
+static FIL  s_io_fil;
+
+#define get_sanitized_basename dmg_sanitize_basename
+#define build_state_path(g, s, out, len) dmg_build_state_path(SAVES_DIR, g, s, out, len)
+
+extern const dmg_emulator_desc_t s_md_desc;
+#define save_emulator_config() md_save_config()
+#define load_emulator_config() md_load_config()
+
+static void system_load_sram(const char *game_name) {
+    if (!gwsram_battery || gwsram_bytes == 0) return;
+    if (gwsram_ensure_buffer() != 0) return;
+
+    char base[64];
+    get_sanitized_basename(game_name, base, sizeof(base));
+
+    char sram_path[FF_MAX_LFN];
+    snprintf(sram_path, sizeof(sram_path), "%s/%s.srm", SAVES_DIR, base);
+    FRESULT fr = f_open(&s_io_fil, sram_path, FA_READ);
+    if (fr != FR_OK) {
+        snprintf(sram_path, sizeof(sram_path), "%s/%s.sav", SAVES_DIR, base);
+        fr = f_open(&s_io_fil, sram_path, FA_READ);
+    }
+    if (fr != FR_OK) {
+        snprintf(sram_path, sizeof(sram_path), "%s/%s.srm", SAVES_DIR_FALLBACK, base);
+        fr = f_open(&s_io_fil, sram_path, FA_READ);
+    }
+    if (fr == FR_OK) {
+        UINT br = 0;
+        f_read(&s_io_fil, gwsram_data, gwsram_bytes, &br);
+        f_close(&s_io_fil);
         gwsram_dirty = 0;
-        return;
-    }
-    if (fr != FR_OK)
-    {
-        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot open save file: %d", fr);
-        printf("%s (%s)\n", ErrorMessage, srmPath);
-        return;
-    }
-
-    /* A save file exists, so this cart really does use its save RAM: this is
-       the other trigger for the deferred allocation. */
-    if (!gwsram_ensure_buffer())
-    {
-        snprintf(ErrorMessage, ERRORMESSAGESIZE, "No memory to load saved game");
-        printf("%s (%s)\n", ErrorMessage, srmPath);
-        f_close(&srmFile);
-        return;
-    }
-
-    printf("Loading cartridge RAM from %s\n", srmPath);
-    fr = f_lseek(&srmFile, (FSIZE_t)(gwsram_start & 0xFFFF));
-
-    uint32_t consumed = 0; /* bytes of the range read so far */
-    while (fr == FR_OK && consumed < gwsram_span)
-    {
-        uint32_t left = gwsram_span - consumed;
-        UINT want = left < sizeof(srmChunk) ? (UINT)left : (UINT)sizeof(srmChunk);
-        UINT got = 0;
-
-        fr = f_read(&srmFile, srmChunk, want, &got);
-        if (fr != FR_OK || got == 0)
-        {
-            break; /* short or truncated file: the rest stays 0xFF */
-        }
-        gwsram_import(consumed, srmChunk, got);
-        consumed += got;
-    }
-    if (fr != FR_OK)
-    {
-        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot read save file: %d", fr);
-        printf("%s (%s)\n", ErrorMessage, srmPath);
-    }
-    else
-    {
-        printf("Cartridge RAM restored (%u of %u bytes of the range)\n",
-               (unsigned)consumed, (unsigned)gwsram_span);
-    }
-    f_close(&srmFile);
-    gwsram_dirty = 0;
-}
-
-static void saveCartSram()
-{
-    if (!gwsram_data || !gwsram_span)
-    {
-        return;
-    }
-    if (!gwsram_dirty)
-    {
-        printf("Cartridge RAM not written by the game, nothing to save.\n");
-        return;
-    }
-    buildSrmPath();
-
-    FRESULT fr = f_open(&srmFile, srmPath, FA_CREATE_ALWAYS | FA_WRITE);
-    if (fr != FR_OK)
-    {
-        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot open save file: %d", fr);
-        printf("%s (%s)\n", ErrorMessage, srmPath);
-        return;
-    }
-
-    printf("Saving cartridge RAM to %s\n", srmPath);
-    uint32_t lead = gwsram_start & 0xFFFF;
-    fr = writeSrmFiller(lead);
-    if (fr == FR_OK)
-        fr = writeSrmSpan();
-    if (fr == FR_OK)
-        fr = writeSrmFiller(SRM_FILE_SIZE - lead - gwsram_span);
-
-    /* The close is what flushes the last sector, so it decides success just as
-       much as the writes do. */
-    FRESULT closed = f_close(&srmFile);
-    if (fr == FR_OK)
-        fr = closed;
-
-    if (fr != FR_OK)
-    {
-        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Error writing save: %d", fr);
-        printf("%s (%s)\n", ErrorMessage, srmPath);
-        return; /* leave it dirty so the next attempt tries again */
-    }
-    printf("done\n");
-    gwsram_dirty = 0;
-}
-
-int ProcessAfterFrameIsRendered()
-{
-    Frens::pollHeadPhoneJack();
-#if NES_PIN_CLK != -1
-    nespad_read_start();
-#endif
-    auto count =
-#if !HSTX
-        dvi_->getFrameCounter();
-#else
-        hstx_getframecounter();
-#endif
-    auto onOff = hw_divider_s32_quotient_inlined(count, 60) & 1;
-    Frens::blinkLed(onOff);
-#if NES_PIN_CLK != -1
-    nespad_read_finish();
-#endif
-    tuh_task();
-#if WII_PIN_SDA >= 0 and WII_PIN_SCL >= 0
-    // Poll Wii pad once per frame (function called once per rendered frame)
-    wiipad_raw_cached = wiipad_read();
-#endif
-#if ENABLE_VU_METER
-    if (isVUMeterToggleButtonPressed())
-    {
-        settings.flags.enableVUMeter = !settings.flags.enableVUMeter;
-        turnOffAllLeds();
-    }
-#endif
-    if (showSettings)
-    {
-        showSettings = false;
-        FrensSettings::savesettings();
-        /* "Enter BOOTSEL" and "Return to loader" reboot from inside the menu
-           and never come back, so flush the cartridge RAM on the way in. */
-        saveCartSram();
-        abSwapped = 1;
-        int rval = showSettingsMenu(true);
-        abSwapped = 0;
-        if (rval == 3)
-        {
-            reset = true;
-        }
-        if (rval == 5)
-        {
-            reset = true;
-            resetGame = true;
-        }
-        audio_enabled = settings.flags.audioEnabled;
-        // Reset next frame time for FPS limiter
-        next_frame_time = 0;
-    }
-    return count;
-}
-
-static DWORD prevButtons[2]{};
-
-static int rapidFireMask[2]{};
-static int rapidFireCounter = 0;
-
-static constexpr int LEFT = 1 << 6;
-static constexpr int RIGHT = 1 << 7;
-static constexpr int UP = 1 << 4;
-static constexpr int DOWN = 1 << 5;
-static constexpr int SELECT = 1 << 2;
-static constexpr int START = 1 << 3;
-static constexpr int A = 1 << 0;
-static constexpr int B = 1 << 1;
-static constexpr int C = 1 << 8;
-
-void toggleScreenMode()
-{
-#if !HSTX
-    if (settings.screenMode == ScreenMode::SCANLINE_1_1)
-    {
-        settings.screenMode = ScreenMode::NOSCANLINE_1_1;
-    }
-    else
-    {
-        settings.screenMode = ScreenMode::SCANLINE_1_1;
-    }
-    Frens::applyScreenMode(settings.screenMode);
-#else
-    Frens::toggleScanLines();
-#endif
-}
-
-static inline int mapWiipadButtons(uint16_t buttonData)
-{
-    int mapped = 0;
-    // swap A and B buttons
-    if (buttonData & A)
-    {
-        mapped |= B;
-    }
-    if (buttonData & B)
-    {
-        mapped |= A;
-    }
-    if (buttonData & SELECT)
-    {
-        mapped |= SELECT;
-    }
-    if (buttonData & START)
-    {
-        mapped |= START;
-    }
-    if (buttonData & UP)
-    {
-        mapped |= UP;
-    }
-    if (buttonData & DOWN)
-    {
-        mapped |= DOWN;
-    }
-    if (buttonData & LEFT)
-    {
-        mapped |= LEFT;
-    }
-    if (buttonData & RIGHT)
-    {
-        mapped |= RIGHT;
-    }
-    if (buttonData & C)
-    {
-        mapped |= C;
-    }
-    return mapped;
-}
-
-/* Some pads have no third button at all: the vintage NES controller on the
-   GPIO port and the AliExpress Manta in NES mode. For those, SELECT doubles as
-   the Genesis C button while a game runs - the menu is unaffected, it reads the
-   pads through its own code and keeps SELECT for itself.
-
-   The SELECT bit is deliberately left in place, so every in-game SELECT+...
-   hotkey keeps working. C is only withheld while START is held down, so
-   SELECT+START opens the settings menu without pressing C on its way out. */
-static inline int selectActsAsC(int bits)
-{
-    return ((bits & SELECT) && !(bits & START)) ? (bits | C) : bits;
-}
-
-#if NES_PIN_CLK != -1
-/* One GPIO pad's buttons, with SELECT promoted to C.
-
-   Read through the full 12-button word, so both pad types reach the Genesis
-   buttons their labels promise, matching what the USB pads already do in
-   hid_app.cpp: the leftmost/bottom button is Genesis A and the one to the
-   right of it is Genesis B, i.e. NES B -> A, NES A -> B and SNES B -> A,
-   SNES A -> B, with SNES X on C. The pad shifts its buttons out in the order
-   bit0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R on
-   a SNES pad, and bit0=A 1=B then the same Select/Start/dpad on a NES one.
-   Bits 2-7 therefore mean the same thing on both and already sit on the
-   constants above, so they pass straight through as a mask. SNES Y, L and R
-   have nowhere to go - the core is a 3-button pad.
-
-   Bits 0 and 1 are the two that swap meaning, so they need to know which pad
-   is on the wire. Only a NES pad can say so: it grounds the shift register's
-   unused outputs, which the driver sees as the ID nibble on every single read,
-   so NESPAD_TYPE_NES is not a guess and needs no button press first. Anything
-   else is taken for a SNES pad, which is what an idle SNES pad and an active
-   8-bit-only adapter cable both need - the cost is that an aftermarket NES pad
-   that leaves those outputs floating cannot be recognised and loses B.
-
-   SELECT still doubles as C for every pad on the port, SNES ones included -
-   see selectActsAsC() above. */
-static inline int nesPadButtons(int pad)
-{
-    const uint16_t ext = nespad_states_ext[pad];
-    int v = ext & (SELECT | START | UP | DOWN | LEFT | RIGHT); // same bits on both pads
-    if (nespad_padtype[pad] == NESPAD_TYPE_NES)
-    {
-        if (ext & (1u << 0))
-            v |= B; // NES A
-        if (ext & (1u << 1))
-            v |= A; // NES B
-    }
-    else
-    {
-        if (ext & (1u << 0))
-            v |= A; // SNES B
-        if (ext & (1u << 8))
-            v |= B; // SNES A
-        if (ext & (1u << 9))
-            v |= C; // SNES X
-        // bit1 is SNES Y - no fourth button to put it on.
-    }
-    return selectActsAsC(v);
-}
-#endif
-
-/* Core callback: refresh button_state[] (active low, S A C B R L D U). */
-extern "C" void gwenesis_io_get_buttons()
-{
-    char timebuf[10];
-    bool usbConnected = false;
-    for (int i = 0; i < 2; i++)
-    {
-        auto &gp = io::getCurrentGamePadState(i);
-        if (i == 0)
-        {
-            usbConnected = gp.isConnected();
-        }
-        int v = (gp.buttons & io::GamePadState::Button::LEFT ? LEFT : 0) |
-                (gp.buttons & io::GamePadState::Button::RIGHT ? RIGHT : 0) |
-                (gp.buttons & io::GamePadState::Button::UP ? UP : 0) |
-                (gp.buttons & io::GamePadState::Button::DOWN ? DOWN : 0) |
-                (gp.buttons & io::GamePadState::Button::A ? A : 0) |
-                (gp.buttons & io::GamePadState::Button::B ? B : 0) |
-                (gp.buttons & io::GamePadState::Button::X ? C : 0) | // X button maps to C button on non-genesis controllers
-                (gp.buttons & io::GamePadState::Button::C ? C : 0) |
-                (gp.buttons & io::GamePadState::Button::SELECT ? SELECT : 0) |
-                (gp.buttons & io::GamePadState::Button::START ? START : 0) |
-                0;
-
-        // The Manta reports as a NES pad in its NES mode, and then has no
-        // button that can reach C. Applied per source, so a pad with a real C
-        // sharing the same player slot keeps its own SELECT.
-        if (gp.GamePadName && strcmp(gp.GamePadName, "Manta NES") == 0)
-        {
-            v = selectActsAsC(v);
-        }
-
-#if NES_PIN_CLK != -1
-        // When USB controller is connected both NES ports act as controller 2
-        if (usbConnected)
-        {
-            if (i == 1)
-            {
-                v = v | nesPadButtons(1) | nesPadButtons(0);
-            }
-        }
-        else
-        {
-            v |= nesPadButtons(i);
-        }
-#endif
-// When USB controller is connected  wiipad acts as controller 2
-#if WII_PIN_SDA >= 0 and WII_PIN_SCL >= 0
-        if (usbConnected)
-        {
-            if (i == 1)
-            {
-                v |= mapWiipadButtons(wiipad_raw_cached);
-            }
-        }
-        else
-        {
-            if (i == 0)
-            {
-                v |= mapWiipadButtons(wiipad_raw_cached);
-            }
-        }
-#endif
-
-        int rv = v;
-        if (rapidFireCounter & 2)
-        {
-            // 15 fire/sec
-            rv &= ~rapidFireMask[i];
-        }
-
-        auto p1 = v;
-
-        auto pushed = v & ~prevButtons[i];
-        if (p1 & SELECT)
-        {
-            if (pushed & START)
-            {
-                showSettings = true;
-            }
-            else if (pushed & UP)
-            {
-                toggleScreenMode();
-            }
-            else if (pushed & DOWN)
-            {
-                toggleDebugFPS = !toggleDebugFPS;
-                Frens::ms_to_d_hhmmss(Frens::time_ms(), timebuf, sizeof timebuf);
-                printf("Uptime %s, Debug FPS %s\n", timebuf, toggleDebugFPS ? "ON" : "OFF");
-            }
-            else if (pushed & LEFT)
-            {
-                // Toggle audio output, ignore if HSTX is enabled, because HSTX must use external audio
-#if EXT_AUDIO_IS_ENABLED && !HSTX
-                settings.flags.useExtAudio = !settings.flags.useExtAudio;
-                if (settings.flags.useExtAudio)
-                {
-                    printf("Using I2S Audio\n");
-                }
-                else
-                {
-                    printf("Using DVIAudio\n");
-                }
-#else
-                settings.flags.useExtAudio = 0;
-#endif
-            }
-#if ENABLE_VU_METER
-            else if (pushed & RIGHT)
-            {
-                settings.flags.enableVUMeter = !settings.flags.enableVUMeter;
-                turnOffAllLeds();
-            }
-#endif
-        }
-        if (p1 & START)
-        {
-            // Toggle frame rate display
-            if (pushed & A)
-            {
-                settings.flags.displayFrameRate = !settings.flags.displayFrameRate;
-                printf("FPS: %s\n", settings.flags.displayFrameRate ? "ON" : "OFF");
-            }
-            else if (pushed & LEFT)
-            {
-#if HW_CONFIG == 8
-                settings.fruitjamVolumeLevel = std::max(-63, settings.fruitjamVolumeLevel - 1);
-                EXT_AUDIO_SETVOLUME(settings.fruitjamVolumeLevel);
-#endif
-            }
-            else if (pushed & RIGHT)
-            {
-#if HW_CONFIG == 8
-                settings.fruitjamVolumeLevel = std::min(23, settings.fruitjamVolumeLevel + 1);
-                EXT_AUDIO_SETVOLUME(settings.fruitjamVolumeLevel);
-#endif
-            }
-        }
-        prevButtons[i] = v;
-        button_state[i] = ((v & LEFT) ? 1 << PAD_LEFT : 0) |
-                          ((v & RIGHT) ? 1 << PAD_RIGHT : 0) |
-                          ((v & UP) ? 1 << PAD_UP : 0) |
-                          ((v & DOWN) ? 1 << PAD_DOWN : 0) |
-                          ((v & START) ? 1 << PAD_S : 0) |
-                          ((v & A) ? 1 << PAD_A : 0) |
-                          ((v & B) ? 1 << PAD_B : 0) |
-                          ((v & C) ? 1 << PAD_C : 0);
-        button_state[i] = ~button_state[i];
+        printf("[I] Battery SRAM loaded (%u bytes) from %s\n", (unsigned)br, sram_path);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Audio sinks: the gwsnd resampler delivers 44.1 kHz stereo samples   */
-/* through one of these, chosen per frame.                             */
-/* ------------------------------------------------------------------ */
+static void system_save_sram(const char *game_name) {
+    if (!gwsram_battery || !gwsram_data || gwsram_bytes == 0 || !gwsram_dirty) return;
+    ensure_save_directories();
 
-static bool i2sActive = false;
+    char base[64];
+    get_sanitized_basename(game_name, base, sizeof(base));
 
-/* Samples actually handed to the I2S ring, per perf window. The ring sits
-   near empty even with the drift trim saturated asking for more output,
-   which it cannot do if samples are arriving at the nominal rate — so
-   compare this against 44100/s to tell "we are losing samples upstream"
-   from "the DAC is draining faster than we produce". */
-static uint32_t dbgI2sSamples = 0;
-
-#if EXT_AUDIO_IS_ENABLED
-/* I2S ring fill, published as one word for the drift trim.
-   audio_i2s_get_fill_permille() derives the level from write_index and
-   read_index, which it reads as two separate words. The DMA IRQ advances
-   read_index in jumps of DMA_BLOCK_SIZE, so any reader that straddles an
-   update gets a negative difference that the ring mask turns into
-   "almost full". With the ring legitimately near empty the two indices
-   sit close together and that straddle is common — and it tells the trim
-   to produce *less*, which empties the ring further and makes the next
-   straddle more likely. Sampling it here with interrupts held, and
-   handing core1 a single aligned word, removes both the IRQ race and the
-   cross-core one. */
-static volatile int i2sFillPermille = 0;
-
-static inline void publishI2sFill()
-{
-    uint32_t save = save_and_disable_interrupts();
-    int permille = audio_i2s_get_fill_permille();
-    restore_interrupts(save);
-    i2sFillPermille = permille;
-}
-#endif
-
-static void audioOutI2S(int16_t l, int16_t r)
-{
-    dbgI2sSamples++;
-    EXT_AUDIO_ENQUEUE_SAMPLE(l, r);
-#if ENABLE_VU_METER
-    if (settings.flags.enableVUMeter)
-    {
-        addSampleToVUMeter(l);
+    char sram_path[FF_MAX_LFN];
+    snprintf(sram_path, sizeof(sram_path), "%s/%s.srm", SAVES_DIR, base);
+    FRESULT fr = f_open(&s_io_fil, sram_path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        snprintf(sram_path, sizeof(sram_path), "%s/%s.srm", SAVES_DIR_FALLBACK, base);
+        fr = f_open(&s_io_fil, sram_path, FA_WRITE | FA_CREATE_ALWAYS);
     }
-#endif
-}
-
-#if HSTX
-/* HSTX builds run the resampler on core1 (offload). HDMI audio may be
-   pushed from core1 (the DI ring's consumer is the core1 DMA IRQ), but
-   I2S and the VU meter must stay on core0 — those samples go through the
-   gwsnd bridge, drained once per frame in the emulate loop. */
-static void __not_in_flash_func(audioOutHstx)(int16_t l, int16_t r)
-{
-    hstx_push_audio_sample(l, r);
-#if ENABLE_VU_METER
-    if (settings.flags.enableVUMeter)
-    {
-        gwsnd_bridge_push(l, r); /* VU fed on core0 via the bridge */
+    if (fr == FR_OK) {
+        UINT bw = 0;
+        f_write(&s_io_fil, gwsram_data, gwsram_bytes, &bw);
+        f_close(&s_io_fil);
+        gwsram_dirty = 0;
+        printf("[I] Battery SRAM saved (%u bytes) to %s\n", (unsigned)bw, sram_path);
     }
-#endif
 }
 
-static void bridgeVUOnly(int16_t l, int16_t r)
-{
+/* =========================================================================
+ * Audio Processing (gwsnd Resampler -> MAX98357A I2S)
+ * ========================================================================= */
+static inline int16_t md_sat16(int32_t v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+static void __not_in_flash_func(audioOutI2S)(int16_t l, int16_t r) {
     (void)r;
-#if ENABLE_VU_METER
-    if (settings.flags.enableVUMeter)
-    {
-        addSampleToVUMeter(l);
+    static const int32_t vol_table[6] = { 0, 51, 102, 154, 205, 256 };
+    int32_t vol = vol_table[persistent_volume_level];
+    if (vol > 0) {
+        int32_t s = ((int32_t)l * vol) >> 8;
+        int16_t s16 = md_sat16(s);
+        EXT_AUDIO_ENQUEUE_SAMPLE(s16, s16);
+    } else {
+        EXT_AUDIO_ENQUEUE_SAMPLE(0, 0);
     }
-#else
-    (void)l;
-#endif
-}
-#else
-static void audioOutDVI(int16_t l, int16_t r)
-{
-    auto &ring = dvi_->getAudioRingBuffer();
-    if (ring.getWritableSize() < 1)
-    {
-        return;
-    }
-    auto p = ring.getWritePointer();
-    *p = {l, r};
-    ring.advanceWritePointer(1);
-}
-#endif
-
-/* Backlog the drift trim aims to hold in each sink. Two things eat into
-   it. Within a frame, core1 may only synthesize up to the per-line
-   watermark core0 publishes, so a paced chunk is a small hole (~23
-   packets / ~92 frames). Across frames, a scene that takes longer than
-   the frame period to emulate produces 735 samples while the sink drains
-   more, costing ~20 packets a frame, and the trim can only claw that back
-   at ~1.8 packets a frame — so a run of heavy frames walks the level
-   down. The target has to cover that walk, not just the intra-frame hole:
-   at 96 packets the walk still reached zero and spliced in silence. */
-#if HSTX
-#define DI_TARGET_PACKETS 160 /* 640 samples, 14.5 ms, of a 256-packet ring */
-#endif
-#if EXT_AUDIO_IS_ENABLED
-#define I2S_TARGET_FRAMES (I2S_AUDIO_RING_SIZE / 2) /* 512, 11.6 ms */
-#endif
-
-/* Backlog error for the resampler's drift trim, as permille where 1000 is
-   on target. In offload mode this runs on CORE1 — it only reads volatile
-   counters.
-
-   Sensitivity is fixed per packet rather than expressed as a ratio of the
-   target, so the loop does not get sluggish just because the target grew:
-   25 permille/packet saturates the trim 20 packets off target. Inside
-   that band the correction is gentle (no audible pitch drift when the
-   level is merely wandering); beyond it the trim runs flat out, which is
-   what a walk from a run of heavy frames needs. */
-static int sinkFillPermille()
-{
-#if EXT_AUDIO_IS_ENABLED
-    if (i2sActive)
-    {
-        int used = i2sFillPermille * I2S_AUDIO_RING_SIZE / 1000;
-        return 1000 + (used - I2S_TARGET_FRAMES) * 6; /* saturates ~80 frames off */
-    }
-#endif
-#if HSTX
-    return 1000 + ((int)hstx_di_queue_get_level() - DI_TARGET_PACKETS) * 25;
-#else
-    auto &ring = dvi_->getAudioRingBuffer();
-    int fill = AUDIOBUFFERSIZE - (int)ring.getWritableSize();
-    /* Target: ring half full. Halved against the obvious
-       fill*1000/(AUDIOBUFFERSIZE/2) because gwsnd_set_fill_permille's
-       authority was doubled for the HSTX sinks — PicoDVI's panel runs off
-       its own clock and leans on this trim continuously, so its effective
-       response must stay exactly where it was rather than detune twice as
-       hard. */
-    return 1000 + (fill - AUDIOBUFFERSIZE / 2) * 1000 / AUDIOBUFFERSIZE;
-#endif
 }
 
-/* Fill the selected sink up to its target with silence. The drift trim
-   only moves ~3.7 samples per frame, so a sink that starts empty would
-   spend seconds underrunning before it reached target on its own.
+/* =========================================================================
+ * Clean Light UI via shared_menu
+ * ========================================================================= */
 
-   The I2S ring is core0-owned in both modes, so priming it is always
-   safe. The HDMI ring is not: once the core1 sound engine is attached it
-   is the single producer of hstx_push_audio_sample(), and a second
-   producer can lose an island. Prime HDMI only before gwsnd_init(), when
-   no background task is installed — a mid-game sink switch lets the
-   drift trim fill in instead. */
-static void primeAudioSink()
-{
-    if (!audio_enabled)
-    {
-        return;
-    }
-#if EXT_AUDIO_IS_ENABLED
-    if (i2sActive)
-    {
-        publishI2sFill();
-        for (int i = i2sFillPermille * I2S_AUDIO_RING_SIZE / 1000; i < I2S_TARGET_FRAMES; i++)
-        {
-            EXT_AUDIO_ENQUEUE_SAMPLE(0, 0);
-        }
-        publishI2sFill();
-        return;
-    }
-#endif
-#if HSTX
-    /* Whole packets only: hstx_push_audio_sample batches 4 samples. */
-    for (uint32_t p = hstx_di_queue_get_level(); p < DI_TARGET_PACKETS; p++)
-    {
-        for (int s = 0; s < 4; s++)
-        {
-            hstx_push_audio_sample(0, 0);
-        }
-    }
-#endif
-}
+typedef dmg_action_t ingame_action_e;
+#define INGAME_ACTION_RESUME DMG_ACTION_RESUME
+#define INGAME_ACTION_RESET  DMG_ACTION_RESET
+#define INGAME_ACTION_EXIT   DMG_ACTION_EXIT
 
-enum SinkKind
-{
-    SINK_UNSET = -1,
-    SINK_NONE,
-    SINK_I2S,
-    SINK_DIRECT
+static const char *s_md_candidate_dirs[] = {
+    "0:/roms/md",
+    "/roms/md",
+    "roms/md",
+    "0:/ROMS/MD",
+    "/ROMS/MD",
+    "ROMS/MD",
+    "0:/roms/genesis",
+    "/roms/genesis",
+    "0:/roms",
+    "/roms",
+    "roms",
+    "0:/",
+    "/",
+    NULL
 };
-static SinkKind selectedSink = SINK_UNSET;
 
-/* Force the next selectAudioSink() to re-store and re-prime; call when a
-   game starts, since the sinks were torn down with the previous one. */
-static void resetAudioSinkSelection() { selectedSink = SINK_UNSET; }
-
-/* Called once per frame. The resampler runs on core1 and reloads the sink
-   pointer per sample, so only ever store when the selection actually
-   changed — an unconditional rewrite every frame is a swap core1 can land
-   in the middle of. */
-static void selectAudioSink()
-{
-    SinkKind want = SINK_DIRECT;
-    if (!audio_enabled)
-    {
-        want = SINK_NONE;
-    }
-#if EXT_AUDIO_IS_ENABLED
-    else if (settings.flags.useExtAudio == 1 || Frens::isHeadPhoneJackConnected())
-    {
-        want = SINK_I2S;
-    }
-#endif
-
-    if (want == selectedSink)
-    {
-        return;
-    }
-    selectedSink = want;
-
-    if (want == SINK_NONE)
-    {
-        i2sActive = false;
-        gwsnd_set_output(nullptr);
-        return;
-    }
-#if EXT_AUDIO_IS_ENABLED
-    if (want == SINK_I2S)
-    {
-        i2sActive = true;
-#if HSTX
-        /* resampler runs on core1: hand samples to core0 via the bridge */
-        gwsnd_set_bridge_sink(audioOutI2S);
-        primeAudioSink();
-        gwsnd_set_output(gwsnd_bridge_push);
-#else
-        primeAudioSink();
-        gwsnd_set_output(audioOutI2S);
-#endif
-        return;
-    }
-#endif
-    i2sActive = false;
-#if HSTX
-    gwsnd_set_bridge_sink(bridgeVUOnly);
-    gwsnd_set_output(audioOutHstx);
-#else
-    primeAudioSink();
-    gwsnd_set_output(audioOutDVI);
-#endif
+static bool is_md_rom(const char *name) {
+    if (!name || name[0] == '\0') return false;
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    return (strcasecmp(dot, ".md") == 0 ||
+            strcasecmp(dot, ".bin") == 0 ||
+            strcasecmp(dot, ".gen") == 0 ||
+            strcasecmp(dot, ".smd") == 0);
 }
 
-/* Game-start sequence: pick the sink and fill it before gwsnd_init()
-   attaches the core1 engine, so HDMI priming has the ring to itself. */
-static void startAudioSinks()
-{
-    resetAudioSinkSelection();
-    selectAudioSink();
-    primeAudioSink();
+static bool md_save_state(const char *game_name, uint8_t slot) {
+    char path[FF_MAX_LFN];
+    ensure_save_directories();
+    dmg_build_state_path(SAVES_DIR, game_name, slot, path, sizeof(path));
+    return (Emulator_SaveState(path) == 0);
 }
 
-/* ------------------------------------------------------------------ */
-/* Sub-frame pacing.                                                   */
-/*                                                                     */
-/* Emulating all 262 lines flat out (~7 ms) and then idling in the      */
-/* frame pacer (~9.6 ms) leaves a hole in audio production for well     */
-/* over half of every frame: core1 may only synthesize up to the        */
-/* watermark core0 publishes per line, and during the idle tail that    */
-/* watermark is already at the frame end. The sink drains 44.1          */
-/* samples/ms straight through the hole and hits empty. Spreading the   */
-/* same wall-clock budget across the frame in 32-line chunks caps the   */
-/* hole at ~2.1 ms (~92 samples) without costing a single byte of the   */
-/* buffer growth that would otherwise be needed to ride it out.         */
-/* ------------------------------------------------------------------ */
+static bool md_load_state(const char *game_name, uint8_t slot) {
+    char path[FF_MAX_LFN];
+    dmg_build_state_path(SAVES_DIR, game_name, slot, path, sizeof(path));
 
-static uint64_t frame_start_time = 0; /* wall clock the current frame began */
-static uint32_t frame_period_us = 16667;
-
-#define PACE_LINE_CHUNK 32
-
-#if HSTX
-/* Backlog watch for the perf overlay. Sampled at the end of every paced
-   chunk — the moment production has been stalled longest, so this is the
-   actual trough. Sampling once per frame instead always lands at the same
-   phase and cannot see it. */
-static uint32_t dbgDiMin = UINT32_MAX, dbgDiMax = 0;
-
-static inline void __not_in_flash_func(noteDiLevel)()
-{
-    uint32_t di = hstx_di_queue_get_level();
-    if (di < dbgDiMin)
-        dbgDiMin = di;
-    if (di > dbgDiMax)
-        dbgDiMax = di;
-}
-#endif
-
-static void __not_in_flash_func(paceScanline)(int line, int lines_per_frame)
-{
-    if (!limit_fps || (line & (PACE_LINE_CHUNK - 1)) != 0 || line >= lines_per_frame)
-    {
-        return;
+    /* The sound engine keeps running on core 1 (the blitter's background
+     * task) even with the blitter stopped, over the same YM2612/SN76489 the
+     * load is about to overwrite, with events of the old timeline still in its
+     * FIFO. Detach it first, load, start it again on an empty FIFO and copy
+     * the restored timers into the core0 status shadow -- otherwise the audio
+     * kept going but no longer matched the game (resume, and any load). */
+    const bool offload = gwsnd_is_offload_active();
+    if (offload) gwsnd_shutdown();
+    const bool ok = (Emulator_LoadState(path) == 0);
+    if (offload) {
+        gwsnd_init((gwenesis_vdp_status & 1) != 0, 1);
+        if (!gwsnd_is_offload_active()) gwsnd_set_output(audioOutI2S);
     }
-    uint64_t deadline = frame_start_time +
-                        (uint64_t)frame_period_us * (uint32_t)line / (uint32_t)lines_per_frame;
-    uint64_t now = time_us_64();
-    if (now >= deadline)
-    {
-        return; /* behind schedule: never stretch a late frame */
-    }
-#if HSTX
-    /* Drain the core1->core0 sample bridge (I2S / VU) before parking: a
-       chunk is at most ~2.1 ms, i.e. ~92 frames into a 1024-frame ring,
-       so once at the top of the wait is plenty. */
-    gwsnd_bridge_drain();
-#endif
-    /* Same shape as the end-of-frame limiter below: sleep the bulk, spin
-       the last 150 us. Spinning the whole ~9.6 ms a frame would burn
-       power for nothing. */
-    uint64_t remaining = deadline - now;
-    if (remaining > 150)
-    {
-        sleep_us(remaining - 150);
-    }
-    while (time_us_64() < deadline)
-    {
-        tight_loop_contents();
-    }
-#if HSTX
-    noteDiLevel();
-#endif
-#if EXT_AUDIO_IS_ENABLED
-    /* Refresh the level the core1 trim reads, so it is at most one paced
-       chunk stale rather than a whole frame. */
-    if (i2sActive)
-    {
-        publishI2sFill();
-    }
-#endif
+    gwsnd_shadow_sync_from_chip();
+    return ok;
 }
 
-#define GWENESIS_LINE_PACE(line, lines_per_frame) paceScanline((line), (lines_per_frame))
-
-/* ------------------------------------------------------------------ */
-/* Frame loop: shared verbatim with the host harness.                  */
-/* ------------------------------------------------------------------ */
-extern "C"
-{
-#include "frame_loop.inc"
+static void md_apply_scale(dmg_scale_mode_t mode) {
+    persistent_scale_mode = (ili9341_scale_mode_t)mode;
+    ili9341_set_scale_mode(persistent_scale_mode);
 }
 
-static inline uint16_t *framebufferLine(int line)
-{
-#if HSTX
-    return hstx_getlineFromFramebuffer(line);
-#else
-    return &Frens::framebuffer[line * SCREENWIDTH];
-#endif
+static void md_apply_effect(bool effect) {
+    persistent_scanlines_enabled = effect;
+    ili9341_set_scanlines(persistent_scanlines_enabled);
 }
 
-/* FPS overlay: drawn straight into the framebuffer after the frame. */
-static void drawFpsOverlay()
-{
-    for (int line = FPSSTART; line < FPSEND; line++)
-    {
-        uint16_t *fpsBuffer = framebufferLine(line) + 5;
-        int rowInChar = line % 8;
-        for (auto i = 0; i < fpsStringLen; i++)
-        {
-            char fontSlice = getcharslicefrom8x8font(fpsString[i], rowInChar);
-            for (auto bit = 0; bit < 8; bit++)
-            {
-                *fpsBuffer++ = (fontSlice & 1) ? fpsfgcolor : fpsbgcolor;
-                fontSlice >>= 1;
-            }
-        }
+static void md_apply_interleave(bool interleave) {
+    persistent_interleave = interleave;
+    ili9341_set_interleave(persistent_interleave);
+}
+
+static void md_apply_speed(bool turbo) {
+    persistent_turbo_mode = turbo ? 1 : 0;
+}
+
+static void md_apply_volume(uint8_t vol) {
+    set_sound_volume_level(vol);
+}
+
+static void md_apply_brightness(uint8_t br) {
+    set_backlight_brightness(br);
+}
+
+static void md_apply_filter(bool shimmerless) {
+    persistent_shimmerless_enabled = shimmerless;
+    ili9341_set_shimmerless(persistent_shimmerless_enabled);
+}
+
+/* Combo hooks, defined after the descriptor they are stored in. */
+static void md_save_config(void);
+static bool md_get_fps(void);
+static void md_apply_fps(bool on);
+
+static void draw_md_image_row(uint8_t idx, bool selected, ili9341_scale_mode_t scale, bool scanlines, bool shimmerless, bool interleave, uint8_t frameskip, bool force_h32, bool fast_audio) {
+    if (idx >= 7) return;
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
+    uint16_t y = (uint16_t)(DMG_UI_INGAME_LIST_START_Y + (uint16_t)idx * DMG_UI_ITEM_HEIGHT);
+    uint16_t bg = selected ? DMG_RGB565_SEL_COLOR : DMG_RGB565_BG_COLOR;
+
+    ili9341_fill_rect(wx, y, ww, DMG_UI_ITEM_HEIGHT, bg);
+
+    char buf[44];
+    buf[0] = '\0';
+
+    if (idx == 0) {
+        const char *scale_names[] = { "< Fit >", "< Stretch >", "< Integer >" };
+        int sm = (int)scale;
+        if (sm < 0 || sm >= 3) sm = 0;
+        snprintf(buf, sizeof(buf), "Scale:        %s", scale_names[sm]);
+    } else if (idx == 1) {
+        snprintf(buf, sizeof(buf), "Effect:       %s", scanlines ? "< Scanlines >" : "< None >");
+    } else if (idx == 2) {
+        snprintf(buf, sizeof(buf), "Filter:       %s", shimmerless ? "< Shimmerless >" : "< Sharp >");
+    } else if (idx == 3) {
+        snprintf(buf, sizeof(buf), "Screen:       %s", interleave ? "< Interleave >" : "< Progressive >");
+    } else if (idx == 4) {
+        const char *fs_names[] = { "< Off >", "< Auto >", "< On >" };
+        snprintf(buf, sizeof(buf), "Frameskip:    %s", fs_names[frameskip % 3]);
+    } else if (idx == 5) {
+        snprintf(buf, sizeof(buf), "Res Mode:     %s", force_h32 ? "< Force H32 >" : "< Auto >");
+    } else if (idx == 6) {
+        snprintf(buf, sizeof(buf), "Audio Rate:   %s", fast_audio ? "< Fast 26k >" : "< Full 53k >");
     }
+
+    ili9341_text(buf, (uint16_t)(wx + 12u), (uint16_t)(y + 7u), selected ? DMG_RGB565_TEXT_SEL_COLOR : DMG_RGB565_TEXT_COLOR, bg);
+    ili9341_flush_rows(y, y + DMG_UI_ITEM_HEIGHT - 1);
 }
 
-void __not_in_flash_func(emulate)()
-{
-    bool firstLoop = true;
-    int old_screen_width = 0;
-    int old_screen_height = 0;
-    char tbuf[32];
+static void md_image_submenu(const dmg_emulator_desc_t *desc, const char *game_name) {
+    uint8_t cursor = 0; /* 0: Scale, 1: Effect, 2: Filter, 3: Screen, 4: Frameskip, 5: Res Mode, 6: Audio Rate */
+    const uint8_t max_items = 7;
+    bool prev_up = true, prev_down = true, prev_left = true, prev_right = true;
+    bool prev_a = true, prev_b = true;
 
-    /* Perf diagnostics, printed once per second while the SELECT+DOWN
-       debug toggle is on: core work time per frame (emulation vs whole
-       pre-pacing loop), sound FIFO high-water/drops, DI queue min/max and
-       underruns. The DI level is sampled every frame and reported as a
-       range — a single instantaneous read once per second lands at a
-       random point on the sawtooth and says nothing. */
-    uint32_t dbgEmuSum = 0, dbgEmuMax = 0, dbgTotSum = 0, dbgTotMax = 0, dbgFrames = 0;
-    uint64_t dbgLastPrint = time_us_64();
-#if HSTX
-    uint32_t dbgUnderrunBase = hstx_di_queue_get_underrun_count();
-    dbgDiMin = UINT32_MAX;
-    dbgDiMax = 0;
-#endif
+    ili9341_scale_mode_t sel_scale = persistent_scale_mode;
+    bool sel_scanlines = persistent_scanlines_enabled;
+    bool sel_shimmerless = persistent_shimmerless_enabled;
+    bool sel_interleave = persistent_interleave;
+    uint8_t sel_frameskip = persistent_frameskip_mode;
+    bool sel_force_h32 = persistent_force_h32;
+    bool sel_fast_audio = persistent_fast_audio;
 
-    while (!reset)
-    {
-        uint64_t t_frame0 = time_us_64();
-        int is_pal = gwenesis_frame_get_config();
-        gwsnd_set_pal(is_pal);
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
 
-        /* Pace off the FPS limiter's own deadline so sub-frame chunks and
-           the end-of-frame wait share one timebase; on the first frame (and
-           after a catch-up jump) fall back to now, which makes every chunk
-           deadline already past and the pacing a no-op for that frame. */
-        frame_period_us = is_pal ? 20000 : 16667;
-        frame_start_time = (next_frame_time > frame_period_us)
-                               ? next_frame_time - frame_period_us
-                               : t_frame0;
-        if (firstLoop || old_screen_height != screen_height || old_screen_width != screen_width)
-        {
-            printf("Uptime %s, is_pal %d, screen_width: %d, screen_height: %d, audio_enabled: %d, frameskip: %d\n",
-                   Frens::ms_to_d_hhmmss(Frens::time_ms(), tbuf, sizeof tbuf), is_pal, screen_width, screen_height,
-                   settings.flags.audioEnabled, settings.flags.frameSkip);
-            firstLoop = false;
-            old_screen_height = screen_height;
-            old_screen_width = screen_width;
+    dmg_wait_for_all_buttons_released();
+
+    if (dmg_is_gb_mode()) {
+        ili9341_fill_screen(0x0000);
+        ili9341_fill_rect(wx, 0, ww, 240, DMG_RGB565_BG_COLOR);
+    } else {
+        ili9341_fill_screen(DMG_RGB565_BG_COLOR);
+    }
+    dmg_draw_top_bar(desc, APP_TITLE, "Image Settings");
+    dmg_draw_game_bar(desc, game_name);
+    dmg_draw_bottom_bar(desc, "L/R: Adjust", "B: Apply & Back");
+
+    for (uint8_t i = 0; i < max_items; i++) {
+        draw_md_image_row(i, i == cursor, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+    }
+    for (uint8_t i = max_items; i < 8; i++) {
+        uint16_t y = (uint16_t)(DMG_UI_INGAME_LIST_START_Y + (uint16_t)i * DMG_UI_ITEM_HEIGHT);
+        ili9341_fill_rect(wx, y, ww, DMG_UI_ITEM_HEIGHT, DMG_RGB565_BG_COLOR);
+    }
+    ili9341_flush(true);
+
+    while (true) {
+        watchdog_update();
+        bool btn_up, btn_down, btn_left, btn_right, btn_a, btn_b, btn_select, btn_start;
+        dmg_read_ui_buttons(&btn_up, &btn_down, &btn_left, &btn_right, &btn_a, &btn_b, &btn_select, &btn_start);
+
+        bool pushed_up    = btn_up && !prev_up;
+        bool pushed_down  = btn_down && !prev_down;
+        bool pushed_left  = btn_left && !prev_left;
+        bool pushed_right = btn_right && !prev_right;
+        bool pushed_a     = btn_a && !prev_a;
+        bool pushed_b     = btn_b && !prev_b;
+
+        prev_up    = btn_up;
+        prev_down  = btn_down;
+        prev_left  = btn_left;
+        prev_right = btn_right;
+        prev_a     = btn_a;
+        prev_b     = btn_b;
+
+        if (pushed_up) {
+            uint8_t prev = cursor;
+            cursor = (cursor == 0) ? (max_items - 1) : (cursor - 1);
+            draw_md_image_row(prev, false, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            draw_md_image_row(cursor, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+        } else if (pushed_down) {
+            uint8_t prev = cursor;
+            cursor = (cursor == max_items - 1) ? 0 : (cursor + 1);
+            draw_md_image_row(prev, false, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            draw_md_image_row(cursor, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
         }
 
-        /* Vertical centering: the framebuffer is 320x240, NTSC games are
-           224 lines. The core renders directly into the framebuffer. */
-        int margin = (SCREENHEIGHT - screen_height) / 2;
-        if (margin < 0)
-        {
-            margin = 0;
-        }
-        gwenesis_vdp_set_buffer(framebufferLine(margin));
-
-        /* Frameskip: render every frame unless enabled (then skip 1 of 3). */
-        drawFrame = !settings.flags.frameSkip || (frame % 3 != 0);
-
-        selectAudioSink();
-
-        uint64_t t_emu0 = time_us_64();
-        gwenesis_frame_run(drawFrame);
-        uint32_t emu_us = (uint32_t)(time_us_64() - t_emu0);
-
-        if (drawFrame && settings.flags.displayFrameRate)
-        {
-            drawFpsOverlay();
-        }
-
-#if HSTX
-        /* Final sweep of the core1->core0 sample bridge (I2S / VU); the
-           bulk is drained incrementally per scanline by gwsnd_line_tick. */
-        gwsnd_bridge_drain();
-#endif
-
-        ProcessAfterFrameIsRendered();
-        frame++;
-        rapidFireCounter++;
-
-        /* Heap-corruption watch: report the first frame in which any
-           emulator buffer's guard word is clobbered, then stop checking
-           so the log stays readable. */
-        static bool guardReported = false;
-        if (!guardReported && check_emulator_mem("in-game") > 0)
-        {
-            printf("  (frame %d, scan_line %d, screen %dx%d)\n", frame, scan_line,
-                   screen_width, screen_height);
-            guardReported = true;
-        }
-
-        uint32_t tot_us = (uint32_t)(time_us_64() - t_frame0);
-        dbgEmuSum += emu_us;
-        dbgTotSum += tot_us;
-        if (emu_us > dbgEmuMax)
-            dbgEmuMax = emu_us;
-        if (tot_us > dbgTotMax)
-            dbgTotMax = tot_us;
-        dbgFrames++;
-#if HSTX
-        /* Covers the inter-frame gap; paceScanline covers within a frame. */
-        noteDiLevel();
-#endif
-#if EXT_AUDIO_IS_ENABLED
-        if (i2sActive)
-        {
-            publishI2sFill();
-        }
-#endif
-        if (toggleDebugFPS && (time_us_64() - dbgLastPrint) >= 1000000)
-        {
-            printf("perf: frames=%u emu avg=%u max=%u us, loop avg=%u max=%u us",
-                   dbgFrames, dbgEmuSum / dbgFrames, dbgEmuMax,
-                   dbgTotSum / dbgFrames, dbgTotMax);
-#if GWSND_OFFLOAD
-            printf(", fifo_hw=%u drops=%u", gwsnd_stats_fifo_highwater(),
-                   gwsnd_stats_drops());
-#endif
-#if HSTX
-            uint32_t underruns = hstx_di_queue_get_underrun_count();
-            printf(", di=%u/%u underruns=%u resync=%d",
-                   (unsigned)(dbgDiMin == UINT32_MAX ? 0 : dbgDiMin), (unsigned)dbgDiMax,
-                   (unsigned)(underruns - dbgUnderrunBase), get_video_output_resync_count());
-            dbgUnderrunBase = underruns;
-#endif
-#if EXT_AUDIO_IS_ENABLED
-            if (i2sActive)
-            {
-                /* i2s_in is samples/s reaching the ring: ~44100 means the
-                   loss is downstream (DAC too fast), well under means we
-                   are not producing/delivering them in the first place. */
-                printf(", i2s=%u%% i2s_in=%u", (unsigned)(i2sFillPermille / 10),
-                       (unsigned)dbgI2sSamples);
-            }
-            dbgI2sSamples = 0;
-#endif
-#if GWSND_OFFLOAD
-            printf(" bridge_drops=%u", gwsnd_stats_bridge_drops());
-#endif
-            printf("\n");
-            dbgEmuSum = dbgEmuMax = dbgTotSum = dbgTotMax = dbgFrames = 0;
-#if HSTX
-            dbgDiMin = UINT32_MAX;
-            dbgDiMax = 0;
-#endif
-            dbgLastPrint = time_us_64();
-        }
-        else if (!toggleDebugFPS && dbgFrames >= 600)
-        {
-            /* keep the accumulators fresh so enabling the toggle shows
-               recent numbers, not an average since game start */
-            dbgEmuSum = dbgEmuMax = dbgTotSum = dbgTotMax = dbgFrames = 0;
-#if HSTX
-            dbgDiMin = UINT32_MAX;
-            dbgDiMax = 0;
-            dbgUnderrunBase = hstx_di_queue_get_underrun_count();
-#endif
-            dbgLastPrint = time_us_64();
-        }
-
-        if (limit_fps)
-        {
-            // Same period the sub-frame pacer divides up, so the last
-            // chunk deadline and this one cannot disagree.
-            const uint64_t frame_period = frame_period_us; // 50Hz or 60Hz
-            const uint64_t now = time_us_64();
-
-            // Initialize first deadline
-            if (next_frame_time == 0)
-                next_frame_time = now + frame_period;
-
-            // Wait if ahead of schedule
-            if (now < next_frame_time)
-            {
-                uint64_t remaining = next_frame_time - now;
-                if (remaining > 150)
-                    sleep_us(remaining - 150);
-                while (time_us_64() < next_frame_time)
-                {
-                    tight_loop_contents();
+        if (pushed_left || pushed_right || pushed_a) {
+            if (cursor == 0) {
+                int num_modes = 3;
+                if (pushed_right || pushed_a) {
+                    sel_scale = (ili9341_scale_mode_t)(((int)sel_scale + 1) % num_modes);
+                } else {
+                    sel_scale = (ili9341_scale_mode_t)(((int)sel_scale == 0) ? (num_modes - 1) : ((int)sel_scale - 1));
                 }
-                // Advance by exactly one frame period
-                next_frame_time += frame_period;
-            }
-            else
-            {
-                // Late: advance until the deadline is in the future (catch up without drifting)
-                do
-                {
-                    next_frame_time += frame_period;
-                } while (now >= next_frame_time);
+                draw_md_image_row(0, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 1) {
+                sel_scanlines = !sel_scanlines;
+                draw_md_image_row(1, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 2) {
+                sel_shimmerless = !sel_shimmerless;
+                draw_md_image_row(2, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 3) {
+                sel_interleave = !sel_interleave;
+                draw_md_image_row(3, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 4) {
+                if (pushed_right || pushed_a) {
+                    sel_frameskip = (sel_frameskip + 1) % 3;
+                } else {
+                    sel_frameskip = (sel_frameskip == 0) ? 2 : (sel_frameskip - 1);
+                }
+                draw_md_image_row(4, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 5) {
+                sel_force_h32 = !sel_force_h32;
+                draw_md_image_row(5, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
+            } else if (cursor == 6) {
+                sel_fast_audio = !sel_fast_audio;
+                draw_md_image_row(6, true, sel_scale, sel_scanlines, sel_shimmerless, sel_interleave, sel_frameskip, sel_force_h32, sel_fast_audio);
             }
         }
 
-        // calculate framerate
-        if (settings.flags.displayFrameRate)
-        {
-            fpsFrameCount++;
-            uint64_t tick_us = Frens::time_us() - start_tick_us;
-            if (tick_us > 1000000)
-            {
-                fps = fpsFrameCount;
-                start_tick_us = Frens::time_us();
-                fpsFrameCount = 0;
-            }
-            int nchars = 0;
-            fpsString[nchars++] = '0' + (fps / 10) % 10;
-            fpsString[nchars++] = '0' + (fps % 10);
+        if (pushed_b) {
+            persistent_scale_mode = sel_scale;
+            persistent_scanlines_enabled = sel_scanlines;
+            persistent_shimmerless_enabled = sel_shimmerless;
+            persistent_interleave = sel_interleave;
+            persistent_frameskip_mode = sel_frameskip;
+            persistent_force_h32 = sel_force_h32;
+            persistent_fast_audio = sel_fast_audio;
+            ili9341_set_scale_mode(persistent_scale_mode);
+            ili9341_set_scanlines(persistent_scanlines_enabled);
+            ili9341_set_shimmerless(persistent_shimmerless_enabled);
+            ili9341_set_interleave(persistent_interleave);
+            gwsnd_set_audio_rate(persistent_fast_audio ? 1 : 0);
+            md_save_config();
+            dmg_wait_for_all_buttons_released();
+            return;
+        }
 
-#if HSTX
-            // Append the HSTX auto-resync count so display glitches are visible.
-            fpsString[nchars++] = ' ';
-            fpsString[nchars++] = 'R';
-            int resync = get_video_output_resync_count();
-            char digits[10];
-            int nd = 0;
-            do
-            {
-                digits[nd++] = '0' + (resync % 10);
-                resync /= 10;
-            } while (resync > 0 && nd < (int)sizeof(digits));
-            while (nd > 0 && nchars < (int)sizeof(fpsString))
-            {
-                fpsString[nchars++] = digits[--nd];
-            }
+        tight_loop_contents();
+        sleep_ms(20);
+    }
+}
+
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+/* Resume intro chime, pushed from core 1 into the I2S ring (dmg_boot_intro.c). */
+static int  md_audio_free(void) { return EXT_AUDIO_GET_FREE(); }
+static void md_audio_push(int16_t l, int16_t r) { EXT_AUDIO_ENQUEUE_SAMPLE(l, r); }
+static void md_audio_restore(void) {
+    /* After the resume intro: ring empty, DMA idle, emulator's rate. */
+    audio_i2s_flush();
+    audio_i2s_update_pio_frequency(44100);
+}
 #endif
-            fpsStringLen = nchars;
+
+/* Battery SRAM to the SD before a standby (dmg_power_off_with_resume). */
+static void md_flush_saves(void) { system_save_sram(selectedRom); }
+
+const dmg_emulator_desc_t s_md_desc = {
+    .app_title            = APP_TITLE,
+    .default_rom_dir      = ROMS_DIR,
+    .candidate_dirs       = s_md_candidate_dirs,
+    .config_path          = CONFIG_PATH,
+    .config_fallback      = CONFIG_PATH_FALLBACK,
+    .saves_dir            = SAVES_DIR,
+    .config_magic         = CONFIG_MAGIC,
+    .is_rgb555            = false,
+    .display = {
+        .fill_rect        = ili9341_fill_rect,
+        .draw_text        = ili9341_text,
+        .flush_rows       = ili9341_flush_rows,
+        .fill_screen      = ili9341_fill_screen,
+        .flush            = ili9341_flush,
+        .stop_blitter     = ili9341_blitter_stop,
+        .start_blitter    = ili9341_blitter_start,
+        .write_rect_565   = ili9341_write_rect_565
+    },
+    .is_rom_file          = is_md_rom,
+    .on_load_rom          = NULL,
+    .save_state           = md_save_state,
+    .load_state           = md_load_state,
+    .apply_scale          = md_apply_scale,
+    .apply_effect         = md_apply_effect,
+    .apply_interleave     = md_apply_interleave,
+    .apply_speed          = md_apply_speed,
+    .apply_volume         = md_apply_volume,
+    .apply_brightness     = md_apply_brightness,
+    .apply_filter         = md_apply_filter,
+    .reset_game           = NULL,
+    .exit_game            = NULL,
+    .custom_submenu_title = "Image >",
+    .custom_submenu       = md_image_submenu,
+    /* On the console build (PSRAM_CS_PIN != 0) the ROM is read straight from the
+     * SD card into PSRAM, so the loading screen must not claim to write a flash
+     * cache it never touches. The HW15 build has no PSRAM and still programs
+     * flash, so there the default wording is correct -- hence the pin test. */
+    .loading_status       = (PSRAM_CS_PIN != 0) ? "Writing PSRAM cache..." : NULL,
+    .save_config          = md_save_config,
+    .get_fps              = md_get_fps,
+    .apply_fps            = md_apply_fps,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_free           = md_audio_free,
+    .audio_push           = md_audio_push,
+#endif
+    .flush_saves          = md_flush_saves,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_restore        = md_audio_restore
+#endif
+};
+
+/* Persists this emulator's settings.
+ *
+ * The emulator keeps them in its own persistent_* variables, while
+ * dmg_config_save() writes g_dmg_config -- two copies of the same state. The
+ * shared in-game menu writes g_dmg_config first and lets the descriptor callback
+ * push it down, so its rows (Speed, Volume, Brightness) saved correctly. The
+ * custom "Image >" submenu went the other way, changing persistent_* and then
+ * calling save, which wrote whatever g_dmg_config happened to hold. The file was
+ * therefore correct on disk but stale by one change, and every Scale / Effect /
+ * Screen edit came back at the previous value.
+ *
+ * Copying them across first is what makes the save mean anything. This is the
+ * shape save_config() already had in PicoWS and save_emulator_config() in
+ * PicoGBC; the other emulators just never had one. */
+static void md_save_config(void) {
+    g_dmg_config.scale_mode       = (uint32_t)persistent_scale_mode;
+    g_dmg_config.grid_effect      = persistent_scanlines_enabled ? 1u : 0u;
+    g_dmg_config.interleave       = persistent_interleave ? 1u : 0u;
+    g_dmg_config.turbo_mode       = persistent_turbo_mode;
+    g_dmg_config.volume_level     = persistent_volume_level;
+    g_dmg_config.brightness_level = persistent_brightness_level;
+    g_dmg_config.save_slot        = persistent_save_slot;
+    g_dmg_config.load_slot        = persistent_load_slot;
+    /* dmg_config_t has no fps field, so it rides in the spare extra_opt1. */
+    g_dmg_config.extra_opt1       = persistent_display_fps ? 1u : 0u;
+    /* extra_opt2 holds:
+     * bit 0: filter mode (0 = Shimmerless, 1 = Sharp)
+     * bits 1..2: frameskip (0: Off, 1: Auto, 2: On)
+     * bit 3: force H32 mode (0: Auto, 1: Force H32)
+     * bit 4: fast audio mode (0: Full 53k, 1: Fast 26k) */
+    g_dmg_config.extra_opt2       = (persistent_shimmerless_enabled ? 0u : 1u) |
+                                    ((uint32_t)(persistent_frameskip_mode & 3u) << 1) |
+                                    (persistent_force_h32 ? (1u << 3) : 0u) |
+                                    (persistent_fast_audio ? (1u << 4) : 0u);
+    dmg_config_save(&s_md_desc);
+}
+
+static void md_load_config(void) {
+    /* dmg_config_load() pushes scale/effect/interleave/speed/volume/brightness
+     * back into the persistent_* variables through the descriptor callbacks.
+     * extra_opt1 has no callback of its own, so the FPS overlay is read and
+     * applied by hand. */
+    dmg_config_load(&s_md_desc);
+    persistent_display_fps = (g_dmg_config.extra_opt1 != 0u);
+    if (s_md_desc.apply_fps != NULL) s_md_desc.apply_fps(persistent_display_fps);
+    persistent_shimmerless_enabled = ((g_dmg_config.extra_opt2 & 1u) == 0u);
+    ili9341_set_shimmerless(persistent_shimmerless_enabled);
+    persistent_frameskip_mode = (uint8_t)((g_dmg_config.extra_opt2 >> 1) & 3u);
+    if (persistent_frameskip_mode > 2) persistent_frameskip_mode = FRAMESKIP_AUTO;
+    persistent_force_h32 = ((g_dmg_config.extra_opt2 & (1u << 3)) != 0u);
+    persistent_fast_audio = ((g_dmg_config.extra_opt2 & (1u << 4)) != 0u);
+    gwsnd_set_audio_rate(persistent_fast_audio ? 1 : 0);
+}
+
+
+static bool md_get_fps(void) {
+    return persistent_display_fps;
+}
+
+static void md_apply_fps(bool on) {
+    persistent_display_fps = on;
+    ili9341_set_fps_overlay(persistent_display_fps, fpsString);
+}
+
+static bool rom_file_selector(char *selected_out, size_t max_len) {
+    return dmg_rom_selector(&s_md_desc, selected_out, max_len);
+}
+
+static ingame_action_e show_ingame_menu(const char *game_name) {
+    return dmg_ingame_menu(&s_md_desc, game_name);
+}
+
+/* =========================================================================
+ * Flash Caching & ROM Loading
+ * ========================================================================= */
+static void md_byteswap_words(uint8_t *data, uint32_t size) {
+    for (uint32_t i = 0; i + 1u < size; i += 2u) {
+        uint8_t t = data[i];
+        data[i] = data[i + 1u];
+        data[i + 1u] = t;
+    }
+}
+
+static bool md_is_valid_rom(const uint8_t *rom, uint32_t size) {
+    if (!rom || size < 0x200u || (size & 1u) != 0u) return false;
+    if (rom[0x100u ^ 1u] == 'S' && rom[0x101u ^ 1u] == 'E' &&
+        rom[0x102u ^ 1u] == 'G' && rom[0x103u ^ 1u] == 'A')
+        return true;
+    const uint32_t pc = ((uint32_t)rom[0x04u ^ 1u] << 24) |
+                        ((uint32_t)rom[0x05u ^ 1u] << 16) |
+                        ((uint32_t)rom[0x06u ^ 1u] << 8) |
+                        (uint32_t)rom[0x07u ^ 1u];
+    return ((pc & 1u) == 0u) && pc >= 0x200u && pc < size;
+}
+
+
+
+/* The cartridge currently loaded, and where it lives.
+ *
+ * On the HW15 build the ROM is programmed into flash and read back through the
+ * XIP window at MD_ROM_CACHE_ABS. On the console build (PSRAM present) it is
+ * read from the SD card straight into PSRAM and s_rom_ptr points there
+ * instead. A flag rather than an address range test: the PSRAM window is at
+ * 0x11000000, which is neither flash XIP (>= 0x10000000) nor SRAM
+ * (0x20000000), so a range check would not recognise it. */
+static const uint8_t *s_rom_ptr = (const uint8_t *)MD_ROM_CACHE_ABS;
+static bool s_rom_in_psram = false;
+
+/* Reads the cartridge into PSRAM instead of programming it into flash.
+ *
+ * The flash path below writes through safe_flash_range_erase/program, which is
+ * slow and destructive, and on this console the flash window also holds the
+ * loader image. Mega Drive ROMs reach 4 MB, so on a PSRAM board there is no
+ * reason to spend flash or the multi-second erase time.
+ *
+ * The 512-byte copier header is stripped before this is called, so the buffer
+ * holds only the cartridge image, and the words are byte-swapped in place --
+ * both matching what the flash path does, so the emulator sees the same bytes
+ * either way. Reads in chunks so the progress bar tracks real progress and a
+ * short read stops the loop instead of leaving the buffer tail uninitialised. */
+static bool md_load_rom_to_psram(FIL *fil, uint32_t size, const char *name) {
+    if (size == 0) {
+        printf("[E] Refusing to load a zero-byte ROM into PSRAM\n");
+        return false;
+    }
+
+    // f_malloc() panics (infinite loop) rather than returning NULL, so the fit
+    // has to be checked here or the console hangs with a black screen instead
+    // of reporting an error. The margin covers the emulator's own allocations
+    // (M68K RAM, Z80 RAM, VRAM, YM2612/PSG tables and buffers, cart SRAM) plus
+    // lwmem bookkeeping.
+    //
+    // The comparison must be written as "does not fit" and not guarded by
+    // `avail > margin`: with a large cart (Aladdin is ~5 MB) `avail` can land
+    // below the margin, the guard goes false, and the allocation is attempted
+    // anyway -- straight into panic().
+    const uint32_t margin = 1024u * 1024u;
+    const uint32_t avail = (uint32_t)Frens::GetAvailableMemory();
+    if (size > avail || (avail - size) < margin) {
+        printf("[E] ROM needs %u bytes; only %u usable in PSRAM and %u is "
+               "reserved for the emulator\n",
+               (unsigned)size, (unsigned)avail, (unsigned)margin);
+        return false;
+    }
+
+    // Free the previous cart before allocating, or switching games leaks each
+    // ROM in full and eventually starves the allocator.
+    if (s_rom_in_psram && s_rom_ptr) {
+        printf("[I] Freeing previous PSRAM ROM at 0x%08x\n", (unsigned)(uintptr_t)s_rom_ptr);
+        Frens::f_free((void *)s_rom_ptr);
+        s_rom_ptr = NULL;
+        s_rom_in_psram = false;
+    }
+
+    uint8_t *buf = (uint8_t *)Frens::f_malloc(size);
+    if (!buf) {
+        printf("[E] PSRAM allocation of %u bytes failed\n", (unsigned)size);
+        return false;
+    }
+
+    const uint32_t CHUNK = 64u * 1024u;
+    uint32_t loaded = 0;
+    while (loaded < size) {
+        watchdog_update();
+        uint32_t want = size - loaded;
+        if (want > CHUNK) want = CHUNK;
+        UINT got = 0;
+        if (f_read(fil, buf + loaded, want, &got) != FR_OK || got != want) {
+            printf("[E] SD read error at offset %u\n", (unsigned)loaded);
+            Frens::f_free(buf);
+            s_rom_ptr = NULL;
+            s_rom_in_psram = false;
+            return false;
+        }
+        loaded += got;
+        dmg_update_loading_progress(&s_md_desc, loaded, size);
+    }
+
+    // Same in-place byte swap the flash path applies, so the cartridge reads
+    // identically no matter which memory it came from.
+    md_byteswap_words(buf, size);
+
+    s_rom_ptr = buf;
+    s_rom_in_psram = true;
+    last_flashed_rom_size = size;
+    printf("[I] ROM loaded to PSRAM: %s, %u bytes at 0x%08x\n",
+           name, (unsigned)size, (unsigned)(uintptr_t)buf);
+    return true;
+}
+
+static bool load_cart_rom_file(const char *filename) {
+    apply_safe_qmi_timing();
+    const char *curr_dir = dmg_get_current_rom_dir();
+    if (strchr(filename, '/') != NULL || strchr(filename, '\\') != NULL || curr_dir == NULL || curr_dir[0] == '\0') {
+        snprintf(s_full_path, sizeof(s_full_path), "%s", filename);
+    } else {
+        size_t dlen = strlen(curr_dir);
+        if (dlen > 0 && curr_dir[dlen - 1] == '/') {
+            snprintf(s_full_path, sizeof(s_full_path), "%s%s", curr_dir, filename);
+        } else {
+            snprintf(s_full_path, sizeof(s_full_path), "%s/%s", curr_dir, filename);
         }
     }
-}
-
-/* Size of the currently selected ROM file (the core needs it to build its
-   address mask; pico_shared only exports the data pointer). */
-static size_t getSelectedRomSize(const char *path)
-{
-    FILINFO fno;
-    if (f_stat(path, &fno) == FR_OK)
-    {
-        return (size_t)fno.fsize;
+    FRESULT fr = f_open(&s_io_fil, s_full_path, FA_READ);
+    if (fr != FR_OK) {
+        snprintf(s_full_path, sizeof(s_full_path), "%s/%s", ROMS_DIR_FALLBACK, filename);
+        fr = f_open(&s_io_fil, s_full_path, FA_READ);
     }
-    printf("f_stat(%s) failed, assuming 4MB rom\n", path);
-    return 4 * 1024 * 1024;
-}
-
-/* Reject anything that is not a plausible Mega Drive image before handing it
-   to the core. The menu only filters on extension (".md .bin") and both are
-   generic enough to match unrelated files, so without this a wrong pick sends
-   the 68000 off to execute junk from a garbage reset vector.
-
-   Reads go through the image as the loader left it: every 16-bit word is
-   byte-swapped for the core's little-endian fetches, so the byte at file
-   offset N lives at [N ^ 1]. */
-static bool isValidGenesisRom(uintptr_t addr, size_t size, char *err, size_t errSize)
-{
-    /* flashromtoPsram() returns nullptr on a read error or when the file does
-       not fit in PSRAM, and the menu has no way to report that back — catch it
-       here instead of letting the core fetch from address 0. */
-    if (addr == 0)
-    {
-        snprintf(err, errSize, "ROM could not be loaded");
-        return false;
-    }
-    /* Vector table (0x000..0x0FF) plus header (0x100..0x1FF): below that there
-       is nothing to run, and set_region() would read past the allocation. */
-    if (size < 0x200)
-    {
-        snprintf(err, errSize, "Not a Genesis ROM (too small)");
-        return false;
-    }
-    /* 68000 fetches are 16-bit and every cart image is word-sized. An odd size
-       also means the loader's byte-swap had a byte with no pair, so refuse
-       rather than run on a possibly damaged heap. */
-    if (size & 1)
-    {
-        snprintf(err, errSize, "Not a Genesis ROM (odd size)");
+    if (fr != FR_OK) {
+        printf("[E] Cannot open ROM file: %s\n", filename);
         return false;
     }
 
-    const unsigned char *rom = (const unsigned char *)addr;
+    FSIZE_t fsz = f_size(&s_io_fil);
+    uint32_t header_offset = 0;
+    if ((fsz % 1024) == 512) {
+        header_offset = 512;
+        fsz -= 512;
+        printf("[I] Detected 512-byte copier header - skipping it\n");
+    }
 
-    /* Console name at 0x100: "SEGA MEGA DRIVE ", "SEGA GENESIS    ", ... */
-    if (rom[0x100 ^ 1] == 'S' && rom[0x101 ^ 1] == 'E' &&
-        rom[0x102 ^ 1] == 'G' && rom[0x103 ^ 1] == 'A')
-    {
+    if (fsz < 0x200 || fsz > MD_ROM_CACHE_MAX || (fsz & 1) != 0) {
+        printf("[E] Invalid ROM size: %lu\n", (unsigned long)fsz);
+        f_close(&s_io_fil);
+        return false;
+    }
+
+    uint32_t size = (uint32_t)fsz;
+    f_lseek(&s_io_fil, header_offset);
+
+    dmg_draw_loading_screen(&s_md_desc, "CARREGANDO ROM", filename, size);
+
+    /* A PSRAM board never programs the ROM into flash: the erase/program cycle
+     * on a 4 MB cart takes seconds and burns the flash window the loader image
+     * also lives in. Route to PSRAM before the flash probe, which reads
+     * MD_ROM_CACHE_ABS and would otherwise compare against stale contents. */
+    if (Frens::isPsramEnabled()) {
+        bool ok = md_load_rom_to_psram(&s_io_fil, size, filename);
+        f_close(&s_io_fil);
+        /* The QMI timing was set for flash-XIP execution at the top of this
+         * function; with the ROM in PSRAM the emulator runs from there, so put
+         * it back the way initAll() left it. */
+        apply_safe_qmi_timing();
+        if (ok && !dmg_boot_intro_active()) {
+            ili9341_blitter_start();
+            ili9341_fill_screen(0x0000);
+            ili9341_flush(true);
+        }
+        return ok;
+    }
+
+    /* Probe check: see if same ROM is already cached in flash */
+    static uint8_t probe_buf[4096];
+    UINT got = 0;
+    bool already_flashed = false;
+    if (f_read(&s_io_fil, probe_buf, sizeof(probe_buf), &got) == FR_OK && got == sizeof(probe_buf)) {
+        md_byteswap_words(probe_buf, sizeof(probe_buf));
+        already_flashed = (memcmp((const void *)MD_ROM_CACHE_ABS, probe_buf, sizeof(probe_buf)) == 0);
+    }
+    f_lseek(&s_io_fil, header_offset);
+
+    if (already_flashed) {
+        printf("[I] ROM already present in Flash Cache (%u bytes)\n", (unsigned)size);
+        f_close(&s_io_fil);
+        apply_safe_qmi_timing();
+        last_flashed_rom_size = size;
         return true;
     }
 
-    /* Hacks and homebrew sometimes wipe the console name, so fall back on the
-       vector table: the initial PC (big-endian longword at 0x004) must be an
-       even address pointing at cartridge space past the header. */
-    uint32_t pc = ((uint32_t)rom[0x04 ^ 1] << 24) | ((uint32_t)rom[0x05 ^ 1] << 16) |
-                  ((uint32_t)rom[0x06 ^ 1] << 8) | (uint32_t)rom[0x07 ^ 1];
-    if ((pc & 1) == 0 && pc >= 0x200 && pc < size)
-    {
-        printf("No SEGA header, but reset vector 0x%06x is sane: accepting\n", (unsigned)pc);
-        return true;
+    /* Program into Flash XIP */
+    printf("[I] Flashing %s (%u bytes) to 0x%08X (offset 0x%08X)...\n",
+           filename, (unsigned)size, (unsigned)MD_ROM_CACHE_ABS, (unsigned)MD_ROM_CACHE_OFF);
+
+    static uint8_t copy_block[4096];
+    uint32_t offset = 0;
+    dmg_boot_intro_flash_begin();   /* core 1 runs the intro from XIP */
+
+    while (offset < size) {
+        watchdog_update();
+        uint32_t chunk = (size - offset > sizeof(copy_block)) ? sizeof(copy_block) : (size - offset);
+        UINT read = 0;
+        if (f_read(&s_io_fil, copy_block, chunk, &read) != FR_OK || read != chunk) {
+            printf("[E] SD read error at offset %u\n", (unsigned)offset);
+            f_close(&s_io_fil);
+            dmg_boot_intro_flash_end();
+            return false;
+        }
+
+        md_byteswap_words(copy_block, chunk);
+        const uint32_t programmed = (chunk + FLASH_PAGE_SIZE - 1u) & ~(FLASH_PAGE_SIZE - 1u);
+        if (programmed > chunk) memset(copy_block + chunk, 0xFF, programmed - chunk);
+
+        /* Erase 64KB flash blocks as we cross boundaries */
+        if ((offset % FLASH_BLOCK_SIZE) == 0u) {
+            safe_flash_range_erase(MD_ROM_CACHE_OFF + offset, FLASH_BLOCK_SIZE);
+        }
+
+        for (uint32_t pos = 0; pos < programmed; pos += FLASH_PAGE_SIZE) {
+            safe_flash_range_program(MD_ROM_CACHE_OFF + offset + pos, copy_block + pos, FLASH_PAGE_SIZE);
+        }
+
+        if (memcmp((const void *)(MD_ROM_CACHE_ABS + offset), copy_block, chunk) != 0) {
+            printf("[E] Flash verification failed at offset %u!\n", (unsigned)offset);
+            f_close(&s_io_fil);
+            dmg_boot_intro_flash_end();
+            return false;
+        }
+
+        offset += chunk;
+        dmg_update_loading_progress(&s_md_desc, offset, size);
     }
 
-    snprintf(err, errSize, "Not a Genesis ROM");
-    return false;
+    f_close(&s_io_fil);
+    dmg_boot_intro_flash_end();
+    apply_safe_qmi_timing();
+    last_flashed_rom_size = size;
+    printf("[I] Flash caching completed successfully\n");
+    return true;
 }
 
-/// @brief
-/// Start emulator.
-/// @return
-int main()
-{
-#if !defined(PICO_RP2350)
-#error "This code is for RP2350 only"
-#endif
-    char selectedRom[FF_MAX_LFN];
-    romName = selectedRom;
-    ErrorMessage[0] = selectedRom[0] = 0;
-    // This emulator is always overclocked at 378 Mhz or higher
-    Frens::setOverclockLimits(CPUFreqKHz,  CPUFreqKHz, VOLTAGE, VOLTAGE);
-    Frens::setClocksAndStartStdio(CPUFreqKHz, VOLTAGE);
+/* =========================================================================
+ * Joypad Input Mapping (Mega Drive 3-Button)
+ * ========================================================================= */
+static bool s_supress_input = false;
 
-    printf("==========================================================================================\n");
-    printf("Pico-Genesis+ %s\n", SWVERSION);
-    printf("Build date: %s\n", __DATE__);
-    printf("Build time: %s\n", __TIME__);
-    printf("CPU freq: %d kHz\n", clock_get_hz(clk_sys) / 1000);
-#if HSTX
-    printf("HSTX freq: %d kHz\n", clock_get_hz(clk_hstx) / 1000);
-#endif
-    printf("Stack size: %d bytes\n", PICO_STACK_SIZE);
-    printf("==========================================================================================\n");
-    printf("Starting up...\n");
-    FrensSettings::initSettings(FrensSettings::emulators::GENESIS);
-    isFatalError = !Frens::initAll(selectedRom, CPUFreqKHz, MARGINTOP, MARGINBOTTOM, AUDIOBUFFERSIZE, true, true);
-#if !HSTX
-    scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
-#endif
-    bool showSplash = true;
-    g_settings_visibility = g_settings_visibility_md;
-    g_available_screen_modes = g_available_screen_modes_md;
-    gwsnd_set_fill_query(sinkFillPermille);
-    while (true)
-    {
-        if (strlen(selectedRom) == 0 || reset == true)
-        {
-            menu("Pico-Genesis+", ErrorMessage, isFatalError, showSplash, ".md .bin", selectedRom);
+static void update_md_input(void) {
+    dmg_pad_t pad_in;
+    read_ui_buttons(&pad_in.up, &pad_in.down, &pad_in.left, &pad_in.right,
+                    &pad_in.a, &pad_in.b, &pad_in.select, &pad_in.start);
+
+    /* Combos:
+     * START + B: Pause Menu
+     * START + A: Toggle FPS Overlay
+     * SELECT + A: Toggle 1x / 2x speed
+     * SELECT + START: Exit to ROM selector (hold ~1 second)
+     * SELECT + UP / DOWN: Volume
+     *
+     * The SELECT+START exit is the one that needs the hold. GP8 is SELECT and it
+     * maps to Genesis Button C, so in an action game (Sonic 2 jump, Comix Zone
+     * attack) a press of C while START happens to be down would otherwise close
+     * the game instantly. 60 consecutive frames of deliberate hold is what makes
+     * it unambiguous; the shared layer counts those frames for all nine
+     * emulators rather than each keeping its own counter.
+     */
+    dmg_combo_events_t ev;
+    dmg_combo_frame(&pad_in, &s_md_desc, &ev);
+
+    if (ev.request_pause_menu) s_request_pause_menu = true;
+    if (ev.request_exit_game) {
+        s_request_exit_game = true;
+        printf("[I] Combo SELECT+START (held 1s): Exiting to menu\n");
+    }
+    if (ev.request_power_off) {
+        s_request_power_off = true;
+        s_power_reason = ev.power_reason;
+    }
+    if (ev.speed_toggled) {
+        printf("[I] Combo SELECT+A: speed = %s\n",
+               persistent_turbo_mode ? "2x" : "1x");
+    }
+
+    /* s_supress_input is not just "a combo fired this frame": it has to stay
+     * latched until every button is released, because the player is still
+     * holding the combo on the frames after the edge. Comparing against the raw
+     * pad is what detects the release. */
+    if (ev.request_pause_menu || ev.request_exit_game ||
+        ev.speed_toggled || ev.fps_toggled || dmg_combo_volume_active()) {
+        s_supress_input = true;
+    }
+
+    if (s_supress_input) {
+        if (!pad_in.start && !pad_in.b && !pad_in.select && !pad_in.a &&
+            !pad_in.up && !pad_in.down) {
+            s_supress_input = false;
         }
-#if !HSTX
-        if (settings.screenMode != ScreenMode::SCANLINE_1_1 && settings.screenMode != ScreenMode::NOSCANLINE_1_1)
-        {
-            settings.screenMode = ScreenMode::SCANLINE_1_1;
-            FrensSettings::savesettings();
-        }
-        scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
-#endif
+        button_state[0] = 0xFF;
+        button_state[1] = 0xFF;
+        button_state[2] = 0xFF;
+        return;
+    }
 
-        audio_enabled = settings.flags.audioEnabled;
-        size_t romSize = getSelectedRomSize(selectedRom);
+    uint8_t mapped = 0;
+    if (pad_in.up)    mapped |= (1u << PAD_UP);
+    if (pad_in.down)  mapped |= (1u << PAD_DOWN);
+    if (pad_in.left)  mapped |= (1u << PAD_LEFT);
+    if (pad_in.right) mapped |= (1u << PAD_RIGHT);
+    if (pad_in.b)     mapped |= (1u << PAD_B);      /* GP7 (B) -> Genesis B */
+    if (pad_in.select) mapped |= (1u << PAD_C);     /* GP8 (SELECT) -> Genesis C */
+    if (pad_in.a)     mapped |= (1u << PAD_A);      /* GP6 (A) -> Genesis A */
+    if (pad_in.start) mapped |= (1u << PAD_S);      /* GP9 (START) -> Genesis Start */
 
-        do
-        {
-            abSwapped = 0; // don't swap A and B buttons
-            reset = resetGame = false;
-            next_frame_time = 0; // Reset next frame time for FPS limiter
-            if (!isValidGenesisRom(ROM_FILE_ADDR, romSize, ErrorMessage, ERRORMESSAGESIZE))
-            {
-                printf("%s: %s\n", ErrorMessage, selectedRom);
-                reset = true;
-                break;
-            }
-            printf("Starting game (%d KB rom) rom@%p\n", (int)(romSize / 1024),
-                   (void *)ROM_FILE_ADDR);
-            /* Must precede init_emulator_mem(), which allocates the buffer
-               this sizes. */
-            gwsram_detect((const unsigned char *)ROM_FILE_ADDR, romSize);
-            if (!init_emulator_mem())
-            {
-                snprintf(ErrorMessage, 40, "Out of memory starting game");
-                printf("%s\n", ErrorMessage);
-                reset = true;
-                break;
-            }
-            load_cartridge((const unsigned char *)ROM_FILE_ADDR, romSize);
-            power_on();
+    button_state[0] = (unsigned char)~mapped;
+    button_state[1] = 0xFF;
+    button_state[2] = 0xFF;
+}
+
+extern "C" void gwenesis_io_get_buttons(void) {
+    /* Inputs are sampled and button_state is updated once per frame in run_game().
+     * Do NOT run update_md_input() inside 68k memory read handlers. */
+}
+
+/* PSRAM allocation for the C-side port code (buffers.c allocates the YM2612
+ * synthesis tables here).
+ *
+ * This was a stub returning nullptr, so gwsram_ensure_buffer()'s PSRAM
+ * fallback never actually ran: on a console build the cart save RAM had no
+ * place to go when the SRAM heap was full, and it silently reported "this game
+ * will run but cannot save".
+ *
+ * Frens::f_malloc is the allocator the PSRAM window was registered with (see
+ * PicoPlusPsram's constructor calling lwmem_assignmem); plain malloc() would
+ * come from the SRAM heap instead, which is the thing we are trying to avoid.
+ *
+ * One caveat worth keeping: f_malloc enters panic() when the request does not
+ * fit, rather than returning NULL, so callers must check the size first --
+ * md_load_rom_to_psram() does. */
+extern "C" void *gwsram_port_psram_alloc(size_t size) {
+    if (!Frens::isPsramEnabled()) {
+        return nullptr;
+    }
+    return Frens::f_malloc(size);
+}
+
+extern "C" int gwsram_port_psram_available(void) {
+    return Frens::isPsramEnabled() ? 1 : 0;
+}
+
+extern "C" void gwsram_port_psram_free(void *p) {
+    if (p && Frens::isPsramEnabled()) {
+        Frens::f_free(p);
+    }
+}
+
+/* =========================================================================
+ * Main Emulation Execution
+ * ========================================================================= */
+static void run_game(void) {
+    apply_safe_qmi_timing();
+    if (last_flashed_rom_size < 0x200) return;
+
+    const uint8_t *rom = s_rom_ptr;
+    if (!md_is_valid_rom(rom, last_flashed_rom_size)) {
+        printf("[E] Not a valid Genesis ROM (in %s)!\n",
+               s_rom_in_psram ? "PSRAM" : "flash");
+        return;
+    }
+
+    gwsram_detect(rom, last_flashed_rom_size);
+
+    if (!init_emulator_mem()) {
+        printf("[E] Failed to allocate emulator memory buffers!\n");
+        return;
+    }
+
+    load_cartridge(rom, last_flashed_rom_size);
+    power_on();
+    reset_emulation();
+    system_load_sram(selectedRom);
+
+    uint16_t *fb = (uint16_t *)ili9341_get_framebuffer();
+    gwenesis_vdp_set_buffer(fb);
+
+    dmg_boot_intro_finish();   /* no-op unless a resume intro is playing */
+    ili9341_clear_black();
+    ili9341_set_scale_mode(persistent_scale_mode);
+    ili9341_set_scanlines(persistent_scanlines_enabled);
+    ili9341_set_shimmerless(persistent_shimmerless_enabled);
+    ili9341_set_interleave(persistent_interleave);
+    ili9341_set_fps_overlay(persistent_display_fps, "60");
+    ili9341_blitter_start();
+
+    gwsnd_set_output(gwsnd_bridge_push);
+    gwsnd_set_bridge_sink(audioOutI2S);
+    gwsnd_set_fill_query(audio_i2s_get_fill_permille);
+    gwsnd_init(0, 1);
+    if (!gwsnd_is_offload_active()) {
+        printf("[WARN] Core 1 audio offload inactive, falling back to sync mode\n");
+        gwsnd_set_output(audioOutI2S);
+    }
+
+    s_request_pause_menu = false;
+    s_request_exit_game = false;
+    reset = false;
+    /* Drop any half-finished SELECT+START hold or closed edge latch left over
+     * from the previous game, plus the input suppression that goes with it. */
+    dmg_combo_reset();
+    s_supress_input = false;
+
+    uint32_t frame_start_us = time_us_32();
+    uint32_t fps_timer_us = time_us_32();
+    uint32_t frame_count = 0;
+
+    watchdog_enable(6000, false);
+
+    while (!s_request_exit_game) {
+        watchdog_update();
+
+        if (reset) {
             reset_emulation();
-            loadCartSram();
-            Frens::dumpHeapStats("game start"); /* peak usage, both heaps */
-            startAudioSinks();                  /* must precede gwsnd_init */
-            gwsnd_init(0 /* pal detected per frame */, HSTX);
-            emulate();
-            /* Covers both leaving the game and resetting it: the loop below
-               re-enters and reloads the file. */
-            saveCartSram();
-            gwsnd_shutdown();
-            free_emulator_mem();
-        } while (resetGame);
-
-        /* Release the ROM before returning to the menu. Holding it while
-           the menu allocates (RomLister, artwork) leaves those blocks
-           sitting above it in PSRAM, so freeing it later — inside
-           loadRomInPsRam, immediately before allocating the next one —
-           can leave no contiguous room for a larger ROM and f_malloc
-           panics. Freeing here keeps the arena defragmented across games.
-           Only valid with PSRAM: without it ROM_FILE_ADDR points into XIP
-           flash, which must never be passed to free(). */
-        if (Frens::isPsramEnabled() && ROM_FILE_ADDR)
-        {
-            Frens::f_free((void *)ROM_FILE_ADDR);
-            ROM_FILE_ADDR = 0;
+            reset = false;
         }
-        selectedRom[0] = 0;
-        showSplash = false;
+
+        update_md_input();
+
+        /* Power switch OFF (or battery cutoff): save at this frame boundary and
+         * sleep. Never returns -- the wake reboots back into the resume path. */
+        if (s_request_power_off) {
+            s_request_power_off = false;
+            ili9341_blitter_stop();
+            dmg_power_off_with_resume(&s_md_desc, (dmg_power_reason_t)s_power_reason);
+        }
+
+        if (s_request_pause_menu) {
+            s_request_pause_menu = false;
+            ingame_action_e action = show_ingame_menu(selectedRom);
+            if (action == INGAME_ACTION_EXIT) {
+                s_request_exit_game = true;
+                break;
+            } else if (action == INGAME_ACTION_RESET) {
+                reset = true;
+            }
+            ili9341_clear_black();
+            ili9341_set_scale_mode(persistent_scale_mode);
+            ili9341_set_scanlines(persistent_scanlines_enabled);
+            ili9341_set_shimmerless(persistent_shimmerless_enabled);
+            ili9341_set_interleave(persistent_interleave);
+            gwenesis_vdp_set_buffer(fb);
+            ili9341_blitter_start();
+            watchdog_update();
+            frame_start_us = time_us_32();
+        }
+
+        /* Gwenesis Frame Step */
+        const bool is_pal = (gwenesis_vdp_status & 1) != 0;
+        gwsnd_set_pal(is_pal ? 1 : 0);
+        screen_height = REG1_PAL ? 240 : 224;
+        screen_width = (persistent_force_h32 || !REG12_MODE_H40) ? 256 : 320;
+        const int lines_per_frame = is_pal ? LINES_PER_FRAME_PAL : LINES_PER_FRAME_NTSC;
+        int hint_counter = gwenesis_vdp_regs[10];
+
+        /* Frameskip evaluation */
+        static bool s_skip_next_render = false;
+        static bool s_skip_phase = false;
+        bool render_this_frame = true;
+
+        if (persistent_frameskip_mode == FRAMESKIP_ON) {
+            s_skip_phase = !s_skip_phase;
+            render_this_frame = !s_skip_phase;
+        } else if (persistent_frameskip_mode == FRAMESKIP_AUTO) {
+            if (s_skip_next_render) {
+                render_this_frame = false;
+                s_skip_next_render = false;
+            } else {
+                render_this_frame = true;
+            }
+        } else {
+            render_this_frame = true;
+        }
+
+        gwenesis_vdp_render_config();
+        ili9341_md_set_geometry(screen_width, screen_height);
+        system_clock = 0;
+        zclk = 0;
+        scan_line = 0;
+
+        while (scan_line < lines_per_frame) {
+            m68k_run(system_clock + VDP_CYCLES_PER_LINE);
+            z80_run(system_clock + VDP_CYCLES_PER_LINE);
+            gwsnd_line_tick(system_clock + VDP_CYCLES_PER_LINE);
+
+            if (scan_line < screen_height) {
+                if (render_this_frame && md_line_active[scan_line]) {
+                    gwenesis_vdp_render_line(scan_line);
+                    ili9341_stream_md_line_fast(md_line_dst_row[scan_line], &fb[scan_line * 320]);
+                }
+            }
+
+            /* On line 0, reload counter. On VBLANK lines (>= screen_height), reload counter and NEVER fire H-INT! */
+            if (scan_line == 0 || scan_line >= screen_height) {
+                hint_counter = REG10_LINE_COUNTER;
+            } else {
+                /* Active display scanlines 1 to screen_height - 1 */
+                if (--hint_counter < 0) {
+                    if (REG0_LINE_INTERRUPT != 0) {
+                        hint_pending = 1;
+                        if ((gwenesis_vdp_status & STATUS_VIRQPENDING) == 0)
+                            m68k_update_irq(4);
+                    }
+                    hint_counter = REG10_LINE_COUNTER;
+                }
+            }
+
+            scan_line++;
+            if (scan_line == screen_height) {
+                if (REG1_VBLANK_INTERRUPT != 0) {
+                    gwenesis_vdp_status |= STATUS_VIRQPENDING;
+                    m68k_set_irq(6);
+                }
+                z80_irq_line(1);
+            }
+            if (scan_line == screen_height + 1) {
+                z80_irq_line(0);
+            }
+
+            system_clock += VDP_CYCLES_PER_LINE;
+        }
+
+        if (render_this_frame) {
+            ili9341_stream_md_frame_end();
+        }
+        gwsnd_frame_end(system_clock);
+        m68k.cycles -= system_clock;
+        frame_counter++;
+        frame_count++;
+
+        /* Standby wake: put the game back where the switch left it, now that one
+         * frame has run, through the same steps the pause menu's Load State
+         * takes. Loading before the loop (as before) diverged from that path:
+         * the sound engine or the pacing came up wrong (no audio on the MD,
+         * slow SMS/WS) until a Reset. */
+        if (s_resume_pending) {
+            s_resume_pending = false;
+            ili9341_blitter_stop();
+            const bool resumed = md_load_state(selectedRom, DMG_RESUME_SLOT);
+            printf("[resume] state %s\n", resumed ? "restored" : "missing, starting fresh");
+            ili9341_clear_black();
+            ili9341_set_scale_mode(persistent_scale_mode);
+            ili9341_set_scanlines(persistent_scanlines_enabled);
+            ili9341_set_shimmerless(persistent_shimmerless_enabled);
+            ili9341_set_interleave(persistent_interleave);
+            gwenesis_vdp_set_buffer(fb);
+            ili9341_blitter_start();
+            watchdog_update();
+            frame_start_us = time_us_32();
+            dmg_resume_consume();
+            dmg_power_arm_menu_loaded(1000);
+        }
+
+        /* FPS calculation */
+        uint32_t now = time_us_32();
+        if (now - fps_timer_us >= 1000000u) {
+            fps = frame_count;
+            frame_count = 0;
+            fps_timer_us = now;
+            snprintf(fpsString, sizeof(fpsString), "%lu", (unsigned long)fps);
+            if (persistent_display_fps) {
+                ili9341_set_fps_overlay(true, fpsString);
+            }
+        }
+
+        /* Frame Pacing (59.92 Hz NTSC / 50 Hz PAL) */
+        uint32_t frame_budget = is_pal ? 20000u : 16687u;
+        if (persistent_turbo_mode) frame_budget /= 2;
+
+        uint32_t elapsed = time_us_32() - frame_start_us;
+        if (elapsed < frame_budget) {
+            busy_wait_us_32(frame_budget - elapsed);
+        }
+
+        /* Adaptive auto-frameskip safety net */
+        static bool s_last_frame_skipped = false;
+        if (persistent_frameskip_mode == FRAMESKIP_AUTO) {
+            bool need_skip = false;
+            int fill = audio_i2s_get_fill_permille();
+            if (!persistent_turbo_mode) {
+                if (persistent_volume_level > 0 && fill < 100) {
+                    need_skip = true;
+                } else if (!s_last_frame_skipped && (elapsed >= (is_pal ? 24000u : 18500u))) {
+                    need_skip = true;
+                }
+            }
+            if (need_skip) {
+                s_skip_next_render = true;
+                s_last_frame_skipped = true;
+            } else {
+                s_skip_next_render = false;
+                s_last_frame_skipped = false;
+            }
+        } else {
+            s_skip_next_render = false;
+            s_last_frame_skipped = false;
+        }
+        frame_start_us = time_us_32();
+    }
+
+    watchdog_disable();
+
+    gwsnd_shutdown();
+    ili9341_blitter_stop();
+    system_save_sram(selectedRom);
+    free_emulator_mem();
+    ili9341_clear_black();
+}
+
+/* =========================================================================
+ * Main Entry Point
+ * ========================================================================= */
+int main(void) {
+    vreg_set_voltage(VREG_VOLTAGE_1_35);
+    set_sys_clock_khz(CPUFreqKHz, true);
+    apply_safe_qmi_timing();
+
+    /* Decouple SPI peripheral clock from CPU overclock (378 MHz):
+     * Route clk_peri to PLL_USB at 144 MHz (VCO 864 MHz, postdiv 6*1 = 6)
+     * so divisor 2 gives an exact 72.0 MHz for display, and standard <= 20 MHz for SD card. */
+    clock_configure(
+        clk_peri,
+        0,
+        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+        clock_get_hz(clk_sys),
+        clock_get_hz(clk_sys)
+    );
+    pll_init(pll_usb, 1, 864 * MHZ, 6, 1);
+    clock_configure(
+        clk_peri,
+        0,
+        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+        144 * MHZ,
+        144 * MHZ
+    );
+
+    stdio_init_all();
+    init_ui_buttons();
+
+    selectedRom[0] = '\0';
+    ErrorMessage[0] = '\0';
+
+    FrensSettings::initSettings(FrensSettings::emulators::GENESIS);
+    isFatalError = !Frens::initAll(selectedRom, CPUFreqKHz, 0, 0, 1024, false, true);
+
+#if USE_ILI9341
+    ili9341_init();
+    dmg_init_boot_mode();
+    load_emulator_config();
+    set_backlight_brightness(persistent_brightness_level);
+    ili9341_set_scale_mode(persistent_scale_mode);
+    ili9341_set_scanlines(persistent_scanlines_enabled);
+    ili9341_set_shimmerless(persistent_shimmerless_enabled);
+    ili9341_set_interleave(persistent_interleave);
+    ili9341_clear_black();
+#endif
+
+    gwsnd_set_output(audioOutI2S);
+    ensure_save_directories();
+
+    /* Standby by save state: the power switch saves and sleeps instead of
+     * idling awake, and a wake reboots back here. On a game wake the
+     * bootloader skipped its intro; play it on core 1 while this core
+     * loads the ROM, then restore the _R state before the first frame. */
+    dmg_power_enable_resume(&s_md_desc);
+    {
+        dmg_resume_record_t rec;
+        const dmg_resume_kind_t rk = dmg_resume_check(&s_md_desc, &rec);
+        if (rk == DMG_RESUME_GAME) {
+            dmg_boot_intro_start(&s_md_desc);
+            snprintf(selectedRom, sizeof(selectedRom), "%s", rec.rom_file);
+            s_resume_pending = true;
+        } else if (rk == DMG_RESUME_MENU) {
+            dmg_resume_consume();
+            /* Woke in the ROM selector: nothing to load, so the bootloader's
+             * intro just plays out before the list is drawn. */
+            if (dmg_boot_intro_start(&s_md_desc)) dmg_boot_intro_finish();
+        }
+    }
+
+    printf("\n==================================================\n");
+    printf("  %s Sega Mega Drive / Genesis for RP2350\n", APP_TITLE);
+    printf("  CPU: %lu MHz | Display: ILI9341 (320x240 @ 60 FPS)\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+    printf("==================================================\n\n");
+
+    while (true) {
+        if (s_resume_pending || rom_file_selector(selectedRom, sizeof(selectedRom))) {
+            if (load_cart_rom_file(selectedRom)) {
+                /* The config file is the source of truth for how the game is
+                 * displayed, so it is re-read when a game is entered, not only at
+                 * boot. Safe to repeat because every menu visit commits first, so
+                 * the file always matches what was on screen when the menu closed.
+                 */
+                load_emulator_config();
+                set_backlight_brightness(persistent_brightness_level);
+                ili9341_set_scale_mode(persistent_scale_mode);
+                ili9341_set_scanlines(persistent_scanlines_enabled);
+                ili9341_set_shimmerless(persistent_shimmerless_enabled);
+                ili9341_set_interleave(persistent_interleave);
+                dmg_power_set_game(selectedRom, selectedRom);
+                run_game();
+                dmg_power_set_game(NULL, NULL);
+                if (s_resume_pending) {   /* run_game() bailed before the state */
+                    s_resume_pending = false;
+                    dmg_resume_consume();
+                }
+                dmg_boot_intro_finish();
+            } else {
+                if (s_resume_pending) {
+                    s_resume_pending = false;
+                    dmg_resume_consume();
+                }
+                dmg_boot_intro_finish();
+                sleep_ms(1500);
+            }
+        }
     }
 
     return 0;

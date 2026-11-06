@@ -526,7 +526,7 @@ int GetRunCyclesZ80(register Z80 *R)
 {
   return(R->ICount - R->RunCycles);
 }
-int ExecZ80(register Z80 *R,register int RunCycles)
+int GW_SRAM_FUNC(ExecZ80)(register Z80 *R,register int RunCycles)
 {
   register byte I;
   register pair J;
