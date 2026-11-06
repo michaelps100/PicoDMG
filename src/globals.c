@@ -168,8 +168,7 @@ bool8 finishedFrame = false;
 
 SoundStatus so;
 SSoundData SoundData;
-int Echo [24000];
-int DummyEchoBuffer [SOUND_BUFFER_SIZE];
+short Echo [8000] __attribute__((section(".xip_ram")));
 int MixBuffer [SOUND_BUFFER_SIZE];
 int EchoBuffer [SOUND_BUFFER_SIZE];
 int FilterTaps [8];
@@ -245,7 +244,7 @@ uint8 BGSizes [2] =
 {
    8, 16
 };
-uint32 DirectColourMaps [8][256];
+uint16 DirectColourMaps [8][256];
 
 long FilterValues[4][2] =
 {

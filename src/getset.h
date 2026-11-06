@@ -504,9 +504,9 @@ static INLINE uint8* GetBasePointer(uint32 Address)
    switch ((intptr_t) GetAddress)
    {
    case MAP_PPU:
-      return (Memory.FillRAM - 0x2000);
+      return (Memory.FillRAM);
    case MAP_CPU:
-      return (Memory.FillRAM - 0x4000);
+      return (Memory.FillRAM);
    case MAP_DSP:
       return (Memory.FillRAM - 0x6000);
    case MAP_SA1RAM:
@@ -543,14 +543,14 @@ static INLINE uint8* S9xGetMemPointer(uint32 Address)
    switch ((intptr_t) GetAddress)
    {
    case MAP_PPU:
-      return (Memory.FillRAM - 0x2000 + (Address & 0xffff));
+      return (Memory.FillRAM + (Address & 0xffff));
    case MAP_CPU:
-      return (Memory.FillRAM - 0x4000 + (Address & 0xffff));
+      return (Memory.FillRAM + (Address & 0xffff));
    case MAP_DSP:
       return (Memory.FillRAM - 0x6000 + (Address & 0xffff));
    case MAP_SA1RAM:
    case MAP_LOROM_SRAM:
-      return (Memory.SRAM + (Address & 0xffff));
+      return (Memory.SRAM + ((Address & 0xffff) & Memory.SRAMMask));
    case MAP_BWRAM:
       return (Memory.BWRAM - 0x6000 + (Address & 0xffff));
    case MAP_HIROM_SRAM:

@@ -54,11 +54,6 @@
 #include "sa1.h"
 #endif
 
-//SDD1
-#include "sdd1emu.h"
-uint8 buffer[0x10000];
-//SDD1//
-
 extern int HDMA_ModeByteCounts [8];
 extern uint8* HDMAMemPointers [8];
 extern uint8* HDMABasePointers [8];
@@ -111,6 +106,7 @@ void S9xDoDMA(uint8 Channel)
       break;
    }
 
+#if 0
    if (Settings.SDD1)
    {
       if (d->AAddressFixed && Memory.FillRAM [0x4801] > 0)
@@ -127,8 +123,9 @@ void S9xDoDMA(uint8 Channel)
             uint8* in_ptr = GetBasePointer(((d->ABank << 16) | d->AAddress));
             in_ptr += d->AAddress;
 
-            SDD1_decompress(buffer, in_ptr, d->TransferBytes);
-            in_sdd1_dma = buffer;
+            uint8* sdd1_buf = get_sdd1_buffer();
+            SDD1_decompress(sdd1_buf, in_ptr, d->TransferBytes);
+            in_sdd1_dma = sdd1_buf;
          }
          else
          {
@@ -141,6 +138,7 @@ void S9xDoDMA(uint8 Channel)
 
       Memory.FillRAM [0x4801] = 0;
    }
+#endif
 
 #ifdef USE_SA1
    if (d->BAddress == 0x18 && SA1.in_char_dma && (d->ABank & 0xf0) == 0x40)
@@ -623,10 +621,7 @@ void S9xDoDMA(uint8 Channel)
       while (count);
    }
 
-   //#ifdef SPC700_C
-#ifdef SPC700_SHUTDOWN
    CPU.APU_APUExecuting = Settings.APUEnabled;
-#endif
    asm_APU_EXECUTE(1); // execute but only in normal mode
    //#endif
    while (CPU.Cycles > CPU.NextEvent)
@@ -652,10 +647,10 @@ update_address:
 void S9xStartHDMA(void)
 {
    uint8 i;
-   //if (Settings.DisableHDMA)
-   //IPPU.HDMA = 0;
-   //else
    missing.hdma_this_frame = IPPU.HDMA = Memory.FillRAM [0x420c];
+
+   if (IPPU.HDMA != 0)
+      CPU.Cycles += ONE_CYCLE * 3;
 
    IPPU.HDMAStarted = TRUE;
 
@@ -663,21 +658,26 @@ void S9xStartHDMA(void)
    {
       if (IPPU.HDMA & (1 << i))
       {
+         CPU.Cycles += SLOW_ONE_CYCLE;
          DMA [i].LineCount = 0;
          DMA [i].FirstLine = TRUE;
          DMA [i].Address = DMA [i].AAddress;
+         if (DMA[i].HDMAIndirectAddressing)
+            CPU.Cycles += (SLOW_ONE_CYCLE << 2);
       }
       HDMAMemPointers [i] = NULL;
    }
 }
 
-uint8 S9xDoHDMA(uint8 byte)
+uint8 __not_in_flash_func(S9xDoHDMA)(uint8 byte)
 {
    SDMA* p = &DMA [0];
-
    int d = 0;
-
    uint8 mask;
+
+   CPU.InDMA = TRUE;
+   CPU.Cycles += ONE_CYCLE * 3;
+
    for (mask = 1; mask; mask <<= 1, p++, d++)
    {
       if (byte & mask)
@@ -685,6 +685,7 @@ uint8 S9xDoHDMA(uint8 byte)
          if (!p->LineCount)
          {
             uint8 line;
+            CPU.Cycles += SLOW_ONE_CYCLE;
             line = S9xGetByte((p->ABank << 16) + p->Address);
             if (line == 0x80)
             {
@@ -701,9 +702,6 @@ uint8 S9xDoHDMA(uint8 byte)
             if (!p->LineCount || p->BAddress == 0x18)
             {
                byte &= ~mask;
-               p->IndirectAddress += HDMAMemPointers [d] - HDMABasePointers [d];
-               Memory.FillRAM [0x4305 + (d << 4)] = (uint8) p->IndirectAddress;
-               Memory.FillRAM [0x4306 + (d << 4)] = p->IndirectAddress >> 8;
                continue;
             }
 
@@ -712,6 +710,7 @@ uint8 S9xDoHDMA(uint8 byte)
             if (p->HDMAIndirectAddressing)
             {
                p->IndirectBank = Memory.FillRAM [0x4307 + (d << 4)];
+               CPU.Cycles += SLOW_ONE_CYCLE << 2;
                p->IndirectAddress = S9xGetWord((p->ABank << 16) + p->Address);
                p->Address += 2;
             }
@@ -721,28 +720,24 @@ uint8 S9xDoHDMA(uint8 byte)
                p->IndirectAddress = p->Address;
             }
             HDMABasePointers [d] = HDMAMemPointers [d] =
-                                      S9xGetMemPointer((p->IndirectBank << 16) + p->IndirectAddress);
+               S9xGetMemPointer((p->IndirectBank << 16) + p->IndirectAddress);
          }
          else
+            CPU.Cycles += SLOW_ONE_CYCLE;
+
+         if (!HDMAMemPointers [d])
          {
-
-            if (!HDMAMemPointers [d])
+            if (!p->HDMAIndirectAddressing)
             {
-               if (!p->HDMAIndirectAddressing)
-               {
-                  p->IndirectBank = p->ABank;
-                  p->IndirectAddress = p->Address;
-               }
+               p->IndirectBank = p->ABank;
+               p->IndirectAddress = p->Address;
+            }
 
-               if (!(HDMABasePointers [d] = HDMAMemPointers [d] =
-                                               S9xGetMemPointer((p->IndirectBank << 16) + p->IndirectAddress)))
-               {
-                  byte &= ~mask;
-                  continue;
-               }
-               // Uncommenting the following line breaks Punchout - it starts
-               // H-DMA during the frame.
-               //p->FirstLine = TRUE;
+            if (!(HDMABasePointers [d] = HDMAMemPointers [d] =
+                  S9xGetMemPointer((p->IndirectBank << 16) + p->IndirectAddress)))
+            {
+               byte &= ~mask;
+               continue;
             }
          }
          if (p->Repeat && !p->FirstLine)
@@ -810,10 +805,17 @@ uint8 S9xDoHDMA(uint8 byte)
          }
          if (!p->HDMAIndirectAddressing)
             p->Address += HDMA_ModeByteCounts [p->TransferMode];
+         p->IndirectAddress += HDMA_ModeByteCounts [p->TransferMode];
+         if (p->HDMAIndirectAddressing)
+         {
+            Memory.FillRAM [0x4305 + (d << 4)] = (uint8) p->IndirectAddress;
+            Memory.FillRAM [0x4306 + (d << 4)] = p->IndirectAddress >> 8;
+         }
          p->FirstLine = FALSE;
          p->LineCount--;
       }
    }
+   CPU.InDMA = FALSE;
    return (byte);
 }
 

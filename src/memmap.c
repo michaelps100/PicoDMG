@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
  *
  * (c) Copyright 1996 - 2001 Gary Henderson (gary.henderson@ntlworld.com) and
@@ -47,6 +47,7 @@
 
 #include "snes9x.h"
 #include "memmap.h"
+#include "pico_snes_mem.h"
 #include "cpuexec.h"
 #include "ppu.h"
 #include "display.h"
@@ -59,7 +60,7 @@
 #include "fxemu.h"
 extern FxInit_s SuperFX;
 
-static uint8 bytes0x2000 [0x2000];
+#define bytes0x2000 (&Memory.FillRAM[0x6000])
 
 extern bool8  ROMAPUEnabled;
 
@@ -169,41 +170,54 @@ static char *Safe (const char *s)
 /* Init()                                                                                     */
 /* This function allocates all the memory needed by the emulator                              */
 /**********************************************************************************************/
+#define SNES_FLASH_ROM_ABS (0x10080000u + 0x180000u)
+
+/* Set by the port when the cartridge is ALREADY in Memory.ROM but not in the
+ * flash XIP window -- i.e. it lives in PSRAM.
+ *
+ * LoadROM() recognised "already loaded" solely by comparing Memory.ROM against
+ * SNES_FLASH_ROM_ABS, so a PSRAM cartridge failed that test and fell into the
+ * file-reading branch. That branch re-opens the ROM through S9xGetFilename --
+ * which points at the SAVES directory, not the ROMS one -- and then memsets from
+ * the end of the ROM out to MAX_ROM_SIZE. That memset is roughly 4.7 MB written
+ * into PSRAM, which is what stopped the load.
+ *
+ * With this set, the fast path is taken and neither the re-read nor the memset
+ * happens.
+ *
+ * File scope on purpose: next to the line above there is a *local*
+ * `extern uint32_t s_flashed_rom_size;` inside LoadROM(), so defining this next
+ * to it would make it a local and leave the references unresolved. */
+bool8_32 s_rom_preloaded = FALSE;
+
 bool8_32 MemoryInit ()
 {
-    Memory.RAM	    = (uint8 *) malloc (0x20000);
-    Memory.SRAM    = (uint8 *) malloc (0x20000);
-    Memory.VRAM    = (uint8 *) malloc (0x10000);
-    Memory.ROM     = (uint8 *) malloc (MAX_ROM_SIZE + 0x200 + 0x8000);
-    Memory.FillRAM = NULL;
+    pico_snes_init_memory();
 
-    IPPU.TileCache [TILE_2BIT] = (uint8 *) malloc (MAX_2BIT_TILES * 128);
-    IPPU.TileCache [TILE_4BIT] = (uint8 *) malloc (MAX_4BIT_TILES * 128);
-    IPPU.TileCache [TILE_8BIT] = (uint8 *) malloc (MAX_8BIT_TILES * 128);
-    
-    IPPU.TileCached [TILE_2BIT] = (uint8 *) malloc (MAX_2BIT_TILES);
-    IPPU.TileCached [TILE_4BIT] = (uint8 *) malloc (MAX_4BIT_TILES);
-    IPPU.TileCached [TILE_8BIT] = (uint8 *) malloc (MAX_8BIT_TILES);
-    
-    if (!Memory.RAM || !Memory.SRAM || !Memory.VRAM || !Memory.ROM ||
-        !IPPU.TileCache [TILE_2BIT] || !IPPU.TileCache [TILE_4BIT] ||
-	!IPPU.TileCache [TILE_8BIT] || !IPPU.TileCached [TILE_2BIT] ||
-	!IPPU.TileCached [TILE_4BIT] ||	!IPPU.TileCached [TILE_8BIT])
-    {
-	MemoryDeinit ();
-	return (FALSE);
+    Memory.RAM	    = pico_snes_get_wram();
+    Memory.SRAM     = pico_snes_get_sram();
+    Memory.VRAM     = pico_snes_get_vram();
+    Memory.FillRAM  = pico_snes_get_fillram();
+
+#if USE_PSRAM
+    if (pico_snes_has_psram()) {
+        Memory.ROM  = (uint8 *) 0x11000000;
+    } else {
+        Memory.ROM  = (uint8 *) SNES_FLASH_ROM_ABS;
     }
-	
-    // FillRAM uses first 32K of ROM image area, otherwise space just
-    // wasted. Might be read by the SuperFX code.
+#else
+    Memory.ROM      = (uint8 *) SNES_FLASH_ROM_ABS;
+#endif
 
-    Memory.FillRAM = Memory.ROM;
+    IPPU.TileCache [TILE_2BIT] = pico_snes_get_tilecache(TILE_2BIT);
+    IPPU.TileCache [TILE_4BIT] = pico_snes_get_tilecache(TILE_4BIT);
+    IPPU.TileCache [TILE_8BIT] = pico_snes_get_tilecache(TILE_8BIT);
 
-    // Add 0x8000 to ROM image pointer to stop SuperFX code accessing
-    // unallocated memory (can cause crash on some ports).
-    Memory.ROM += 0x8000;
+    IPPU.TileCached [TILE_2BIT] = pico_snes_get_tilecached(TILE_2BIT);
+    IPPU.TileCached [TILE_4BIT] = pico_snes_get_tilecached(TILE_4BIT);
+    IPPU.TileCached [TILE_8BIT] = pico_snes_get_tilecached(TILE_8BIT);
 
-    Memory.C4RAM    = Memory.ROM + 0x400000 + 8192 * 8;
+    Memory.C4RAM    = Memory.RAM;
     ROM    = Memory.ROM;
     SRAM   = Memory.SRAM;
     RegRAM = Memory.FillRAM;
@@ -214,76 +228,40 @@ bool8_32 MemoryInit ()
     SuperFX.nRomBanks = (2 * 1024 * 1024) / (32 * 1024);
     SuperFX.pvRom = (uint8 *) Memory.ROM;
 
-    memset (IPPU.TileCached [TILE_2BIT], 0, MAX_2BIT_TILES);
-    memset (IPPU.TileCached [TILE_4BIT], 0, MAX_4BIT_TILES);
-    memset (IPPU.TileCached [TILE_8BIT], 0, MAX_8BIT_TILES);
-    
+    memset (IPPU.TileCached [TILE_2BIT], 0, 4096);
+    memset (IPPU.TileCached [TILE_4BIT], 0, 2048);
+    memset (IPPU.TileCached [TILE_8BIT], 0, 1024);
+
     Memory.SDD1Data = NULL;
     Memory.SDD1Index = NULL;
+
+    if (!S9xInitAPU())
+    {
+        return (FALSE);
+    }
 
     return (TRUE);
 }
 
 void MemoryDeinit ()
 {
-    if (Memory.RAM)
-    {
-	free ((char *) Memory.RAM);
-	Memory.RAM = NULL;
-    }
-    if (Memory.SRAM)
-    {
-	free ((char *) Memory.SRAM);
-	Memory.SRAM = NULL;
-    }
-    if (Memory.VRAM)
-    {
-	free ((char *) Memory.VRAM);
-	Memory.VRAM = NULL;
-    }
-    if (Memory.ROM)
-    {
-	Memory.ROM -= 0x8000;
-	free ((char *) Memory.ROM);
-	Memory.ROM = NULL;
-    }
+    S9xDeinitAPU();
 
-    if (IPPU.TileCache [TILE_2BIT])
-    {
-	free ((char *) IPPU.TileCache [TILE_2BIT]);
-	IPPU.TileCache [TILE_2BIT] = NULL;
-    }
-    if (IPPU.TileCache [TILE_4BIT])
-    {
-	free ((char *) IPPU.TileCache [TILE_4BIT]);
-	IPPU.TileCache [TILE_4BIT] = NULL;
-    }
-    if (IPPU.TileCache [TILE_8BIT])
-    {
-	free ((char *) IPPU.TileCache [TILE_8BIT]);
-	IPPU.TileCache [TILE_8BIT] = NULL;
-    }
+    Memory.RAM = NULL;
+    Memory.SRAM = NULL;
+    Memory.VRAM = NULL;
+    Memory.ROM = NULL;
+    Memory.FillRAM = NULL;
 
-    if (IPPU.TileCached [TILE_2BIT])
-    {
-	free ((char *) IPPU.TileCached [TILE_2BIT]);
-	IPPU.TileCached [TILE_2BIT] = NULL;
-    }
-    if (IPPU.TileCached [TILE_4BIT])
-    {
-	free ((char *) IPPU.TileCached [TILE_4BIT]);
-	IPPU.TileCached [TILE_4BIT] = NULL;
-    }
-    if (IPPU.TileCached [TILE_8BIT])
-    {
-	free ((char *) IPPU.TileCached [TILE_8BIT]);
-	IPPU.TileCached [TILE_8BIT] = NULL;
-    }
+    IPPU.TileCache [TILE_2BIT] = NULL;
+    IPPU.TileCache [TILE_4BIT] = NULL;
+    IPPU.TileCache [TILE_8BIT] = NULL;
+
+    IPPU.TileCached [TILE_2BIT] = NULL;
+    IPPU.TileCached [TILE_4BIT] = NULL;
+    IPPU.TileCached [TILE_8BIT] = NULL;
 
     FreeSDD1Data ();
-
-    /* Ensure that we free the static char
-     * array allocated by Safe() */
     Safe(NULL);
 }
 
@@ -323,51 +301,67 @@ bool8_32 LoadROM (void)
    CPU.TriedInterleavedMode2 = FALSE;
 
    Memory.CalculatedSize = 0;
-again:
+   extern uint32_t s_flashed_rom_size;
+   if (s_rom_preloaded || (s_flashed_rom_size > 0 && Memory.ROM == (uint8*)SNES_FLASH_ROM_ABS))
    {
-      int calc_size;
-      uint8 *ptr;
-
-      if ((ROMFile = OPEN_STREAM ("rb")) == NULL)
-         return (FALSE);
-
-      Memory.HeaderCount = 0;
-      ptr      = Memory.ROM;
-
-      FileSize = READ_STREAM (ptr, MAX_ROM_SIZE + 0x200 - (ptr - Memory.ROM), ROMFile);
-      CLOSE_STREAM (ROMFile);
-      calc_size = (FileSize / 0x2000) * 0x2000;
-
-      if ((FileSize - calc_size == 512 && !Settings.ForceNoHeader) ||
-            Settings.ForceHeader)
+       TotalFileSize = s_flashed_rom_size;
+       Memory.HeaderCount = 0;
+   }
+   else
+   {
+again:
       {
-         memmove (ptr, ptr + 512, calc_size);
-         Memory.HeaderCount++;
-         FileSize -= 512;
+         int calc_size;
+         uint8 *ptr;
+
+         if ((ROMFile = OPEN_STREAM ("rb")) == NULL)
+            return (FALSE);
+
+         Memory.HeaderCount = 0;
+         ptr      = Memory.ROM;
+
+         FileSize = READ_STREAM (ptr, MAX_ROM_SIZE + 0x200 - (ptr - Memory.ROM), ROMFile);
+         CLOSE_STREAM (ROMFile);
+         calc_size = (FileSize / 0x2000) * 0x2000;
+
+         if ((FileSize - calc_size == 512 && !Settings.ForceNoHeader) ||
+               Settings.ForceHeader)
+         {
+            memmove (ptr, ptr + 512, calc_size);
+            Memory.HeaderCount++;
+            FileSize -= 512;
+         }
+         ptr           += FileSize;
+         TotalFileSize += FileSize;
       }
-      ptr           += FileSize;
-      TotalFileSize += FileSize;
    }
 
    hi_score = ScoreHiROM (FALSE);
    lo_score = ScoreLoROM (FALSE);
 
-   if (Memory.HeaderCount == 0 && !Settings.ForceNoHeader &&
-         ((hi_score > lo_score && ScoreHiROM (TRUE) > hi_score) ||
-          (hi_score <= lo_score && ScoreLoROM (TRUE) > lo_score)))
+   if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS)
    {
-      memmove (Memory.ROM, Memory.ROM + 512, TotalFileSize - 512);
-      TotalFileSize -= 512;
-      S9xMessage (S9X_INFO, S9X_HEADER_WARNING, 
-            "Try specifying the -nhd command line option if the game doesn't work\n");
+      if (Memory.HeaderCount == 0 && !Settings.ForceNoHeader &&
+            ((hi_score > lo_score && ScoreHiROM (TRUE) > hi_score) ||
+             (hi_score <= lo_score && ScoreLoROM (TRUE) > lo_score)))
+      {
+         memmove (Memory.ROM, Memory.ROM + 512, TotalFileSize - 512);
+         TotalFileSize -= 512;
+         S9xMessage (S9X_INFO, S9X_HEADER_WARNING, 
+               "Try specifying the -nhd command line option if the game doesn't work\n");
+      }
    }
 
    Memory.CalculatedSize = (TotalFileSize / 0x2000) * 0x2000;
-   memset (Memory.ROM + Memory.CalculatedSize, 0, MAX_ROM_SIZE - Memory.CalculatedSize);
+   if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS)
+   {
+      memset (Memory.ROM + Memory.CalculatedSize, 0, MAX_ROM_SIZE - Memory.CalculatedSize);
+   }
 
    // Check for altered DAIKAIJYUMONOGATARI2
 
-   if (Memory.CalculatedSize == 0x500000 &&
+   if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS &&
+         Memory.CalculatedSize == 0x500000 &&
          strncmp ((const char *)&Memory.ROM [0x40ffc0], "DAIKAIJYUMONOGATARI2", 20) == 0 &&
          strncmp ((const char *)&Memory.ROM [0x40ffb0], "18AE6J", 6) == 0 &&
          memcmp (&Memory.ROM[0x40ffb0], &Memory.ROM [0xffb0], 0x30))
@@ -447,7 +441,8 @@ again:
             Interleaved = FALSE;
          }
          else 
-            if (Memory.CalculatedSize == 0x100000 &&
+            if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS &&
+                  Memory.CalculatedSize == 0x100000 &&
                   strncmp ((char *) &Memory.ROM [0xffc0], "WWF SUPER WRESTLEMANIA", 22) == 0)
             {
                int cvcount;
@@ -464,7 +459,7 @@ again:
             }
    }
 
-   if (!Settings.ForceNotInterleaved && Interleaved)
+   if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS && !Settings.ForceNotInterleaved && Interleaved)
    {
       uint8 *tmp;
       int nblocks;
@@ -544,10 +539,11 @@ again:
       hi_score = ScoreHiROM (FALSE);
       lo_score = ScoreLoROM (FALSE);
 
-      if ((Memory.HiROM &&
-               (lo_score >= hi_score || hi_score < 0)) ||
-            (Memory.LoROM &&
-             (hi_score > lo_score || lo_score < 0)))
+      if (!s_rom_preloaded && Memory.ROM != (uint8*)SNES_FLASH_ROM_ABS &&
+          ((Memory.HiROM &&
+                (lo_score >= hi_score || hi_score < 0)) ||
+             (Memory.LoROM &&
+              (hi_score > lo_score || lo_score < 0))))
       {
          if (retry_count == 0)
          {
@@ -573,6 +569,9 @@ again:
 
 void S9xDeinterleaveMode2(void)
 {
+   if (s_rom_preloaded || Memory.ROM == (uint8*)SNES_FLASH_ROM_ABS)
+      return;
+
    int nblocks;
    int step = 64;
    uint8 blocks [256];
@@ -792,8 +791,8 @@ void InitROM (bool8_32 Interleaved)
                            {
                               AlphaROMMap ();
                            }
-                           else
-                              LoROMMap ();
+                            else
+                               LoROMMap ();
    }
 
    size = Memory.CalculatedSize;
@@ -975,6 +974,8 @@ void MapExtraRAM(void)
       Memory.BlockIsROM [c + 0x730] = FALSE;
    }
 }
+
+
 
 void LoROMMap ()
 {
@@ -1979,12 +1980,12 @@ void ApplyROMFixes ()
 	strncmp (Memory.ROMId, "APB", 3) == 0 ||
 	((strncmp (Memory.ROMName, "Parlor", 6) == 0 ||
           strcmp (Memory.ROMName, "HEIWA PARLOR!MINI8") == 0 ||
-	  strncmp (Memory.ROMName, "SANKYO Fever! ﾌｨｰﾊﾞｰ!", 21) == 0) &&
+	  strncmp (Memory.ROMName, "SANKYO Fever! ï¾Œï½¨ï½°ï¾Šï¾žï½°!", 21) == 0) &&
 	 strcmp (Memory.CompanyId, "A0") == 0) ||
 	strcmp (Memory.ROMName, "DARK KINGDOM") == 0 ||
 	strcmp (Memory.ROMName, "ZAN3 SFC") == 0 ||
 	strcmp (Memory.ROMName, "HIOUDEN") == 0 ||
-	strcmp (Memory.ROMName, "ﾃﾝｼﾉｳﾀ") == 0 ||
+	strcmp (Memory.ROMName, "ï¾ƒï¾ï½¼ï¾‰ï½³ï¾€") == 0 ||
 	strcmp (Memory.ROMName, "FORTUNE QUEST") == 0 ||
 	strcmp (Memory.ROMName, "FISHING TO BASSING") == 0 ||
 	strncmp (Memory.ROMName, "TOKYODOME '95BATTLE 7", 21) == 0 ||
@@ -2030,6 +2031,9 @@ void ApplyROMFixes ()
 	}
 	WriteProtectROM ();
     }
+
+    if (Settings.CyclesPercentage <= 0)
+        Settings.CyclesPercentage = 100;
 
     Settings.H_Max = (SNES_CYCLES_PER_SCANLINE * 
 		      Settings.CyclesPercentage) / 100;
@@ -2084,7 +2088,7 @@ void ApplyROMFixes ()
     
     Settings.APURAMInitialValue = 0xff;
 
-    if (strcmp (Memory.ROMName, "ｷｭｳﾔｸ･ﾒｶﾞﾐﾃﾝｾｲ") == 0 ||
+    if (strcmp (Memory.ROMName, "ï½·ï½­ï½³ï¾”ï½¸ï½¥ï¾’ï½¶ï¾žï¾ï¾ƒï¾ï½¾ï½²") == 0 ||
     	strcmp (Memory.ROMName, "KENTOUOU WORLDCHAMPIO") == 0 ||
     	strcmp (Memory.ROMName, "TKO SUPERCHAMPIONSHIP") == 0 ||
     	strcmp (Memory.ROMName, "TKO SUPER CHAMPIONSHI") == 0 ||
@@ -2285,7 +2289,7 @@ void ApplyROMFixes ()
 #endif // USE_SA1
 
     // Additional game fixes by sanmaiwashi ...
-    if (strcmp (Memory.ROMName, "SFX ﾅｲﾄｶﾞﾝﾀﾞﾑﾓﾉｶﾞﾀﾘ 1") == 0)
+    if (strcmp (Memory.ROMName, "SFX ï¾…ï½²ï¾„ï½¶ï¾žï¾ï¾€ï¾žï¾‘ï¾“ï¾‰ï½¶ï¾žï¾€ï¾˜ 1") == 0)
     {
 	bytes0x2000 [0xb18] = 0x4c;
 	bytes0x2000 [0xb19] = 0x4b;
@@ -2310,7 +2314,7 @@ void ApplyROMFixes ()
     }
 
     if (strncmp (Memory.ROMName, "SWORD WORLD SFC", 15) == 0 ||
-        strcmp (Memory.ROMName, "SFC ｶﾒﾝﾗｲﾀﾞｰ") == 0)
+        strcmp (Memory.ROMName, "SFC ï½¶ï¾’ï¾ï¾—ï½²ï¾€ï¾žï½°") == 0)
     {
 	IAPU.OneCycle = 15;
 	SNESGameFixes.NeedInit0x2137 = TRUE;
@@ -2321,7 +2325,7 @@ void ApplyROMFixes ()
     if (strncmp (Memory.ROMName, "SHIEN THE BLADE CHASE", 21) == 0)
 	SNESGameFixes.Old_Read0x4200 = TRUE;
 
-    if (strcmp (Memory.ROMName, "ｺﾞｼﾞﾗ ｶｲｼﾞｭｳﾀﾞｲｹｯｾﾝ") == 0)
+    if (strcmp (Memory.ROMName, "ï½ºï¾žï½¼ï¾žï¾— ï½¶ï½²ï½¼ï¾žï½­ï½³ï¾€ï¾žï½²ï½¹ï½¯ï½¾ï¾") == 0)
 	SNESGameFixes.NeedInit0x2137 = TRUE;
 
     if (strcmp (Memory.ROMName, "UMIHARAKAWASE") == 0)
@@ -2330,10 +2334,16 @@ void ApplyROMFixes ()
     if (strcmp (Memory.ROMName, "ALIENS vs. PREDATOR") == 0)
 	SNESGameFixes.alienVSpredetorFix = TRUE;
 
-    if (strcmp (Memory.ROMName, "demon's blazon") == 0 ||
-	strcmp (Memory.ROMName, "demon's crest") == 0 ||
-	strcmp (Memory.ROMName, "ROCKMAN X") == 0 ||
-	strcmp (Memory.ROMName, "MEGAMAN X") == 0)
+    if (strstr(Memory.ROMName, "demon's blazon") ||
+	strstr(Memory.ROMName, "demon's crest") ||
+	strstr(Memory.ROMName, "ROCKMAN X") ||
+	strstr(Memory.ROMName, "MEGAMAN X") ||
+	strstr(Memory.ROMName, "ALADDIN") ||
+	strstr(Memory.ROMName, "Aladdin") ||
+	strncmp((char*)&Memory.ROM[0x7fc0], "ROCKMAN X", 9) == 0 ||
+	strncmp((char*)&Memory.ROM[0x7fc0], "MEGAMAN X", 9) == 0 ||
+	strncmp((char*)&Memory.ROM[0x7fc0], "ALADDIN", 7) == 0 ||
+	strncmp((char*)&Memory.ROM[0x7fc0], "demon's", 7) == 0)
     {
 
 	// CAPCOM's protect
@@ -2343,8 +2353,8 @@ void ApplyROMFixes ()
 	    Memory.Map [0x408 + c] = Memory.ROM - 0x8000;
     }
 
-    if (strcmp (Memory.ROMName, "ｽｰﾊﾟｰﾌｧﾐｽﾀ") == 0 ||
-	strcmp (Memory.ROMName, "ｽｰﾊﾟｰﾌｧﾐｽﾀ 2") == 0 ||
+    if (strcmp (Memory.ROMName, "ï½½ï½°ï¾Šï¾Ÿï½°ï¾Œï½§ï¾ï½½ï¾€") == 0 ||
+	strcmp (Memory.ROMName, "ï½½ï½°ï¾Šï¾Ÿï½°ï¾Œï½§ï¾ï½½ï¾€ 2") == 0 ||
 	strcmp (Memory.ROMName, "ZENKI TENCHIMEIDOU") == 0 ||
 	strcmp (Memory.ROMName, "GANBA LEAGUE") == 0)
     {
@@ -2362,10 +2372,10 @@ void ApplyROMFixes ()
     if (strcmp (Memory.ROMName, "goemon 4") == 0)
 	SNESGameFixes.SRAMInitialValue = 0x00;
 
-    if (strcmp (Memory.ROMName, "PACHISLO ｹﾝｷｭｳ") == 0)
+    if (strcmp (Memory.ROMName, "PACHISLO ï½¹ï¾ï½·ï½­ï½³") == 0)
 	SNESGameFixes._0x213E_ReturnValue = 1;
 
-    if (strcmp (Memory.ROMName, "ｻﾞ ﾏｰｼﾞｬﾝ ﾄｳﾊｲﾃﾞﾝ") == 0)
+    if (strcmp (Memory.ROMName, "ï½»ï¾ž ï¾ï½°ï½¼ï¾žï½¬ï¾ ï¾„ï½³ï¾Šï½²ï¾ƒï¾žï¾") == 0)
 	SNESGameFixes.TouhaidenControllerFix = TRUE;
 
     if (strcmp (Memory.ROMName, "DRAGON KNIGHT 4") == 0)

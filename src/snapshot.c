@@ -99,7 +99,7 @@ enum
 #undef OFFSET
 #define OFFSET(f) Offset(f, SCPUState *)
 
-static FreezeData SnapCPU [] =
+static const FreezeData SnapCPU [] =
 {
    {OFFSET(Flags), 4, INT_V},
    {OFFSET(BranchSkip), 1, INT_V},
@@ -118,7 +118,7 @@ static FreezeData SnapCPU [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SRegisters *)
 
-static FreezeData SnapRegisters [] =
+static const FreezeData SnapRegisters [] =
 {
    {OFFSET(PB),  1, INT_V},
    {OFFSET(DB),  1, INT_V},
@@ -134,7 +134,7 @@ static FreezeData SnapRegisters [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SPPU *)
 
-static FreezeData SnapPPU [] =
+static const FreezeData SnapPPU [] =
 {
    {OFFSET(BGMode), 1, INT_V},
    {OFFSET(BG3Priority), 1, INT_V},
@@ -268,7 +268,7 @@ static FreezeData SnapPPU [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SDMA *)
 
-static FreezeData SnapDMA [] =
+static const FreezeData SnapDMA [] =
 {
 #define O(N) \
     {OFFSET (TransferDirection) + N * sizeof ( SDMA), 1, INT_V}, \
@@ -294,7 +294,7 @@ static FreezeData SnapDMA [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SAPU *)
 
-static FreezeData SnapAPU [] =
+static const FreezeData SnapAPU [] =
 {
    {OFFSET(Cycles), 4, INT_V},
    {OFFSET(ShowROM), 1, INT_V},
@@ -312,7 +312,7 @@ static FreezeData SnapAPU [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SAPURegisters *)
 
-static FreezeData SnapAPURegisters [] =
+static const FreezeData SnapAPURegisters [] =
 {
    {OFFSET(P)   , 1, INT_V},
    {OFFSET(YA.W), 2, INT_V},
@@ -325,7 +325,7 @@ static FreezeData SnapAPURegisters [] =
 #undef OFFSET1
 #define OFFSET(f) Offset(f,SSoundData *)
 
-static FreezeData SnapSoundData [] =
+static const FreezeData SnapSoundData [] =
 {
    {OFFSET(master_volume_left), 2, INT_V},
    {OFFSET(master_volume_right), 2, INT_V},
@@ -378,7 +378,7 @@ static FreezeData SnapSoundData [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SSA1Registers *)
 
-static FreezeData SnapSA1Registers [] =
+static const FreezeData SnapSA1Registers [] =
 {
    {OFFSET(PB),  1, INT_V},
    {OFFSET(DB),  1, INT_V},
@@ -394,7 +394,7 @@ static FreezeData SnapSA1Registers [] =
 #undef OFFSET
 #define OFFSET(f) Offset(f, SSA1 *)
 
-static FreezeData SnapSA1 [] =
+static const FreezeData SnapSA1 [] =
 {
    {OFFSET(Flags), 4, INT_V},
    {OFFSET(NMIActive), 1, INT_V},
@@ -410,11 +410,11 @@ static FreezeData SnapSA1 [] =
 
 static void Freeze(void);
 static int Unfreeze(void);
-void FreezeStruct(char* name, void* base, FreezeData* fields,
+void FreezeStruct(char* name, void* base, const FreezeData* fields,
                   int num_fields);
 void FreezeBlock(char* name, uint8* block, int size);
 
-int UnfreezeStruct(char* name, void* base, FreezeData* fields,
+int UnfreezeStruct(char* name, void* base, const FreezeData* fields,
                    int num_fields);
 int UnfreezeBlock(char* name, uint8* block, int size);
 
@@ -697,7 +697,7 @@ int FreezeSize(int size, int type)
    }
 }
 
-void FreezeStruct(char* name, void* base, FreezeData* fields,
+void FreezeStruct(char* name, void* base, const FreezeData* fields,
                   int num_fields)
 {
    // Work out the size of the required block
@@ -796,7 +796,7 @@ void FreezeBlock(char* name, uint8* block, int size)
 
 }
 
-int UnfreezeStruct(char* name, void* base, FreezeData* fields,
+int UnfreezeStruct(char* name, void* base, const FreezeData* fields,
                    int num_fields)
 {
    // Work out the size of the required block
@@ -930,7 +930,7 @@ static int32 BlockSize(char *name, int data_size)
    return strlen(buffer) + data_size;
 }
 
-static int32 StructSize(char* name, FreezeData* fields,
+static int32 StructSize(char* name, const FreezeData* fields,
                       int num_fields)
 {
    // Work out the size of the required block

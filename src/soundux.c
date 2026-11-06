@@ -134,6 +134,9 @@ void S9xSetEchoDelay(int delay)
    SoundData.echo_buffer_size = (512 * delay * so.playback_rate) >> 15; // notaz / 32000;
    if (so.stereo)
       SoundData.echo_buffer_size <<= 1;
+   if (SoundData.echo_buffer_size > 7990)
+      SoundData.echo_buffer_size = 7990;
+   SoundData.echo_buffer_size &= ~1;
    if (SoundData.echo_buffer_size)
    {
       while (SoundData.echo_ptr >= SoundData.echo_buffer_size)
@@ -962,11 +965,14 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
             // ... but no filter defined.
             for (J = 0; J < sample_count; J += 2)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J + 1];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 
@@ -984,6 +990,8 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
             // ... with filter defined.
             for (J = 0; J < sample_count; J += 2)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Loop [(Z - 0) & 15] = E;
@@ -1002,8 +1010,9 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
                Z++;
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J + 1];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 
@@ -1029,10 +1038,11 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
             // ... no filter defined
             for (J = 0; J < sample_count; J++)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 
@@ -1046,6 +1056,8 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
             // ... with filter defined
             for (J = 0; J < sample_count; J++)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Loop [(Z - 0) & 7] = E;
@@ -1061,7 +1073,6 @@ void S9xMixSamplesO(signed short* buffer, int sample_count, int sample_offset)
                Z++;
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 
@@ -1242,10 +1253,11 @@ void S9xMixSamplesLowPassO(signed short* buffer, int sample_count, int low_pass_
             // ... no filter defined
             for (J = 0; J < sample_count; J++)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 
@@ -1265,6 +1277,8 @@ void S9xMixSamplesLowPassO(signed short* buffer, int sample_count, int low_pass_
             // ... with filter defined
             for (J = 0; J < sample_count; J++)
             {
+               if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
+                  SoundData.echo_ptr = 0;
                int E = Echo [SoundData.echo_ptr];
 
                Loop [(Z - 0) & 7] = E;
@@ -1280,7 +1294,6 @@ void S9xMixSamplesLowPassO(signed short* buffer, int sample_count, int low_pass_
                Z++;
 
                Echo[SoundData.echo_ptr++] = (E * SoundData.echo_feedback) / 128 + EchoBuffer[J];
-
                if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                   SoundData.echo_ptr = 0;
 

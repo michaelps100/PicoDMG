@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
  *
  * (c) Copyright 1996 - 2001 Gary Henderson (gary.henderson@ntlworld.com) and
@@ -80,6 +80,7 @@
 #define MEMMAP_MASK (MEMMAP_BLOCK_SIZE - 1)
 #define MEMMAP_MAX_SDD1_LOGGED_ENTRIES (0x10000 / 8)
 
+extern bool8_32 s_rom_preloaded;
 bool8_32 LoadROM(void);
 void  InitROM(bool8_32);
 bool8_32 MemoryInit(void);
@@ -139,8 +140,8 @@ typedef struct
    uint8 SRAMSize;
    uint8* Map [MEMMAP_NUM_BLOCKS];
    uint8* WriteMap [MEMMAP_NUM_BLOCKS];
-   uint32 MemorySpeed [MEMMAP_NUM_BLOCKS];
-   uint8 BlockIsRAM [MEMMAP_NUM_BLOCKS];
+   uint8  MemorySpeed [MEMMAP_NUM_BLOCKS];
+   uint8  BlockIsRAM [MEMMAP_NUM_BLOCKS];
    uint8 BlockIsROM [MEMMAP_NUM_BLOCKS];
    char  ROMName [ROM_NAME_LEN];
    char  ROMId [5];
@@ -164,6 +165,7 @@ extern uint8* SRAM;
 extern uint8* ROM;
 extern uint8* RegRAM;
 void S9xDeinterleaveMode2(void);
+
 
 #ifdef NO_INLINE_SET_GET
 uint8 S9xGetByte(uint32 Address, struct SCPUState*);

@@ -209,7 +209,7 @@ void S9xMainLoop_SA1_NoAPU(void)
 // USE_SA1
 #endif
 
-void S9xMainLoop_NoSA1_APU(void)
+void __not_in_flash_func(S9xMainLoop_NoSA1_APU)(void)
 {
    for (;;)
    {
@@ -445,7 +445,7 @@ void S9xClearIRQ(uint32 source)
    CLEAR_IRQ_SOURCE(source);
 }
 
-void S9xDoHBlankProcessing()
+void __not_in_flash_func(S9xDoHBlankProcessing)()
 {
 #ifdef CPU_SHUTDOWN
    CPU.WaitCounter++;
@@ -546,8 +546,8 @@ void S9xDoHBlankProcessing()
                APU.Timer [2] -= APU.TimerTarget [2];
 #ifdef SPC700_SHUTDOWN
                IAPU.WaitCounter++;
-               /*IAPU.APUExecuting*/CPU.APU_APUExecuting = TRUE;
 #endif
+               CPU.APU_APUExecuting = Settings.APUEnabled;
             }
          }
          if (CPU.V_Counter & 1)
@@ -561,8 +561,8 @@ void S9xDoHBlankProcessing()
                   APU.Timer [0] = 0;
 #ifdef SPC700_SHUTDOWN
                   IAPU.WaitCounter++;
-                  /*IAPU.APUExecuting*/CPU.APU_APUExecuting = TRUE;
 #endif
+                  CPU.APU_APUExecuting = Settings.APUEnabled;
                }
             }
             if (APU.TimerEnabled [1])
@@ -574,8 +574,8 @@ void S9xDoHBlankProcessing()
                   APU.Timer [1] = 0;
 #ifdef SPC700_SHUTDOWN
                   IAPU.WaitCounter++;
-                  /*IAPU.APUExecuting*/CPU.APU_APUExecuting = TRUE;
 #endif
+                  CPU.APU_APUExecuting = Settings.APUEnabled;
                }
             }
          }

@@ -228,7 +228,7 @@ void asm_APU_EXECUTE2(void);
 #else
 
 #define asm_APU_EXECUTE(MODE)\
-   do { if (CPU.APU_APUExecuting == MODE) \
+   do { if (CPU.APU_APUExecuting) \
       while (CPU.APU_Cycles <= CPU.Cycles)\
       {\
          CPU.APU_Cycles += S9xAPUCycles [*IAPU.PC];\
@@ -237,7 +237,7 @@ void asm_APU_EXECUTE2(void);
 
 
 #define asm_APU_EXECUTE2() \
-    if  (CPU.APU_APUExecuting == 1) do\
+    if (CPU.APU_APUExecuting) do\
       {\
          CPU.APU_Cycles += S9xAPUCycles [*IAPU.PC];\
          (*S9xApuOpcodes[*IAPU.PC]) ();\

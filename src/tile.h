@@ -45,23 +45,37 @@ void SelectPalette();
 
 extern uint32 TileBlank;
 
+#include "pico_snes_mem.h"
+
 #define TILE_PREAMBLE \
     uint32 l; \
     uint8 *pCache; \
 \
-    uint32 TileAddr = (BG.TileAddress + ((Tile & 0x3ff) << BG.TileShift)) & 0xffff; \
+    uint32 TileAddr = BG.TileAddress + ((Tile & 0x3ff) << BG.TileShift); \
+    if ((Tile & 0x1ff) >= 256) \
+       TileAddr += BG.NameSelect; \
+    TileAddr &= 0xffff; \
 \
-    uint32 TileNumber; \
-    pCache = &BG.Buffer[(TileNumber = (TileAddr >> BG.TileShift)) << 6]; \
-\
-    if (!BG.Buffered [TileNumber]) \
-   BG.Buffered[TileNumber] = ConvertTile (pCache, TileAddr); \
-\
-    if (BG.Buffered [TileNumber] == BLANK_TILE){ \
-      TileBlank = Tile; \
-      return; \
-   } \
-\
+    uint32 key = (BG.TileShift == 4 ? 0 : (BG.TileShift == 5 ? 4096 : 6144)) + (TileAddr >> BG.TileShift); \
+    uint16 slot = s_tile_slot[key]; \
+    if (slot == 0xFFFF) { \
+        slot = s_next_tile_slot++; \
+        if (slot >= SNES_COMPACT_TILE_COUNT) { \
+            slot = (s_next_tile_slot - 1) & (SNES_COMPACT_TILE_COUNT - 1); \
+            uint16 old_key = s_slot_to_tile[slot]; \
+            if (old_key != 0xFFFF && old_key < SNES_TILE_KEY_COUNT) s_tile_slot[old_key] = 0xFFFF; \
+        } \
+        s_tile_slot[key] = slot; \
+        s_slot_to_tile[slot] = key; \
+        pCache = &s_tile_cache[slot << 6]; \
+        s_slot_blank[slot] = ConvertTile(pCache, TileAddr); \
+    } else { \
+        pCache = &s_tile_cache[slot << 6]; \
+    } \
+    if (s_slot_blank[slot] == BLANK_TILE) { \
+        TileBlank = Tile; \
+        return; \
+    } \
     GFX.ScreenColors = &GFX.ScreenColorsPre[(Tile & GFX.PaletteMask) >> GFX.PaletteShift];
 
 

@@ -238,8 +238,8 @@ static uint8 GetPPU_APUR(uint16 Address)
    return ((uint8) _SPCOutP[Address & 3]);
 #else
    // CPU.Flags |= DEBUG_MODE_FLAG;
+   CPU.APU_APUExecuting = Settings.APUEnabled;
 #ifdef SPC700_SHUTDOWN
-   CPU.APU_APUExecuting =  Settings.APUEnabled;
    IAPU.WaitCounter++;
 #endif
    if (Settings.APUEnabled)

@@ -159,23 +159,19 @@ const unsigned short DSP1ROM[1024] =
 
 #define INCR 2048
 #define Angle(x) (((x)/(65536/INCR)) & (INCR-1))
-#define Cos(x) ((float) CosTable2[x])
-#define Sin(x) ((float) SinTable2[x])
+#define AngleFix(x) (((x)>>5) & (INCR-1))
+
+#include "dsp1_sintable.h"
+
+#define SinFix(x) (SinTable2Fix[(x) & (INCR - 1)])
+#define CosFix(x) (SinTable2Fix[((x) + (INCR / 4)) & (INCR - 1)])
+#define Sin(x)    ((float)SinFix(x) / 65536.0f)
+#define Cos(x)    ((float)CosFix(x) / 65536.0f)
+
 #ifdef PI
 #undef PI
 #endif
 #define PI 3.1415926535897932384626433832795
-float CosTable2[INCR];
-float SinTable2[INCR];
-
-int32  CosTable2Fix[INCR];//=NULL;
-int32  SinTable2Fix[INCR];//=NULL;
-
-
-#define AngleFix(x) (((x)>>5) & (INCR-1))
-#define CosFix(x) (CosTable2Fix[x])
-#define SinFix(x) (SinTable2Fix[x])
-
 
 float Atan(float x)
 {
@@ -185,28 +181,12 @@ float Atan(float x)
       return (PI / 2 - Atan(1 / x));
 }
 
-
 /***************************************************************************\
 *  DSP1 code                                                                *
 \***************************************************************************/
 
 void InitDSP(void)
 {
-#ifdef __OPT__
-   unsigned int i;
-
-   //    CosTable2Fix = (int32 *) ljz_malloc(INCR*sizeof(int32));
-   // SinTable2Fix = (int32 *) ljz_malloc(INCR*sizeof(int32));
-
-   for (i = 0; i < INCR; i++)
-   {
-      CosTable2[i] = (cosf((float)(2 * PI * i / INCR)));
-      SinTable2[i] = (sinf((float)(2 * PI * i / INCR)));
-
-      CosTable2Fix[i] = (65536 * cosf((float)(2 * PI * i / INCR)));
-      SinTable2Fix[i] = (65536 * sinf((float)(2 * PI * i / INCR)));
-   }
-#endif
 }
 
 

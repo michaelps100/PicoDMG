@@ -57,15 +57,9 @@ typedef struct
 {
    struct SCheat   c [MAX_CHEATS];
    uint32      num_cheats;
-   uint8       CWRAM [0x20000];
-   uint8       CSRAM [0x10000];
-   uint8       CIRAM [0x2000];
    uint8*           RAM;
    uint8*           FillRAM;
    uint8*           SRAM;
-   uint32      WRAM_BITS [0x20000 >> 3];
-   uint32      SRAM_BITS [0x10000 >> 3];
-   uint32      IRAM_BITS [0x2000 >> 3];
 } SCheatData;
 
 typedef enum

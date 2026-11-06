@@ -998,5 +998,5 @@ bool JustifierOffscreen(void) { return false; }
 
 void S9xToggleSoundChannel (int channel) {}
 
-void S9xExit(void) { exit(1); }
+void S9xExit(void) { }
 void S9xMessage(int a, int b, const char* msg) { }

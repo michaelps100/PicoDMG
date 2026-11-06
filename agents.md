@@ -3340,3 +3340,36 @@ RAM 294.008 / 512 KB (56,08%). Compila sem warnings em `state.cpp` e `dsp.c`; `n
 5. Copiar o `.ss` de um jogo com o nome de outro: tem de ser recusado (`belongs to another game`) sem travar.
 6. Battery save (`.srm`) e Reset do menu sem regressão.
 
+---
+
+## Standby por Savestate e Resume (2026-11-05)
+
+Camada comum: `AGENTS.md` da raiz, §45 (`shared_menu/dmg_power`, `dmg_resume`,
+`dmg_boot_intro`). Aqui fica so o que mudou neste emulador.
+
+Fluxo: chave OFF -> backlight apagado, painel pintado de preto, savestate no slot
+`_R` (`<saves_dir>/<jogo>_R.ss`, nunca aparece no Load State 1..4), saves de
+bateria gravados, `0:/saves/resume.bin`, DORMANT. Chave ON -> reboot, o bootloader
+pula direto para o emulador, a abertura do bootloader (logo + som) roda no Core 1
+enquanto o Core 0 carrega a ROM, e o `_R` e carregado depois do 1o quadro.
+Desligar no seletor de jogos volta ao seletor, tambem com a abertura.
+
+### O que foi feito
+- `ili9341_write_rect_565()` no driver; `audio_i2s_flush()` no driver de audio.
+- Descritor: `audio_free/push` (anel EXT), `flush_saves = system_save_sram()`,
+  `audio_restore = snes_audio_restore` (flush + `SNES_AUDIO_RATE`, 32 kHz).
+- O I2S fica a 44,1 kHz so durante a abertura e volta para 32 kHz no
+  `audio_restore`: musica do jogo no tom certo.
+- `_R` carregado dentro do loop, depois do 1o quadro, apos `snes_load_config()`;
+  load parcial -> `S9xReset`.
+
+### Correcao: tela branca as vezes depois do resume
+`run_game()` comeca com `ili9341_clear_black()` (um quadro inteiro pelo SPI0) e
+depois troca o I2S e faz o prefill do anel. No resume isso podia rodar com a abertura
+ainda desenhando no Core 1: os dois fluxos de comando se misturavam no SPI0 e o
+painel ficava branco com o jogo rodando por baixo. Agora `dmg_boot_intro_finish()` e
+a primeira coisa do `run_game()`.
+
+### Status
+Validado em hardware (Core2350B) pelo usuario em 2026-11-05: OFF no jogo, no menu
+de pausa e no seletor; volta no mesmo ponto, com som e FPS normais.

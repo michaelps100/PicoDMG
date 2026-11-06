@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
  *
  * (c) Copyright 1996 - 2001 Gary Henderson (gary.henderson@ntlworld.com) and
@@ -53,6 +53,17 @@
 #include <stdint.h>
 #include "asmmemfuncs.h"
 #include "tile.h"
+#include "pico_snes_mem.h"
+
+extern bool ili9341_is_blitter_active(void);
+extern bool ili9341_is_active_md_line(int line, int height);
+extern void ili9341_stream_md_line(int line, const uint16_t *rgb565_line, int width, int height);
+extern void ili9341_stream_snes_line(int line, const uint16_t *rgb555_line, int width, int height);
+
+/* Pixels the rasteriser wrote, counted in the core. See the use in
+ * S9xUpdateScreen(): paired against the driver's own whole-frame count to say
+ * whether a black screen comes from the rasteriser or from the display path. */
+volatile uint32_t s_core_pixels = 0;
 
 uint32 TileBlank;
 
@@ -477,40 +488,8 @@ bool8_32 S9xGraphicsInit(void)
    }
 #endif
 #else
-   if (!(GFX.ZERO = (uint16_t*) malloc(sizeof(uint16_t) * 0x10000)))
-      return false;
+   GFX.ZERO = NULL;
 #endif
-
-   // Build a lookup table that if the top bit of the color value is zero
-   // then the value is zero, otherwise its just the value.
-   for (r = 0; r <= MAX_RED; r++)
-   {
-      uint32 r2 = r;
-      if ((r2 & 0x10) == 0)
-         r2 = 0;
-      else
-         r2 &= ~0x10;
-
-      for (g = 0; g <= MAX_GREEN; g++)
-      {
-         uint32 g2 = g;
-         if ((g2 & GREEN_HI_BIT) == 0)
-            g2 = 0;
-         else
-            g2 &= ~GREEN_HI_BIT;
-         for (b = 0; b <= MAX_BLUE; b++)
-         {
-            uint32 b2 = b;
-            if ((b2 & 0x10) == 0)
-               b2 = 0;
-            else
-               b2 &= ~0x10;
-
-            GFX.ZERO [BUILD_PIXEL2(r, g, b)] = BUILD_PIXEL2(r2, g2, b2);
-            GFX.ZERO [BUILD_PIXEL2(r, g, b) & ~ALPHA_BITS_MASK] = BUILD_PIXEL2(r2, g2, b2);
-         }
-      }
-   }
 
    return (TRUE);
 }
@@ -559,6 +538,7 @@ void S9xStartScreenRefresh()
 {
    if (IPPU.RenderThisFrame)
    {
+      pico_snes_reset_tile_cache();
       IPPU.RenderedFramesCount++;
       IPPU.PreviousLine = IPPU.CurrentLine = 0;
       IPPU.MaxBrightness = PPU.Brightness;
@@ -2914,80 +2894,10 @@ void DisplayChar(uint8* Screen, uint8 c)
    }
 }
 
-void S9xUpdateScreen(void)  // ~30-50ms! (called from FLUSH_REDRAW())
+static void __not_in_flash_func(S9xRenderScanline)(uint32 line, uint32 black, int32 x2)
 {
-   uint32 black;
-   uint32 starty, endy;
-   uint8_t *memoryfillram;
-   int32 x2 = 1;
-
-   GFX.S = GFX.Screen;
-   memoryfillram = Memory.FillRAM;
-
-   // get local copies of vid registers to be used later
-   GFX.r2131 = memoryfillram [0x2131]; // ADDITION/SUBTRACTION & SUBTRACTION DESIGNATION FOR EACH SCREEN
-   GFX.r212c = memoryfillram [0x212c]; // MAIN SCREEN, DESIGNATION - used to enable BGS
-   GFX.r212d = memoryfillram [0x212d]; // SUB SCREEN DESIGNATION - used to enable sub BGS
-   GFX.r2130 = memoryfillram [0x2130]; // INITIAL SETTINGS FOR FIXED COLOR ADDITION OR SCREEN ADDITION
-
-   // If external sync is off and
-   // main screens have not been configured the same as the sub screen and
-   // color addition and subtraction has been diabled then
-   // Pseudo is 1
-   // anything else it is 0
-   GFX.Pseudo = (memoryfillram [0x2133] & 8) != 0 && // Use EXTERNAL SYNCHRONIZATION?
-                (GFX.r212c & 15) != (GFX.r212d & 15) && // Are the main screens different from the sub screens?
-                (GFX.r2131 & 0x3f) == 0; // Is colour data addition/subtraction disabled on all BGS?
-
-   // If sprite data has been changed then go through and
-   // refresh the sprites.
-   if (IPPU.OBJChanged)
-      S9xSetupOBJ();
-
-   if (PPU.RecomputeClipWindows)
-   {
-      ComputeClipWindows();
-      PPU.RecomputeClipWindows = FALSE;
-   }
-
-   GFX.StartY = IPPU.PreviousLine;
-   if ((GFX.EndY = IPPU.CurrentLine - 1) >= PPU.ScreenHeight)
-      GFX.EndY = PPU.ScreenHeight - 1;
-
-   starty = GFX.StartY;
-   endy = GFX.EndY;
-
-   if (Settings.SupportHiRes &&
-         (PPU.BGMode == 5 || PPU.BGMode == 6 || IPPU.LatchedInterlace))
-   {
-      if (PPU.BGMode == 5 || PPU.BGMode == 6)
-      {
-         IPPU.RenderedScreenWidth = 512;
-         x2 = 2;
-      }
-      if (IPPU.LatchedInterlace)
-      {
-         starty = GFX.StartY * 2;
-         endy = GFX.EndY * 2 + 1;
-      }
-      if (!IPPU.DoubleWidthPixels)
-      {
-         uint32 y;
-         // The game has switched from lo-res to hi-res mode part way down
-         // the screen. Scale any existing lo-res pixels on screen
-         for (y = 0; y < GFX.StartY; y++)
-         {
-            int x;
-            uint16* p = (uint16*)(GFX.Screen + y * GFX_PITCH) + 255;
-            uint16* q = (uint16*)(GFX.Screen + y * GFX_PITCH) + 510;
-            for (x = 255; x >= 0; x--, p--, q -= 2)
-               * q = *(q + 1) = *p;
-         }
-         IPPU.DoubleWidthPixels = TRUE;
-      }
-   }
-
-   black = BLACK | (BLACK << 16);
+   uint32 starty = line;
+   uint32 endy = line;
 
    // Are we worrying about transparencies?
    if (Settings.Transparency)
@@ -3576,9 +3486,9 @@ void S9xUpdateScreen(void)  // ~30-50ms! (called from FLUSH_REDRAW())
       if (!(Memory.FillRAM [0x2131] & 0x80) && (Memory.FillRAM[0x2131] & 0x20) &&
             (PPU.FixedColourRed || PPU.FixedColourGreen || PPU.FixedColourBlue))
       {
-         back = (IPPU.XB[PPU.FixedColourRed] << 11) |
-                (IPPU.XB[PPU.FixedColourGreen] << 6) |
-                (IPPU.XB[PPU.FixedColourBlue] << 1) | 1;
+         back = BUILD_PIXEL(IPPU.XB[PPU.FixedColourRed],
+                            IPPU.XB[PPU.FixedColourGreen],
+                            IPPU.XB[PPU.FixedColourBlue]);
          back = (back << 16) | back;
       }
       else
@@ -3739,6 +3649,92 @@ else \
       }
    }
 #endif
+}
+
+void S9xUpdateScreen(void)
+{
+   uint32 black;
+   uint32 starty, endy;
+   uint8_t *memoryfillram;
+   int32 x2 = 1;
+
+   memoryfillram = Memory.FillRAM;
+
+   // get local copies of vid registers to be used later
+   GFX.r2131 = memoryfillram [0x2131]; // ADDITION/SUBTRACTION & SUBTRACTION DESIGNATION FOR EACH SCREEN
+   GFX.r212c = memoryfillram [0x212c]; // MAIN SCREEN, DESIGNATION - used to enable BGS
+   GFX.r212d = memoryfillram [0x212d]; // SUB SCREEN DESIGNATION - used to enable sub BGS
+   GFX.r2130 = memoryfillram [0x2130]; // INITIAL SETTINGS FOR FIXED COLOR ADDITION OR SCREEN ADDITION
+
+   GFX.Pseudo = (memoryfillram [0x2133] & 8) != 0 &&
+                (GFX.r212c & 15) != (GFX.r212d & 15) &&
+                (GFX.r2131 & 0x3f) == 0;
+
+   if (IPPU.OBJChanged)
+      S9xSetupOBJ();
+
+   if (PPU.RecomputeClipWindows)
+   {
+      ComputeClipWindows();
+      PPU.RecomputeClipWindows = FALSE;
+   }
+
+   starty = IPPU.PreviousLine;
+   if ((endy = IPPU.CurrentLine - 1) >= PPU.ScreenHeight)
+      endy = PPU.ScreenHeight - 1;
+
+   if (starty > endy)
+   {
+      IPPU.PreviousLine = IPPU.CurrentLine;
+      return;
+   }
+
+   if (Settings.SupportHiRes &&
+         (PPU.BGMode == 5 || PPU.BGMode == 6 || IPPU.LatchedInterlace))
+   {
+      if (PPU.BGMode == 5 || PPU.BGMode == 6)
+      {
+         IPPU.RenderedScreenWidth = 512;
+         x2 = 2;
+      }
+   }
+
+   black = BLACK | (BLACK << 16);
+
+   uint16_t *s_line_buf = pico_snes_get_screen();
+   uint16_t *s_subline_buf = pico_snes_get_screen() + 256;
+   uint8_t  *s_zbuf_line = pico_snes_get_zbuffer();
+   uint8_t  *s_subzbuf_line = pico_snes_get_zbuffer() + 256;
+
+   for (uint32 line = starty; line <= endy; line++)
+   {
+
+      GFX.StartY = line;
+      GFX.EndY = line;
+      GFX.Screen = (uint8 *)s_line_buf - line * GFX_PITCH;
+      GFX.SubScreen = (uint8 *)s_subline_buf - line * GFX_PITCH;
+      GFX.ZBuffer = s_zbuf_line - line * GFX_ZPITCH;
+      GFX.SubZBuffer = s_subzbuf_line - line * GFX_ZPITCH;
+      GFX.Delta = 256;
+      GFX.DepthDelta = 256;
+      GFX.S = GFX.Screen;
+
+      S9xRenderScanline(line, black, x2);
+
+      /* Count what the rasteriser actually wrote, INSIDE the core, before the
+       * line leaves for the driver. The driver counts the same buffer again, so
+       * the two together localise the fault: zeros here mean the rasteriser
+       * produced nothing; non-zero here but zero there means the line never
+       * reached the driver intact. */
+      {
+         uint32_t n = 0;
+         const uint16_t *l = s_line_buf;
+         for (int x = 0; x < 256; x++) { if (l[x] != 0) n++; }
+         s_core_pixels += n;
+      }
+      ili9341_stream_snes_line((int)line, s_line_buf, 256, (int)PPU.ScreenHeight);
+   }
+
    IPPU.PreviousLine = IPPU.CurrentLine;
 }
 

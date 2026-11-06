@@ -122,15 +122,12 @@ void S9xUpdateHTimer()
 void S9xFixColourBrightness()
 {
    IPPU.XB = mul_brightness [PPU.Brightness];
+   for (unsigned int i = 0; i < 256; i++)
    {
-      unsigned int i;
-      for (i = 0; i < 256; i++)
-      {
-         //IPPU.Red [i] = IPPU.XB [PPU.CGDATA [i] & 0x1f];
-         //IPPU.Green [i] = IPPU.XB [(PPU.CGDATA [i] >> 5) & 0x1f];
-         //IPPU.Blue [i] = IPPU.XB [(PPU.CGDATA [i] >> 10) & 0x1f];
-         IPPU.ScreenColors [i] = BUILD_PIXEL(IPPU.XB[IPPU.Red [i]], IPPU.XB[IPPU.Green [i]], IPPU.XB[IPPU.Blue [i]]);
-      }
+      IPPU.Red [i]   = IPPU.XB [PPU.CGDATA [i] & 0x1f];
+      IPPU.Green [i] = IPPU.XB [(PPU.CGDATA [i] >> 5) & 0x1f];
+      IPPU.Blue [i]  = IPPU.XB [(PPU.CGDATA [i] >> 10) & 0x1f];
+      IPPU.ScreenColors [i] = BUILD_PIXEL(IPPU.Red [i], IPPU.Green [i], IPPU.Blue [i]);
    }
 }
 

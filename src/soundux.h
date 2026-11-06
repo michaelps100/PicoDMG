@@ -61,7 +61,7 @@ enum { MODE_NONE = SOUND_SILENT, MODE_ADSR, MODE_RELEASE = SOUND_RELEASE,
 #define SOUND_DECODE_LENGTH 16
 
 #define NUM_CHANNELS    8
-#define SOUND_BUFFER_SIZE (2*44100/50)
+#define SOUND_BUFFER_SIZE 1280
 #define MAX_BUFFER_SIZE SOUND_BUFFER_SIZE
 
 #define SOUND_BUFS      4
@@ -182,7 +182,7 @@ bool8 S9xInitSound(void);
 //#define DEBUG
 //#include <dprintf.h>
 
-extern int Echo [24000];
+extern short Echo [8000];
 extern int Loop [16];
 extern int FilterTaps [8];
 extern int EchoBuffer [SOUND_BUFFER_SIZE];

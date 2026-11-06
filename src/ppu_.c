@@ -310,42 +310,43 @@ void S9xSetPPU(uint8 Byte, uint16 Address)
          break;
 
       case 0x210D:
-         PPU.BG[0].HOffset = ((PPU.BG[0].HOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[0].HOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x210E:
-         PPU.BG[0].VOffset = ((PPU.BG[0].VOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[0].VOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
+
       case 0x210F:
-         PPU.BG[1].HOffset = ((PPU.BG[1].HOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[1].HOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2110:
-         PPU.BG[1].VOffset = ((PPU.BG[1].VOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[1].VOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2111:
-         PPU.BG[2].HOffset = ((PPU.BG[2].HOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[2].HOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2112:
-         PPU.BG[2].VOffset = ((PPU.BG[2].VOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[2].VOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2113:
-         PPU.BG[3].HOffset = ((PPU.BG[3].HOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[3].HOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2114:
-         PPU.BG[3].VOffset = ((PPU.BG[3].VOffset >> 8) & 0xff) |
-                             ((uint16) Byte << 8);
+         PPU.BG[3].VOffset = (Byte << 8) | PPU.BGnxOFSbyte;
+         PPU.BGnxOFSbyte = Byte;
          break;
 
       case 0x2115:
@@ -834,6 +835,7 @@ void S9xSetPPU(uint8 Byte, uint16 Address)
          // CPU.Flags |= DEBUG_MODE_FLAG;
          Memory.FillRAM [Address] = Byte;
          IAPU.RAM [(Address & 3) + 0xf4] = Byte;
+         CPU.APU_APUExecuting = Settings.APUEnabled;
 #ifdef SPC700_SHUTDOWN
          IAPU.APUExecuting = Settings.APUEnabled;
          IAPU.WaitCounter++;
@@ -860,6 +862,7 @@ void S9xSetPPU(uint8 Byte, uint16 Address)
    }
    else
    {
+#ifdef USE_SA1
       if (Settings.SA1)
       {
          if (Address >= 0x2200 && Address < 0x23ff)
@@ -869,6 +872,7 @@ void S9xSetPPU(uint8 Byte, uint16 Address)
          return;
       }
       else
+#endif
          // Dai Kaijyu Monogatari II
          if (Address == 0x2801 && Settings.SRTC)
             S9xSetSRTC(Byte, Address);
@@ -1254,6 +1258,7 @@ uint8 S9xGetPPU(uint16 Address)
          return ((uint8) _SPCOutP [Address & 3]);
 #else
          //   CPU.Flags |= DEBUG_MODE_FLAG;
+         CPU.APU_APUExecuting = Settings.APUEnabled;
 #ifdef SPC700_SHUTDOWN
          IAPU.APUExecuting = Settings.APUEnabled;
          IAPU.WaitCounter++;
@@ -1323,8 +1328,10 @@ uint8 S9xGetPPU(uint16 Address)
    }
    else
    {
+#ifdef USE_SA1
       if (Settings.SA1)
          return (S9xGetSA1(Address));
+#endif
 
       if (Address <= 0x2fff || Address >= 0x3000 + 768)
       {
@@ -1960,14 +1967,7 @@ uint8 S9xGetCPU(uint16 Address)
       case 0x420a:
          return (PPU.IRQVBeamPos >> 8);
       case 0x420b:
-         // General purpose DMA enable
-         // Super Formation Soccer 95 della Serie A UCC Xaqua requires this
-         // register should not always return zero.
-         // .. But Aero 2 waits until this register goes zero..
-         // Just keep toggling the value for now in the hope that it breaks
-         // the game out of its wait loop...
-         Memory.FillRAM [0x420b] = !Memory.FillRAM [0x420b];
-         return (Memory.FillRAM [0x420b]);
+         return (CPU.InDMA ? Memory.FillRAM[0x420b] : 0);
       case 0x420c:
          // H-DMA enable
          return (IPPU.HDMA);
@@ -1983,8 +1983,8 @@ uint8 S9xGetCPU(uint16 Address)
          CPU.WaitAddress = CPU.PCAtOpcodeStart;
 #endif
          byte = Memory.FillRAM[0x4210];
-         Memory.FillRAM[0x4210] = 0;
-         return (byte);
+         Memory.FillRAM[0x4210] = 0x02;
+         return (byte & 0x80) | 0x02;
       case 0x4211:
          byte = (CPU.IRQActive & (PPU_V_BEAM_IRQ_SOURCE | PPU_H_BEAM_IRQ_SOURCE)) ? 0x80 : 0;
          // Super Robot Wars Ex ROM bug requires this.
@@ -2517,6 +2517,7 @@ void S9xUpdateJoypads(void)
    }
 }
 
+#ifdef SUPER_FX
 void S9xSuperFXExec(void)
 {
    if (Settings.SuperFX)
@@ -2541,3 +2542,4 @@ void S9xSuperFXExec(void)
    }
 
 }
+#endif

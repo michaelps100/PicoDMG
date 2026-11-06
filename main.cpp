@@ -44,6 +44,8 @@
  * SNES-specific: the descriptor, the S9x callbacks, and the Image submenu. */
 #include "dmg_menu.h"
 #include "dmg_combo.h"
+#include "dmg_resume.h"
+#include "dmg_boot_intro.h"
 #endif
 
 /* Snes9x emulator core headers (upstream pico-snesPlus tree, snes9x_src/).
@@ -361,6 +363,10 @@ static uint8_t persistent_frameskip_mode = FRAMESKIP_OFF;
 
 static bool s_request_pause_menu = false;
 static bool s_request_exit_game = false;
+/* Standby by save state (shared_menu/dmg_power.h). */
+static bool s_request_power_off = false;
+static uint8_t s_power_reason = 0;
+static bool s_resume_pending = false;
 
 /* Descriptor callbacks, defined below next to the descriptor that stores them.
  *
@@ -797,6 +803,20 @@ static void snes_apply_fps(bool on) {
  * lets the emulator's frame loop perform the reset between frames, which is the
  * only safe point for S9xReset(). Exit is handled by the same return value, so
  * wiring exit_game as well would just add a second, redundant path. */
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+/* Resume intro chime, pushed from core 1 into the I2S ring (dmg_boot_intro.c). */
+static int  snes_audio_free(void) { return EXT_AUDIO_GET_FREE(); }
+static void snes_audio_push(int16_t l, int16_t r) { EXT_AUDIO_ENQUEUE_SAMPLE(l, r); }
+static void snes_audio_restore(void) {
+    /* After the resume intro: ring empty, DMA idle, emulator's rate. */
+    audio_i2s_flush();
+    audio_i2s_update_pio_frequency(SNES_AUDIO_RATE);
+}
+#endif
+
+/* Battery SRAM to the SD before a standby (dmg_power_off_with_resume). */
+static void snes_flush_saves(void) { system_save_sram(selectedRom); }
+
 const dmg_emulator_desc_t s_snes_desc = {
     .app_title = APP_TITLE,
     .default_rom_dir = ROMS_DIR,
@@ -818,6 +838,7 @@ const dmg_emulator_desc_t s_snes_desc = {
         .flush = ili9341_flush,
         .stop_blitter = ili9341_blitter_stop,
         .start_blitter = ili9341_blitter_start,
+        .write_rect_565 = ili9341_write_rect_565,
     },
     .is_rom_file = snes_is_rom_file,
     .on_load_rom = snes_on_load_rom,
@@ -840,6 +861,14 @@ const dmg_emulator_desc_t s_snes_desc = {
     /* NULL: the generic probe looks for <saves_dir>/<game>_<slot>.ss, the one
      * path snes_load_state() opens. */
     .state_exists = NULL,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_free           = snes_audio_free,
+    .audio_push           = snes_audio_push,
+#endif
+    .flush_saves          = snes_flush_saves,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_restore        = snes_audio_restore
+#endif
 };
 
 /* =========================================================================
@@ -1223,6 +1252,7 @@ static bool snes_load_rom_to_flash(const char *filename, uint32_t size, uint32_t
            filename, (unsigned)size, (unsigned)SNES_ROM_CACHE_ABS, (unsigned)SNES_ROM_CACHE_OFF);
 
     dmg_draw_loading_screen(&s_snes_desc, APP_TITLE, filename, size);
+    dmg_boot_intro_flash_begin();
 
     uint8_t *copy_block = (uint8_t *)malloc(4096);
     if (!copy_block) {
@@ -1496,6 +1526,12 @@ static void update_snes_input(void) {
     }
     if (ev.request_exit_game) {
         s_request_exit_game = true;
+        s_current_pad_mask = 0;
+        return;
+    }
+    if (ev.request_power_off) {
+        s_request_power_off = true;
+        s_power_reason = ev.power_reason;
         s_current_pad_mask = 0;
         return;
     }
@@ -1887,6 +1923,17 @@ static void run_game(void) {
     if (last_flashed_rom_size < 0x8000) return;
     perf_note_heap_before_core();
 
+    /* Standby wake: the intro has to be over before anything below touches the
+     * panel or the audio. ili9341_clear_black() right after this pushes a whole
+     * frame over SPI0, and doing that while core 1 is still drawing the intro
+     * interleaves the two command streams -- the panel took a corrupted command
+     * and stayed white while the game ran blind underneath. Further down,
+     * audio_i2s_update_pio_frequency() and the prefill would also race the
+     * intro's chime in the I2S ring. Whether it happened depended on the ROM
+     * load finishing before or after the intro, hence "sometimes". No-op on a
+     * normal start. */
+    dmg_boot_intro_finish();
+
     /* CRITICAL: Disconnect framebuffer before any memory init or clearing
      * so ili9341_clear_black() does NOT wipe out 153KB over s_wram and s_fillram! */
     ili9341_set_framebuffer(NULL);
@@ -2065,6 +2112,7 @@ static void run_game(void) {
     s9x_set_interleave(persistent_interleave);
     ili9341_set_fps_overlay(persistent_display_fps, fpsString);
 
+    dmg_boot_intro_finish();   /* no-op unless a resume intro is playing */
     ili9341_blitter_start();
 
     s_request_pause_menu = false;
@@ -2124,6 +2172,14 @@ static void run_game(void) {
         }
 
         update_snes_input();
+
+        /* Power switch OFF (or battery cutoff): save at this frame boundary and
+         * sleep. Never returns -- the wake reboots back into the resume path. */
+        if (s_request_power_off) {
+            s_request_power_off = false;
+            ili9341_blitter_stop();
+            dmg_power_off_with_resume(&s_snes_desc, (dmg_power_reason_t)s_power_reason);
+        }
 
         if (s_request_pause_menu) {
             s_request_pause_menu = false;
@@ -2213,6 +2269,28 @@ static void run_game(void) {
         play_snes_audio(s_audio_buffer, samples_to_mix);
 
         frame_count++;
+
+        /* Standby wake: put the game back where the switch left it, now that one
+         * frame has run, through the same steps the pause menu's Load State
+         * takes. Loading before the loop (as before) diverged from that path:
+         * the sound engine or the pacing came up wrong (no audio on the MD,
+         * slow SMS/WS) until a Reset. */
+        if (s_resume_pending) {
+            s_resume_pending = false;
+            ili9341_blitter_stop();
+            const bool resumed = snes_load_state(selectedRom, DMG_RESUME_SLOT);
+            printf("[resume] state %s\n", resumed ? "restored" : "missing, starting fresh");
+            ili9341_clear_black();
+            ili9341_blitter_start();
+            if (s_state_load_broke) {   /* half-restored core: Reset path, as the menu */
+                s_state_load_broke = false;
+                reset = true;
+            }
+            EXT_AUDIO_ENQUEUE_SAMPLES(s_audio_prefill, 2048);
+            s_frame_deadline = time_us_32();
+            dmg_resume_consume();
+            dmg_power_arm_menu_loaded(1000);
+        }
 
         /* FPS calculation */
         uint32_t now = time_us_32();
@@ -2444,6 +2522,33 @@ int main(void) {
 
     ensure_save_directories();
 
+    /* Standby by save state: the power switch saves and sleeps instead of
+     * idling awake, and a wake reboots back here. On a game wake the
+     * bootloader skipped its intro; play it on core 1 while this core
+     * loads the ROM, then restore the _R state before the first frame. */
+    dmg_power_enable_resume(&s_snes_desc);
+    {
+        dmg_resume_record_t rec;
+        const dmg_resume_kind_t rk = dmg_resume_check(&s_snes_desc, &rec);
+        if (rk == DMG_RESUME_GAME) {
+            dmg_boot_intro_start(&s_snes_desc);
+            snprintf(selectedRom, sizeof(selectedRom), "%s", rec.rom_file);
+            s_resume_pending = true;
+        } else if (rk == DMG_RESUME_MENU) {
+            dmg_resume_consume();
+            /* Woke in the ROM selector: nothing to load, so the bootloader's
+             * intro just plays out before the list is drawn. */
+            audio_i2s_update_pio_frequency(44100);   /* the chime is 44.1 kHz */
+        if (dmg_boot_intro_start(&s_snes_desc)) dmg_boot_intro_finish();
+        audio_i2s_update_pio_frequency(SNES_AUDIO_RATE);
+        }
+    }
+    if (s_resume_pending) {
+        snprintf(current_rom_dir, sizeof(current_rom_dir), "%s", dmg_get_current_rom_dir());
+        /* The intro chime is 44.1 kHz; run_game() sets the SNES 32 kHz again. */
+        audio_i2s_update_pio_frequency(44100);
+    }
+
     printf("\n==================================================\n");
     printf("  %s Super Nintendo (SNES) for RP2350\n", APP_TITLE);
     printf("  CPU: %lu MHz | clk_peri %lu MHz | SPI0 panel %lu MHz | SPI1 microSD %lu MHz\n",
@@ -2481,11 +2586,23 @@ int main(void) {
 
     while (true) {
 
-        if (rom_file_selector(selectedRom, sizeof(selectedRom))) {
+        if (s_resume_pending || rom_file_selector(selectedRom, sizeof(selectedRom))) {
             if (load_cart_rom_file(selectedRom)) {
                 dmg_config_commit(&s_snes_desc);
+                dmg_power_set_game(selectedRom, selectedRom);
                 run_game();
+                dmg_power_set_game(NULL, NULL);
+                if (s_resume_pending) {   /* run_game() bailed before the state */
+                    s_resume_pending = false;
+                    dmg_resume_consume();
+                }
+                dmg_boot_intro_finish();
             } else {
+                if (s_resume_pending) {
+                    s_resume_pending = false;
+                    dmg_resume_consume();
+                }
+                dmg_boot_intro_finish();
                 sleep_ms(1500);
             }
         }

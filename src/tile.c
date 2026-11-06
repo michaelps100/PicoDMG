@@ -52,7 +52,7 @@
 extern uint32 HeadMask [4];
 extern uint32 TailMask [5];
 
-uint8 ConvertTile(uint8* pCache, uint32 TileAddr)
+uint8 __not_in_flash_func(ConvertTile)(uint8* pCache, uint32 TileAddr)
 {
    uint8* tp = &Memory.VRAM[TileAddr];
    uint32* p = (uint32*) pCache;

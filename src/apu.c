@@ -49,6 +49,7 @@
 #include "apumem.h"
 #include "soundux.h"
 #include "cpuexec.h"
+#include "pico_snes_mem.h"
 
 #undef ABS
 #define ABS(a) ((a) < 0 ? -(a) : (a))
@@ -363,11 +364,11 @@ bool8 S9xInitAPU()
    IAPU.ExtraRAM = APU.ExtraRAM;
    IAPU.asmJumpTab = &Spc700JumpTab_15;  // Normal case: ONE_APU_CYCLE = 15
 
-   IAPU.RAM = (uint8*) malloc(0x10000);
-   IAPU.ShadowRAM = NULL;//(uint8 *) malloc (0x10000);
-   IAPU.CachedSamples = NULL;//(uint8 *) malloc (0x40000);
+   IAPU.RAM = pico_snes_get_aram();
+   IAPU.ShadowRAM = NULL;
+   IAPU.CachedSamples = NULL;
 
-   if (!IAPU.RAM /*|| !IAPU.ShadowRAM || !IAPU.CachedSamples*/)
+   if (!IAPU.RAM)
    {
       S9xDeinitAPU();
       return (FALSE);
@@ -378,21 +379,9 @@ bool8 S9xInitAPU()
 
 void S9xDeinitAPU()
 {
-   if (IAPU.RAM)
-   {
-      free((char*) IAPU.RAM);
-      IAPU.RAM = NULL;
-   }
-   if (IAPU.ShadowRAM)
-   {
-      free((char*) IAPU.ShadowRAM);
-      IAPU.ShadowRAM = NULL;
-   }
-   if (IAPU.CachedSamples)
-   {
-      free((char*) IAPU.CachedSamples);
-      IAPU.CachedSamples = NULL;
-   }
+   IAPU.RAM = NULL;
+   IAPU.ShadowRAM = NULL;
+   IAPU.CachedSamples = NULL;
 }
 
 void S9xResetAPU(void)

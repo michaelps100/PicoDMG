@@ -42,6 +42,7 @@
 #define _PPU_H_
 
 #include "rops.h"
+#include "pico_snes_mem.h"
 
 #define FIRST_VISIBLE_LINE 1
 
@@ -406,6 +407,7 @@ static INLINE void REGISTER_2118(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (!PPU.VMA.High)
    {
 #ifdef DEBUGGER
@@ -432,6 +434,7 @@ static INLINE void REGISTER_2118_tile(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (!PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2118] = Byte;
@@ -444,6 +447,7 @@ static INLINE void REGISTER_2118_linear(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (!PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2118] = Byte;
@@ -465,6 +469,7 @@ static INLINE void REGISTER_2119(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (PPU.VMA.High)
    {
 #ifdef DEBUGGER
@@ -490,6 +495,7 @@ static INLINE void REGISTER_2119_tile(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2119] = Byte;
@@ -502,6 +508,7 @@ static INLINE void REGISTER_2119_linear(uint8 Byte)
    IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
    IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
    IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   pico_snes_invalidate_tile(address);
    if (PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2119] = Byte;
@@ -550,56 +557,36 @@ static INLINE void REGISTER_2122(uint8 Byte)
 #else // __OLD_RASTER_FX__
 static INLINE void REGISTER_2122(uint8 Byte)
 {
-   // CG-RAM (palette) write
-   
    if (PPU.CGFLIP)
    {
       if ((Byte & 0x7f) != (PPU.CGDATA[PPU.CGADD] >> 8))
       {
-         if (!(Settings.os9x_hack & PPU_IGNORE_PALWRITE))
-         {
-#ifdef   __DEBUG__
-            printf("SetPPU_2122, CG-RAM (palette) write. PPU.CFGFLIP. Byte : %x\n", Byte);
-#endif
-            FLUSH_REDRAW();
-         }
+         FLUSH_REDRAW();
          PPU.CGDATA[PPU.CGADD] &= 0x00FF;
          PPU.CGDATA[PPU.CGADD] |= (Byte & 0x7f) << 8;
          IPPU.ColorsChanged = TRUE;
-         IPPU.Blue [PPU.CGADD] = (Byte >> 2) & 0x1f;
-         IPPU.Green [PPU.CGADD] = (PPU.CGDATA[PPU.CGADD] >> 5) & 0x1f;
-         IPPU.ScreenColors [PPU.CGADD] = (uint16) BUILD_PIXEL(IPPU.XB[IPPU.Red[PPU.CGADD]],
-                                         IPPU.XB[IPPU.Green[PPU.CGADD]],
-                                         IPPU.XB[IPPU.Blue [PPU.CGADD]]);
+         IPPU.Blue [PPU.CGADD]  = IPPU.XB [(Byte >> 2) & 0x1f];
+         IPPU.Green [PPU.CGADD] = IPPU.XB [(PPU.CGDATA[PPU.CGADD] >> 5) & 0x1f];
+         IPPU.ScreenColors [PPU.CGADD] = (uint16) BUILD_PIXEL(IPPU.Red[PPU.CGADD],
+                                         IPPU.Green[PPU.CGADD],
+                                         IPPU.Blue [PPU.CGADD]);
       }
       PPU.CGADD++;
    }
-   else
+   else if (Byte != (uint8)(PPU.CGDATA[PPU.CGADD] & 0xff))
    {
-      if (Byte != (uint8)(PPU.CGDATA[PPU.CGADD] & 0xff))
-      {
-         if (!(Settings.os9x_hack & PPU_IGNORE_PALWRITE))
-         {
-#ifdef   __DEBUG__
-            printf("SetPPU_2122, CG-RAM (palette) write. !PPU.CFGFLIP. Byte : %x\n", Byte);
-#endif
-            FLUSH_REDRAW();
-         }
-
-         PPU.CGDATA[PPU.CGADD] &= 0x7F00;
-         PPU.CGDATA[PPU.CGADD] |= Byte;
-         IPPU.ColorsChanged = TRUE;
-         IPPU.Red [PPU.CGADD] = Byte & 0x1f;
-         IPPU.Green [PPU.CGADD] = (PPU.CGDATA[PPU.CGADD] >> 5) & 0x1f;
-         IPPU.ScreenColors [PPU.CGADD] = (uint16) BUILD_PIXEL(IPPU.XB[IPPU.Red[PPU.CGADD]],
-                                         IPPU.XB[IPPU.Green[PPU.CGADD]],
-                                         IPPU.XB[IPPU.Blue [PPU.CGADD]]);
-      }
+      FLUSH_REDRAW();
+      PPU.CGDATA[PPU.CGADD] &= 0x7F00;
+      PPU.CGDATA[PPU.CGADD] |= Byte;
+      IPPU.ColorsChanged = TRUE;
+      IPPU.Red [PPU.CGADD]   = IPPU.XB [Byte & 0x1f];
+      IPPU.Green [PPU.CGADD] = IPPU.XB [(PPU.CGDATA[PPU.CGADD] >> 5) & 0x1f];
+      IPPU.ScreenColors [PPU.CGADD] = (uint16) BUILD_PIXEL(IPPU.Red[PPU.CGADD],
+                                      IPPU.Green[PPU.CGADD],
+                                      IPPU.Blue [PPU.CGADD]);
    }
    PPU.CGFLIP ^= 1;
-   //    Memory.FillRAM [0x2122] = Byte;
 }
-
 #endif
 
 static INLINE void REGISTER_2180(uint8 Byte)

@@ -56,6 +56,14 @@ I can't take it anymore, it's too convoluted.  So I've commented out the entire
    with a single define-block for each target platform.
 */
 
+#ifndef PIXEL_FORMAT
+#if defined(PS2)
+#define PIXEL_FORMAT BGR555
+#else 
+#define PIXEL_FORMAT RGB555
+#endif
+#endif
+
 /* Required Includes */
 #include "pixform.h"
 #include <stdint.h>
@@ -110,21 +118,18 @@ typedef short        int16_32;
 #define VAR_CYCLES
 //#define SPC700_SHUTDOWN
 #define FASTCALL
-#if defined(PS2)
-#define PIXEL_FORMAT BGR555
-#else 
-#define PIXEL_FORMAT RGB565
-#endif
 #define CPU_SHUTDOWN
 #define PACKING __attribute__ ((packed))
 #define ALIGN_BY_ONE  __attribute__ ((aligned (1), packed))
 #undef  FAST_LSB_WORD_ACCESS
-#define SUPER_FX
+//#define SUPER_FX
 #if defined(ASM_SPC700) && defined(SPC700_SHUTDOWN)
 #undef SPC700_SHUTDOWN
 #endif
 
 void S9xGenerateSound(void);
+
+#include "pico.h"
 
 #define strcasecmp strcmp
 #define strncasecmp strncmp

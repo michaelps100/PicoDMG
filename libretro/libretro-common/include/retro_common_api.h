@@ -104,7 +104,11 @@ typedef int ssize_t;
 #include <inttypes.h>
 #endif
 #ifndef PRId64
-#error "inttypes.h is being screwy"
+#define PRId64 "lld"
+#define PRIu64 "llu"
+#endif
+#ifndef PRIuPTR
+#define PRIuPTR "u"
 #endif
 #define STRING_REP_INT64 "%" PRId64
 #define STRING_REP_UINT64 "%" PRIu64

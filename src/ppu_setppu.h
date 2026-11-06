@@ -1358,8 +1358,8 @@ static void SetPPU_APU(uint8 Byte, uint16 Address)
    // CPU.Flags |= DEBUG_MODE_FLAG;
    Memory.FillRAM[Address] = Byte;
    IAPU.RAM[(Address & 3) + 0xf4] = Byte;
-#ifdef SPC700_SHUTDOWN
    CPU.APU_APUExecuting = Settings.APUEnabled;
+#ifdef SPC700_SHUTDOWN
    IAPU.WaitCounter++;
 #endif
 #endif // SPCTOOL

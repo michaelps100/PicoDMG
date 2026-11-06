@@ -45,9 +45,9 @@
 #include "ppu.h"
 
 #define GFX_PIXSIZE 1
-#define GFX_PITCH 640
-#define GFX_ZPITCH 320
-#define GFX_PPL 320
+#define GFX_PITCH 512
+#define GFX_ZPITCH 256
+#define GFX_PPL 256
 
 typedef struct
 {
@@ -156,7 +156,7 @@ extern uint32_t odd_low [4][16];
 extern uint32_t even_high [4][16];
 extern uint32_t even_low [4][16];
 extern SBG BG;
-extern uint32 DirectColourMaps [8][256];
+extern uint16 DirectColourMaps [8][256];
 
 //extern uint8 add32_32 [32][32];
 //extern uint8 add32_32_half [32][32];
@@ -205,80 +205,46 @@ extern uint8 mul_brightness [16][32];
 #define SUB_SCREEN_DEPTH 0
 #define MAIN_SCREEN_DEPTH 32
 
-#if defined(USE_OLD_COLOUR_OPS)
-/* Pre-1.60 colour operations */
-#if defined(OLD_COLOUR_BLENDING)
-#define COLOR_ADD(C1, C2) \
-GFX.X2 [((((C1) & RGB_REMOVE_LOW_BITS_MASK) + \
-     ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1) + \
-   ((C1) & (C2) & RGB_LOW_BITS_MASK)]
-#else
-#define COLOR_ADD(C1, C2) \
-(GFX.X2 [((((C1) & RGB_REMOVE_LOW_BITS_MASK) + \
-     ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1) + \
-    ((C1) & (C2) & RGB_LOW_BITS_MASK)] | \
- (((C1) ^ (C2)) & RGB_LOW_BITS_MASK))
-#endif
-#else
 static INLINE uint16_t COLOR_ADD(uint16_t C1, uint16_t C2)
 {
-	const int RED_MASK   = 0x1F << RED_SHIFT_BITS;
-	const int GREEN_MASK = 0x1F << GREEN_SHIFT_BITS;
-	const int BLUE_MASK  = 0x1F << BLUE_SHIFT_BITS;
-
-	int rb          = (C1 & (RED_MASK | BLUE_MASK)) + (C2 & (RED_MASK | BLUE_MASK));
-	int rbcarry     = rb & ((0x20 << RED_SHIFT_BITS) | (0x20 << 0));
-	int g           = (C1 & (GREEN_MASK)) + (C2 & (GREEN_MASK));
-	int rgbsaturate = (((g & (0x20 << GREEN_SHIFT_BITS)) | rbcarry) >> 5) * 0x1f;
-	uint16_t retval = (rb & (RED_MASK | BLUE_MASK)) | (g & GREEN_MASK) | rgbsaturate;
-
-#if GREEN_SHIFT_BITS == 6
-	retval         |= (retval & 0x0400) >> 5;
-#endif
-
-	return retval;
+	uint32_t r = ((C1 >> 10) & 0x1F) + ((C2 >> 10) & 0x1F);
+	uint32_t g = ((C1 >> 5) & 0x1F) + ((C2 >> 5) & 0x1F);
+	uint32_t b = (C1 & 0x1F) + (C2 & 0x1F);
+	if (r > 31) r = 31;
+	if (g > 31) g = 31;
+	if (b > 31) b = 31;
+	return (uint16_t)((r << 10) | (g << 5) | b);
 }
-#endif
 
-#define COLOR_ADD1_2(C1, C2) \
-(((((C1) & RGB_REMOVE_LOW_BITS_MASK) + \
-          ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1) + \
-         ((C1) & (C2) & RGB_LOW_BITS_MASK) | ALPHA_BITS_MASK)
+static INLINE uint16_t COLOR_ADD1_2(uint16_t C1, uint16_t C2)
+{
+	uint32_t r = (((C1 >> 10) & 0x1F) + ((C2 >> 10) & 0x1F)) >> 1;
+	uint32_t g = (((C1 >> 5) & 0x1F) + ((C2 >> 5) & 0x1F)) >> 1;
+	uint32_t b = ((C1 & 0x1F) + (C2 & 0x1F)) >> 1;
+	return (uint16_t)((r << 10) | (g << 5) | b);
+}
 
-#if defined(USE_OLD_COLOUR_OPS)
-/* Pre-1.60 colour operations */
-#if defined(OLD_COLOUR_BLENDING)
-#define COLOR_SUB(C1, C2) \
-GFX.ZERO_OR_X2 [(((C1) | RGB_HI_BITS_MASKx2) - \
-       ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1]
-#else
-#define COLOR_SUB(C1, C2) \
-(GFX.ZERO_OR_X2 [(((C1) | RGB_HI_BITS_MASKx2) - \
-                  ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1] + \
-((C1) & RGB_LOW_BITS_MASK) - ((C2) & RGB_LOW_BITS_MASK))
-#endif
-#else
 static INLINE uint16_t COLOR_SUB(uint16_t C1, uint16_t C2)
 {
-	int rb1         = (C1 & (THIRD_COLOR_MASK | FIRST_COLOR_MASK)) | ((0x20 << 0) | (0x20 << RED_SHIFT_BITS));
-	int rb2         = C2 & (THIRD_COLOR_MASK | FIRST_COLOR_MASK);
-	int rb          = rb1 - rb2;
-	int rbcarry     = rb & ((0x20 << RED_SHIFT_BITS) | (0x20 << 0));
-	int g           = ((C1 & (SECOND_COLOR_MASK)) | (0x20 << GREEN_SHIFT_BITS)) - (C2 & (SECOND_COLOR_MASK));
-	int rgbsaturate = (((g & (0x20 << GREEN_SHIFT_BITS)) | rbcarry) >> 5) * 0x1f;
-	uint16_t retval = ((rb & (THIRD_COLOR_MASK | FIRST_COLOR_MASK)) | (g & SECOND_COLOR_MASK)) & rgbsaturate;
-
-#if GREEN_SHIFT_BITS == 6
-	retval         |= (retval & 0x0400) >> 5;
-#endif
-
-	return retval;
+	int32_t r = (int32_t)((C1 >> 10) & 0x1F) - (int32_t)((C2 >> 10) & 0x1F);
+	int32_t g = (int32_t)((C1 >> 5) & 0x1F) - (int32_t)((C2 >> 5) & 0x1F);
+	int32_t b = (int32_t)(C1 & 0x1F) - (int32_t)(C2 & 0x1F);
+	if (r < 0) r = 0;
+	if (g < 0) g = 0;
+	if (b < 0) b = 0;
+	return (uint16_t)(((uint32_t)r << 10) | ((uint32_t)g << 5) | (uint32_t)b);
 }
-#endif
 
-#define COLOR_SUB1_2(C1, C2) \
-GFX.ZERO [(((C1) | RGB_HI_BITS_MASKx2) - \
-      ((C2) & RGB_REMOVE_LOW_BITS_MASK)) >> 1]
+static INLINE uint16_t COLOR_SUB1_2(uint16_t C1, uint16_t C2)
+{
+	int32_t r = (int32_t)((C1 >> 10) & 0x1F) - (int32_t)((C2 >> 10) & 0x1F);
+	int32_t g = (int32_t)((C1 >> 5) & 0x1F) - (int32_t)((C2 >> 5) & 0x1F);
+	int32_t b = (int32_t)(C1 & 0x1F) - (int32_t)(C2 & 0x1F);
+	if (r < 0) r = 0;
+	if (g < 0) g = 0;
+	if (b < 0) b = 0;
+	return (uint16_t)((((uint32_t)r >> 1) << 10) | (((uint32_t)g >> 1) << 5) | ((uint32_t)b >> 1));
+}
 
 typedef void (*NormalTileRenderer)(uint32 Tile, int32 Offset,
                                    uint32 StartLine, uint32 LineCount);

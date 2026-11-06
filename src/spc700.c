@@ -99,12 +99,6 @@ void STOP(char* s)
    S9xMessage(S9X_ERROR, S9X_APU_STOPPED, String);
    APU.TimerEnabled[0] = APU.TimerEnabled[1] = APU.TimerEnabled[2] = FALSE;
    CPU.APU_APUExecuting = FALSE;
-
-#ifdef DEBUGGER
-   CPU.Flags |= DEBUG_MODE_FLAG;
-#else
-   S9xExit();
-#endif
 }
 
 #define TCALL(n)\
