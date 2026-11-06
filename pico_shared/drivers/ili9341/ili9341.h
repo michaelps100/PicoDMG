@@ -118,6 +118,7 @@ ili9341_scale_mode_t ili9341_get_scale_mode(void);
 /* Graphics and UI primitives */
 void ili9341_fill_screen(uint16_t color);
 void ili9341_fill_rect(int x, int y, int w, int h, uint16_t color);
+void ili9341_write_rect_565(int x, int y, int w, int h, const uint16_t *px);
 void ili9341_draw_char(char c, uint16_t x, uint16_t y, uint16_t fg, uint16_t bg);
 void ili9341_text(const char *str, uint16_t x, uint16_t y, uint16_t fg, uint16_t bg);
 

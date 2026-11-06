@@ -81,6 +81,10 @@ static ili9341_scale_mode_t s_scale_mode = SCALE_FIT;
 static uint8_t s_next_row = 0u;
 static uint8_t s_field_parity = 0u; /* 0 or 1: interlaced fields to halve SPI bandwidth */
 static uint32_t s_row_hash[ILI9341_HEIGHT];
+static bool s_bov_frame_rows = false;   /* low-battery overlay: rows emitted this frame */
+static inline bool bov_in_rows(uint16_t row) {
+    return row >= dmg_batt_overlay_y0() && row < dmg_batt_overlay_y0() + dmg_batt_overlay_h();
+}
 /* Per-second WonderSwan profiling counters (see ili9341_ws_prof_take). Written
  * from Core 0 except c1_us, which Core 1 owns; plain 32-bit stores, no locking. */
 static volatile ili9341_ws_prof_t s_prof;
@@ -1722,6 +1726,9 @@ void __not_in_flash_func(ili9341_stream_ws_line)(int line, const uint8_t *indexe
         const uint8_t row = rows[i];
         rh[i] = h_line;
         if (grid && (row & 1u)) rh[i] ^= 0x5A5A5A5Au;
+        dmg_batt_overlay_mark_row(row);
+        s_bov_frame_rows = true;
+        rh[i] ^= dmg_batt_overlay_row_salt(row);
         if (hud_on && row >= 180 && row < 200) {
             s_row_hash[row] = 0xFFFFFFFFu;
             need[i] = true;
@@ -1777,6 +1784,16 @@ void __not_in_flash_func(ili9341_stream_ws_line)(int line, const uint8_t *indexe
         s_slot_row[slots[j]] = srows[j];
         s_slot_x0[slots[j]]  = s_ws_ax0;
         s_slot_w[slots[j]]   = s_ws_aw;
+        if (bov_in_rows(srows[j])) {
+            /* low-battery overlay rows go out full width: the overlay reaches past
+             * the image span, and the next send after it hides wipes the border */
+            const uint16_t ax1 = (uint16_t)(s_ws_ax0 + s_ws_aw);
+            if (s_ws_ax0 > 0u) memset(dst16, 0, 2u * (size_t)s_ws_ax0);
+            if (ax1 < ILI9341_WIDTH) memset(&dst16[ax1], 0, 2u * (size_t)(ILI9341_WIDTH - ax1));
+            dmg_batt_overlay_stamp_row(srows[j], dst16, 0, ILI9341_WIDTH, true);
+            s_slot_x0[slots[j]] = 0u;
+            s_slot_w[slots[j]]  = ILI9341_WIDTH;
+        }
         __atomic_store_n(&s_slot_state[slots[j]], 1u, __ATOMIC_RELEASE);
     }
     s_write_slot = (uint8_t)((first + np) % NES_LCD_SLOTS);
@@ -1812,6 +1829,7 @@ void __not_in_flash_func(ili9341_stream_ws_frame_end)(void) {
                         }
                         x_pos += 8;
                     }
+                    dmg_batt_overlay_stamp_row(row, (uint16_t *)dst, 0, ILI9341_WIDTH, true);
                     s_slot_row[slot] = row;
                     __atomic_store_n(&s_slot_state[slot], 1u, __ATOMIC_RELEASE);
                     s_write_slot = (uint8_t)((slot + 1u) % NES_LCD_SLOTS);
@@ -1824,12 +1842,34 @@ void __not_in_flash_func(ili9341_stream_ws_frame_end)(void) {
                     tight_loop_contents();
                 }
                 memset(s_slot_data[slot], 0, ILI9341_WIDTH * 2);
+                dmg_batt_overlay_stamp_row(row, (uint16_t *)s_slot_data[slot], 0, ILI9341_WIDTH, true);
                 s_slot_row[slot] = row;
                 __atomic_store_n(&s_slot_state[slot], 1u, __ATOMIC_RELEASE);
                 s_write_slot = (uint8_t)((slot + 1u) % NES_LCD_SLOTS);
                 s_row_hash[row] = 0u;
             }
             s_ws_fps_drawn = false;
+        }
+    }
+
+    /* Low-battery overlay rows the image does not cover: black + overlay */
+    if (s_bov_frame_rows) {
+        s_bov_frame_rows = false;
+        const uint32_t m = dmg_batt_overlay_frame_rows();
+        const uint16_t y0 = dmg_batt_overlay_y0();
+        for (uint16_t i = 0; i < dmg_batt_overlay_h(); i++) {
+            if (!(m & (1u << i))) continue;
+            const uint16_t row = (uint16_t)(y0 + i);
+            const uint8_t slot = s_write_slot;
+            while (__atomic_load_n(&s_slot_state[slot], __ATOMIC_ACQUIRE)) tight_loop_contents();
+            memset(s_slot_data[slot], 0, ILI9341_WIDTH * 2);
+            dmg_batt_overlay_stamp_row(row, (uint16_t *)s_slot_data[slot], 0, ILI9341_WIDTH, true);
+            s_slot_row[slot] = (uint8_t)row;
+            s_slot_x0[slot] = 0u;
+            s_slot_w[slot] = ILI9341_WIDTH;
+            __atomic_store_n(&s_slot_state[slot], 1u, __ATOMIC_RELEASE);
+            s_write_slot = (uint8_t)((slot + 1u) % NES_LCD_SLOTS);
+            s_row_hash[row] = 0u;
         }
     }
 
@@ -1970,6 +2010,9 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
 
     uint32_t h = ws_line_hash(indexed_144, WS_VERT_W);
     if (apply_grid && (row & 1u)) h ^= 0x5A5A5A5Au;
+    dmg_batt_overlay_mark_row(row);
+    s_bov_frame_rows = true;
+    h ^= dmg_batt_overlay_row_salt(row);
 
     /* volume HUD rows are always sent while it shows (see ili9341_stream_ws_line) */
     if (row >= 180 && row < 200 && dmg_volume_hud_is_active()) {
@@ -1982,7 +2025,8 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
     ws_prepare_vxmap();
 
     const bool overlay = (s_fps_enabled && row >= 8 && row < 16) ||
-                         (row >= 180 && row < 200 && dmg_volume_hud_is_active());
+                         (row >= 180 && row < 200 && dmg_volume_hud_is_active()) ||
+                         dmg_batt_overlay_row_hit(row);
     const bool wide = overlay || s_ws_vrow_wide[row];
     s_ws_vrow_wide[row] = overlay;
     const uint16_t xlo = wide ? 0u : s_ws_vx0;
@@ -2165,6 +2209,8 @@ static void __not_in_flash_func(ws_vband_push)(const uint8_t *indexed_144, uint8
             }
         }
     }
+
+    dmg_batt_overlay_stamp_row(row, dst16, 0, ILI9341_WIDTH, true);
 
     s_slot_row[slot] = row;
     s_slot_x0[slot]  = xlo;
@@ -2426,6 +2472,10 @@ bool ili9341_is_frame_busy(void) {
 }
 
 /* Menu synchronous flush (flushes full 320x240 s_fb with RGB555->RGB565 conversion) */
+/* One line buffer for the three blocking flushes below. They all run on core 0
+ * and never overlap, and three separate statics were SRAM PicoWS did not have. */
+static uint16_t s_flush_line[ILI9341_WIDTH];
+
 void ili9341_flush(bool wait) {
     (void)wait;
     ili9341_wait_frame_done();
@@ -2437,7 +2487,7 @@ void ili9341_flush(bool wait) {
     cs_low();
     spi_set_format(ILI9341_SPI, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
-    static uint16_t line_buf[ILI9341_WIDTH];
+    uint16_t *line_buf = s_flush_line;
     for (int y = 0; y < ILI9341_HEIGHT; y++) {
         const uint16_t *src = &s_fb[y * ILI9341_WIDTH];
         for (int x = 0; x < ILI9341_WIDTH; x++) {
@@ -2464,7 +2514,7 @@ void ili9341_flush_buffer(const uint16_t *buffer, bool wait) {
     cs_low();
     spi_set_format(ILI9341_SPI, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
-    static uint16_t line_buf[ILI9341_WIDTH];
+    uint16_t *line_buf = s_flush_line;
     for (int y = 0; y < ILI9341_HEIGHT; y++) {
         const uint16_t *src = &buffer[y * ILI9341_WIDTH];
         for (int x = 0; x < ILI9341_WIDTH; x++) {
@@ -2494,7 +2544,7 @@ void ili9341_flush_rows(int y_start, int y_end) {
     cs_low();
     spi_set_format(ILI9341_SPI, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
-    static uint16_t line_buf[ILI9341_WIDTH];
+    uint16_t *line_buf = s_flush_line;
     for (int y = y_start; y <= y_end; y++) {
         const uint16_t *src = &s_fb[y * ILI9341_WIDTH];
         for (int x = 0; x < ILI9341_WIDTH; x++) {
@@ -2508,6 +2558,35 @@ void ili9341_flush_rows(int y_start, int y_end) {
 
     cs_high();
     spi_set_format(ILI9341_SPI, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+}
+
+/* Direct-to-panel block write, host-order RGB565, no framebuffer. Used by the
+ * standby-resume intro on core 1 (shared_menu/dmg_boot_intro.c) while core 0
+ * loads the game -- so it must not touch the framebuffer or the blitter state,
+ * only the SPI. Blocking SPI on purpose: the DMA channel belongs to the blitter. */
+void ili9341_write_rect_565(int x, int y, int w, int h, const uint16_t *px) {
+    if (px == NULL || w <= 0 || h <= 0) return;
+    if (x < 0 || y < 0 || x + w > ILI9341_WIDTH || y + h > ILI9341_HEIGHT) return;
+
+    set_addr_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + w - 1), (uint16_t)(y + h - 1));
+    write_cmd(CMD_RAMWR);
+    dc_data();
+    cs_low();
+    uint8_t buf[64];
+    size_t n = 0;
+    const int count = w * h;
+    for (int i = 0; i < count; i++) {
+        buf[n++] = (uint8_t)(px[i] >> 8);
+        buf[n++] = (uint8_t)(px[i] & 0xFF);
+        if (n == sizeof(buf)) {
+            spi_write_blocking(ILI9341_SPI, buf, n);
+            n = 0;
+        }
+    }
+    if (n) spi_write_blocking(ILI9341_SPI, buf, n);
+    while (spi_is_busy(ILI9341_SPI)) tight_loop_contents();
+    while (spi_is_readable(ILI9341_SPI)) (void)spi_get_hw(ILI9341_SPI)->dr;
+    cs_high();
 }
 
 void ili9341_fill_rect(int x, int y, int w, int h, uint16_t color) {

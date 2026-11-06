@@ -82,6 +82,9 @@ add_executable(${projectname}
     ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_panel.c
     ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_combo.c
     ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_power.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_battery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_resume.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_boot_intro.c
 )
 
 # Test builds: -DWS_EXTRA_DEFS="WS_NO_IDLE_SKIP;..." (see build_variant.ps1)
@@ -213,6 +216,7 @@ PRIVATE
     hardware_timer
     hardware_clocks
     hardware_xosc
+    hardware_adc
     hardware_rosc
     hardware_pwm
     hardware_flash

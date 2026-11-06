@@ -838,3 +838,72 @@ Modo de janela `0x10` (bit "fora" sem o bit de habilitar): o Oswan não desenha 
 1. Regressão nos outros jogos com o caminho rápido com janelas e o novo `audio_primed`: Klonoa (música e voz do Moo), FF1, Tetris, um `.ws` mono, modo vertical.
 2. Se ainda for preciso folga no render: medir `ws_tileCache_getTileRow` (decodificação de tiles 4bpp/2bpp) antes de mexer.
 3. Contadores antigos sem consumidor: `s_prof` (`ili9341.c`), `ws_prof_rom` (`memory.c`), `ws_prof_instr` (`nec.c`).
+
+---
+
+## 33. Travamento em "Iniciando MicroSD..." — falta de heap para o anel I2S (05/11/2026)
+
+### Sintoma
+O console parava na tela "Iniciando MicroSD..." e nunca mostrava a lista de jogos, inclusive com bateria. Os outros emuladores funcionavam.
+
+### Causa
+O SD não tem relação com o problema. Essa tela só é desenhada depois que o `f_mount()` já deu certo.
+
+O passo seguinte é o `audio_i2s_setup()`, que fazia `malloc(I2S_AUDIO_RING_SIZE * 4)`. Com `I2S_AUDIO_RING_SIZE=2048`, isso dá **8 KB**, e no ELF a chamada aparece como `calloc(8192, 1)`. A alocação falhava, o `__wrap_calloc` do SDK entrava em `panic()` e a tela ficava congelada; o watchdog só é ligado durante o jogo.
+
+- O trabalho de bateria no `shared_menu` (raiz §42/§44) ocupou ~5,9 KB de `.bss`, principalmente `s_bov`, com 3.584 B. Com isso o heap caiu:
+
+  | | Antes | Depois |
+  | :--- | ---: | ---: |
+  | HW16 | 18.516 B | 12.644 B |
+  | HW15 | 10.868 B | 4.996 B |
+
+- O newlib arredonda o `sbrk` para páginas de 4 KB:
+  1. O pool de exceções do libstdc++ (1.088 B, alocado antes do `main`) leva o topo do heap a `0x2007E000`.
+  2. O pedido de 8 KB vira um `sbrk` de 12.288 B, até `0x20081000`, o que passa do `__StackLimit` (`0x20080000`).
+
+  Por isso 12,6 KB livres não bastavam para 8 KB.
+
+### Correção
+- `pico_shared/drivers/pico_audio_i2s/audio_i2s.c`: o anel agora é estático (`s_audio_ring_buf`). O `free()` de `audio_i2s_disable()` foi removido. Se faltar RAM, o erro passa a aparecer no link, e não mais no boot.
+- `src/main.cpp`: o `blk` da gravação de ROM em flash caiu de 4 KB para 2 KB. O laço trabalha em múltiplos de 256 B, e isso devolve a RAM de que o HW15 precisa.
+- Nenhum outro emulador foi alterado.
+
+---
+
+## Standby por Savestate e Resume (2026-11-05)
+
+Camada comum: `AGENTS.md` da raiz, §45 (`shared_menu/dmg_power`, `dmg_resume`,
+`dmg_boot_intro`). Aqui fica so o que mudou neste emulador.
+
+Fluxo: chave OFF -> backlight apagado, painel pintado de preto, savestate no slot
+`_R` (`<saves_dir>/<jogo>_R.ss`, nunca aparece no Load State 1..4), saves de
+bateria gravados, `0:/saves/resume.bin`, DORMANT. Chave ON -> reboot, o bootloader
+pula direto para o emulador, a abertura do bootloader (logo + som) roda no Core 1
+enquanto o Core 0 carrega a ROM, e o `_R` e carregado depois do 1o quadro.
+Desligar no seletor de jogos volta ao seletor, tambem com a abertura.
+
+### O que foi feito
+- `ili9341_write_rect_565()` no driver; `audio_i2s_flush()` no driver de audio.
+- Descritor: `audio_free/push` (anel EXT 44,1 kHz),
+  `flush_saves = ws_flush_battery_save`, `audio_restore = ws_audio_restore`
+  (flush + 44,1 kHz).
+- `_R` carregado em `run_game()`, dentro do loop, depois do 1o quadro (antes era logo
+  apos `ws_sram_load()`), pela sequencia do Load State do menu de pausa. Corrigiu a
+  lentidao depois do resume.
+
+### RAM do HW15
+O build HW15 ja passava ~3,5 KB do limite (overlay de bateria) e com o resume
+chegou a 4,4 KB. Liberado sem mudar comportamento:
+- buffer da gravacao de flash reaproveita o quadro do modo Tate (`s_ws_vframe`) no
+  HW15 (2 KB);
+- os tres `line_buf` dos flushes do driver viraram um so (`s_flush_line`);
+- no `shared_menu`: ponteiros em vez de copias em `dmg_power`, buffer de coluna da
+  abertura na pilha do Core 1, `VOLUME=` do `boot.txt` regravado linha a linha.
+
+Resultado: **RAM 99,96% (~190 B livres)**. Qualquer static novo no HW15 precisa de
+compensacao.
+
+### Status
+Validado em hardware (Core2350B) pelo usuario em 2026-11-05: OFF no jogo, no menu
+de pausa e no seletor; volta no mesmo ponto, com som e FPS normais.

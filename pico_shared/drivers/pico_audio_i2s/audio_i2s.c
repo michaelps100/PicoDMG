@@ -38,6 +38,10 @@
 
 // Ring buffer for audio samples. It holds AUDIO_RING_SIZE samples, which are 32-bit integers.
 static uint32_t *audio_ring = NULL;
+/* Static, not malloc'd: PicoWS has ~12 KB of heap and newlib rounds sbrk to
+ * 4 KB pages, so an 8 KB malloc here failed and panicked at boot (stuck on
+ * "Iniciando MicroSD..."). A static buffer fails at link time instead. */
+static uint32_t s_audio_ring_buf[I2S_AUDIO_RING_SIZE] __attribute__((aligned(4)));
 static volatile size_t write_index = 0;
 static volatile size_t read_index = 0;
 static int _driver = 0;
@@ -138,7 +142,7 @@ audio_i2s_hw_t *audio_i2s_setup(int driver, int freqHZ, int dmachan)
 		samplefreq = freqHZ;
 	}
 	printf("Allocating %d bytes for audio ring buffer\n", I2S_AUDIO_RING_SIZE * sizeof(uint32_t));
-	audio_ring = malloc(I2S_AUDIO_RING_SIZE * sizeof(uint32_t));
+	audio_ring = s_audio_ring_buf;
 	memset(audio_ring, 0, I2S_AUDIO_RING_SIZE * sizeof(uint32_t));
 	write_index = 0;
 	read_index = 0;
@@ -298,6 +302,24 @@ void __not_in_flash_func(audio_i2s_enqueue_samples)(const uint32_t *samples, siz
 	restore_interrupts(save);
 }
 
+/* Empty the ring and stop the DMA, from core 0. Used after the standby-resume
+ * intro (shared_menu/dmg_boot_intro.c), which played its chime through this
+ * ring from core 1: the game has to start with the audio exactly as on a
+ * normal boot -- ring empty, DMA idle, nothing pending. The completion IRQ an
+ * abort of an active transfer can still raise is cleared too, or dma_handler()
+ * would advance read_index right after the reset. */
+void audio_i2s_flush(void)
+{
+	if (!audio_ring) return;
+	uint32_t save = save_and_disable_interrupts();
+	dma_channel_abort(audio_i2s.dma_chan);
+	dma_hw->ints0 = 1u << audio_i2s.dma_chan;
+	dma_hw->ints1 = 1u << audio_i2s.dma_chan;
+	read_index = 0;
+	write_index = 0;
+	restore_interrupts(save);
+}
+
 int audio_i2s_get_freebuffer_size()
 {
 	return (read_index - write_index - 1) & AUDIO_RING_MASK;
@@ -323,8 +345,7 @@ void audio_i2s_disable()
 		irq_set_enabled(DMA_IRQ_0, false);
 	}
 	dma_channel_abort(audio_i2s.dma_chan);
-	free(audio_ring);
-	audio_ring = NULL;
+	audio_ring = NULL;   /* static buffer: nothing to free */
 }
 
 bool audio_i2s_dacError()

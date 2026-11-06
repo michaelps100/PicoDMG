@@ -40,6 +40,8 @@
 #include "ili9341.h"
 #include "dmg_menu.h"
 #include "dmg_combo.h"
+#include "dmg_resume.h"
+#include "dmg_boot_intro.h"
 #include "FrensHelpers.h"
 #include "external_audio.h"
 
@@ -357,6 +359,10 @@ static void ws_apply_fps(bool on);
 extern "C" volatile uint32_t ws_sram_epoch;
 static char     s_sav_path[ROM_NAME_LEN + 32];
 static bool     s_sav_active = false;
+/* Standby by save state (shared_menu/dmg_power.h). */
+static bool s_request_power_off = false;
+static uint8_t s_power_reason = 0;
+static bool s_resume_pending = false;
 static uint32_t s_sav_epoch  = 0;
 
 static void ws_flush_battery_save(void) {
@@ -388,6 +394,17 @@ static const char *s_ws_candidate_dirs[] = {
     NULL
 };
 
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+/* Resume intro chime, pushed from core 1 into the I2S ring (dmg_boot_intro.c). */
+static int  ws_audio_free(void) { return EXT_AUDIO_GET_FREE(); }
+static void ws_audio_push(int16_t l, int16_t r) { EXT_AUDIO_ENQUEUE_SAMPLE(l, r); }
+static void ws_audio_restore(void) {
+    /* After the resume intro: ring empty, DMA idle, emulator's rate. */
+    audio_i2s_flush();
+    audio_i2s_update_pio_frequency(44100);
+}
+#endif
+
 static const dmg_emulator_desc_t s_ws_desc = {
     .app_title = "PicoWS",
     .default_rom_dir = "0:/roms/ws",
@@ -405,6 +422,7 @@ static const dmg_emulator_desc_t s_ws_desc = {
         .flush = ili9341_flush,
         .stop_blitter = ws_stop_blitter,
         .start_blitter = ili9341_blitter_start,
+        .write_rect_565 = ili9341_write_rect_565,
     },
     .is_rom_file = ws_is_rom_file,
     .on_load_rom = NULL,
@@ -425,6 +443,14 @@ static const dmg_emulator_desc_t s_ws_desc = {
     .get_fps = ws_get_fps,
     .apply_fps = ws_apply_fps,
     .state_exists = ws_state_exists,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_free           = ws_audio_free,
+    .audio_push           = ws_audio_push,
+#endif
+    .flush_saves          = ws_flush_battery_save,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    .audio_restore        = ws_audio_restore
+#endif
 };
 
 static bool ws_get_fps(void) {
@@ -648,14 +674,25 @@ static bool flash_load_rom(const char *filename) {
     if (!flashed) {
         dmg_draw_loading_screen(&s_ws_desc, "CARREGANDO FLASH", filename, size);
 
-        static uint8_t blk[4096];
+        /* 2 KB (was 4 KB): frees SRAM for the static I2S ring; any multiple
+         * of FLASH_PAGE_SIZE works with the loop below. */
+#if defined(PSRAM_CS_PIN) && PSRAM_CS_PIN
+        static uint8_t blk_store[2048];
+        uint8_t *blk = blk_store;
+#else
+        /* HW15 has no SRAM to spare: borrow the Tate frame buffer, which is
+         * idle while a ROM is being loaded (it is only drawn during play). */
+        uint8_t *blk = s_ws_vframe;
+#endif
+        const uint32_t blk_size = 2048u;
         uint32_t off = 0;
+        dmg_boot_intro_flash_begin();   /* core 1 runs the intro from XIP */
         while (off < size) {
             watchdog_update();
-            uint32_t chunk = (size - off > sizeof(blk)) ? sizeof(blk) : (size - off);
+            uint32_t chunk = (size - off > blk_size) ? blk_size : (size - off);
             UINT rd = 0;
             if (f_read(&s_fil, blk, chunk, &rd) != FR_OK || rd != chunk) {
-                f_close(&s_fil); return false;
+                f_close(&s_fil); dmg_boot_intro_flash_end(); return false;
             }
             uint32_t prog = (chunk + FLASH_PAGE_SIZE - 1u) & ~(FLASH_PAGE_SIZE - 1u);
             if (prog > chunk) memset(blk + chunk, 0xFF, prog - chunk);
@@ -670,6 +707,7 @@ static bool flash_load_rom(const char *filename) {
             if (memcmp((const void *)(WS_ROM_CACHE_ABS + off), blk, chunk) != 0) {
                 printf("[E] Flash verification failed at offset %u!\n", (unsigned)off);
                 f_close(&s_fil);
+                dmg_boot_intro_flash_end();
                 return false;
             }
 
@@ -686,6 +724,7 @@ static bool flash_load_rom(const char *filename) {
         strncpy(nhdr.filename, clean, sizeof(nhdr.filename)-1);
         safe_flash_range_erase(WS_CACHE_HDR_OFF, FLASH_SECTOR_SIZE);
         safe_flash_range_program(WS_CACHE_HDR_OFF, (const uint8_t *)&nhdr, FLASH_PAGE_SIZE);
+        dmg_boot_intro_flash_end();
     } else {
         dmg_draw_loading_screen(&s_ws_desc, "CARREGANDO FLASH", filename, size);
         dmg_update_loading_progress(&s_ws_desc, size, size);
@@ -935,6 +974,7 @@ static void run_game(void) {
         if (s_ws_vframe) memset(s_ws_vframe, 0, 144 * 224);
     }
 #endif
+    dmg_boot_intro_finish();   /* no-op unless a resume intro is playing */
     ili9341_clear_black();
     ili9341_set_scale_mode(cfg_scale);
     ili9341_set_ws_vertical(s_ws_vertical);
@@ -1007,6 +1047,13 @@ static void run_game(void) {
          */
         dmg_combo_events_t ev;
         dmg_combo_frame(&pad_in, &s_ws_desc, &ev);
+
+        /* Power switch OFF (or battery cutoff): save at this frame boundary and
+         * sleep. Never returns -- the wake reboots back into the resume path. */
+        if (ev.request_power_off) {
+            ws_stop_blitter();
+            dmg_power_off_with_resume(&s_ws_desc, (dmg_power_reason_t)ev.power_reason);
+        }
 
         if (ev.request_pause_menu) s_req_pause = true;
         if (ev.request_exit_game)  s_req_exit = true;
@@ -1159,6 +1206,26 @@ static void run_game(void) {
         }
         if (draw_frame) ili9341_stream_ws_frame_end();
         frame_cnt++;
+
+        /* Standby wake: put the game back where the switch left it, now that one
+         * frame has run, through the same steps the pause menu's Load State
+         * takes. Loading before the loop (as before) diverged from that path:
+         * the sound engine or the pacing came up wrong (no audio on the MD,
+         * slow SMS/WS) until a Reset. */
+        if (s_resume_pending) {
+            s_resume_pending = false;
+            watchdog_disable();
+            ws_stop_blitter();
+            const bool resumed = ws_load_state(s_selected_rom, DMG_RESUME_SLOT);
+            printf("[resume] state %s\n", resumed ? "restored" : "missing, starting fresh");
+            ili9341_clear_black();
+            ili9341_blitter_start();
+            watchdog_enable(6000, false);
+            frame_timer = time_us_32();
+            fps_timer = time_us_32();
+            dmg_resume_consume();
+            dmg_power_arm_menu_loaded(1000);
+        }
         uint32_t now = time_us_32();
         if (now - fps_timer >= 1000000u) {
             uint32_t fps_val = frame_cnt;
@@ -1337,19 +1404,45 @@ int main(void) {
     ili9341_set_fps_overlay(cfg_fps, "60");
     ensure_save_dirs();
 
+    /* Standby by save state: the power switch saves and sleeps instead of
+     * idling awake, and a wake reboots back here. On a game wake the
+     * bootloader skipped its intro; play it on core 1 while this core
+     * loads the ROM, then restore the _R state before the first frame. */
+    dmg_power_enable_resume(&s_ws_desc);
+    {
+        dmg_resume_record_t rec;
+        const dmg_resume_kind_t rk = dmg_resume_check(&s_ws_desc, &rec);
+        if (rk == DMG_RESUME_GAME) {
+            dmg_boot_intro_start(&s_ws_desc);
+            snprintf(s_selected_rom, sizeof(s_selected_rom), "%s", rec.rom_file);
+            s_resume_pending = true;
+        } else if (rk == DMG_RESUME_MENU) {
+            dmg_resume_consume();
+            /* Woke in the ROM selector: nothing to load, so the bootloader's
+             * intro just plays out before the list is drawn. */
+            if (dmg_boot_intro_start(&s_ws_desc)) dmg_boot_intro_finish();
+        }
+    }
 
     printf("\n=== %s WonderSwan for RP2350 ===\n", APP_TITLE);
     printf("CPU: %lu MHz | Display: ILI9341 320x240\n",
            (unsigned long)(clock_get_hz(clk_sys) / 1000000));
 
-    s_selected_rom[0] = '\0';
+    if (!s_resume_pending) s_selected_rom[0] = '\0';
 
     while (true) {
-        if (rom_file_selector(s_selected_rom, sizeof(s_selected_rom))) {
+        if (s_resume_pending || rom_file_selector(s_selected_rom, sizeof(s_selected_rom))) {
             if (flash_load_rom(s_selected_rom)) {
                 wait_buttons_released();
+                dmg_power_set_game(s_selected_rom, s_selected_rom);
                 run_game();
+                dmg_power_set_game(NULL, NULL);
             } else {
+                if (s_resume_pending) {
+                    s_resume_pending = false;
+                    dmg_resume_consume();
+                }
+                dmg_boot_intro_finish();
                 /* Show error */
                 ili9341_fill_screen(UI_BG);
                 ili9341_text("ROM load failed!", 80, 120, UI_ERR, UI_BG);

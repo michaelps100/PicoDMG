@@ -78,6 +78,7 @@ void audio_i2s_out_32(uint32_t sample32);
 void audio_i2s_enqueue_sample(uint32_t sample32);
 void audio_i2s_enqueue_samples(const uint32_t *samples, size_t count);
 enum headphone_toggle_t audio_i2s_poll_headphone_status();
+void audio_i2s_flush(void);
 int audio_i2s_get_freebuffer_size();
 int audio_i2s_get_fill_permille();
 void audio_i2s_disable() ;
