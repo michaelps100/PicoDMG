@@ -29,7 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define NUMBER_OF_MANUAL_PALETTES 13
+#define NUMBER_OF_MANUAL_PALETTES 14
 #define PALETTE_SIZE_IN_BYTES (3 * 4 * sizeof(uint16_t))
 
 typedef uint16_t palette_t[3][4];
@@ -555,6 +555,17 @@ void get_colour_palette(palette_t selected_palette,uint8_t table_entry,uint8_t s
 			{ 0xFFFF, 0xFC30, 0x91C7, 0x0000 }, /* OBJ0 */
 			{ 0xFFFF, 0x653F, 0x001F, 0x0000 }, /* OBJ1 */
 			{ 0xFFFF, 0x7FE6, 0x0318, 0x0000 }  /* BG */
+		};
+		memcpy(selected_palette, palette, PALETTE_SIZE_IN_BYTES);
+		return;
+	}
+	if(table_entry==0xFE && shuffling_flags==0xFE)
+	{
+		/* Game Boy Light palette (electroluminescent teal/cyan backlight) */
+		const palette_t palette = 	{
+			{ 0x46F8, 0x24F0, 0x12A9, 0x0103 }, /* OBJ0 */
+			{ 0x46F8, 0x24F0, 0x12A9, 0x0103 }, /* OBJ1 */
+			{ 0x46F8, 0x24F0, 0x12A9, 0x0103 }  /* BG */
 		};
 		memcpy(selected_palette, palette, PALETTE_SIZE_IN_BYTES);
 		return;
@@ -1343,6 +1354,12 @@ void manual_assign_palette(palette_t palette, uint8_t selection)
 			/* A + B Original Game Boy DMG color palette (monochrome 4-shades of green!) */
  			get_colour_palette(palette,0xFF,0xFF);
  			break;
+		}
+		case 13:
+		{
+			/* Game Boy Light color palette (electroluminescent teal/cyan backlight) */
+			get_colour_palette(palette,0xFE,0xFE);
+			break;
 		}
 		default:
 		{

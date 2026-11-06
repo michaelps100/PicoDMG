@@ -31,6 +31,11 @@
 #include <hardware/dma.h>
 #include "audio_i2s.pio.h"
 
+/* Highest volume allowed. 0 (full scale) overdrives the MAX98357A and trips
+ * its thermal protection in a few seconds, so the loudest setting is capped.
+ * Volume == I2S_MIN_VOLUME means samples are divided by (1u << I2S_MIN_VOLUME). */
+#define I2S_MIN_VOLUME 4u
+
 typedef struct i2s_config 
 {
     uint32_t sample_freq;        
@@ -40,8 +45,10 @@ typedef struct i2s_config
     PIO	     pio;
     uint8_t  sm; 
     uint8_t  dma_channel;
+    uint8_t  dma_channel_b;
     uint16_t dma_trans_count;
     uint16_t *dma_buf;
+    uint16_t *dma_buf_b;
     uint8_t volume;
 } i2s_config_t;
 
@@ -51,5 +58,9 @@ void i2s_init(i2s_config_t *i2s_config);
 void i2s_write(const i2s_config_t *i2s_config,const int16_t *samples,const size_t len);
 void i2s_dma_write(i2s_config_t *i2s_config,const int16_t *samples);
 void i2s_volume(i2s_config_t *i2s_config,uint8_t volume);
+size_t i2s_ring_free(void);
+void i2s_ring_push(i2s_config_t *i2s_config, int16_t left, int16_t right);
 void i2s_increase_volume(i2s_config_t *i2s_config);
 void i2s_decrease_volume(i2s_config_t *i2s_config);
+void i2s_audio_start(i2s_config_t *i2s_config);
+void i2s_audio_stop(i2s_config_t *i2s_config);

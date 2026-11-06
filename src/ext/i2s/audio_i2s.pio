@@ -50,11 +50,17 @@ static inline void audio_i2s_program_init(PIO pio, uint sm, uint offset, uint da
     sm_config_set_out_pins(&sm_config, data_pin, 1);
     sm_config_set_sideset_pins(&sm_config, clock_pin_base);
     sm_config_set_out_shift(&sm_config, false, true, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &sm_config);
 
-    uint pin_mask = (1u << data_pin) | (3u << clock_pin_base);
+#if PICO_PIO_USE_GPIO_BASE
+    uint64_t pin_mask = (1ull << data_pin) | (3ull << clock_pin_base);
+    pio_sm_set_pindirs_with_mask64(pio, sm, pin_mask, pin_mask);
+#else
+    uint32_t pin_mask = (1u << data_pin) | (3u << clock_pin_base);
     pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+#endif
     pio_sm_set_pins(pio, sm, 0); // clear pins
 
     pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));

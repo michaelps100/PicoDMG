@@ -28,13 +28,25 @@
 
 void spi_dma_isr();
 
+// SD SPI clock. This used to be a hardcoded 12.5 MHz, which is what the
+// emulator has always run at: SD_SPI_BAUD_RATE was defined in CMake for years
+// but never read by any source file, so the build line said 20 MHz while the
+// hardware sat at 12.5. It is now the single source of truth.
+//
+// 20 MHz is the value the rest of the console already uses for the SD (PicoNES,
+// PicoPCE). If reads ever become flaky, this is the first number to lower --
+// 12.5 MHz is a safe fallback and costs ~0.15 s on a 4 MB cart.
+#ifndef GB_SD_SPI_BAUD_HZ
+#define GB_SD_SPI_BAUD_HZ 20000000u
+#endif
+
 static spi_t spis[]={
     {
-        .hw_inst=spi1,
-        .miso_gpio=12,
-        .mosi_gpio=15,
-        .sck_gpio=14,
-        .baud_rate=12500*1000,
+        .hw_inst=spi1,   /* SD bus; GB_SD_SPI is a string, not a peripheral */
+        .miso_gpio=GB_SD_PIN_MISO,
+        .mosi_gpio=GB_SD_PIN_MOSI,
+        .sck_gpio=GB_SD_PIN_SCK,
+        .baud_rate=GB_SD_SPI_BAUD_HZ,
         .dma_isr=spi_dma_isr
     }
 };
@@ -43,7 +55,7 @@ static sd_card_t sd_cards[]={
     {
         .pcName="0:",
         .spi=&spis[0],
-        .ss_gpio=13,
+        .ss_gpio=GB_SD_PIN_CS,
         .use_card_detect=false,
         .m_Status=STA_NOINIT
     }

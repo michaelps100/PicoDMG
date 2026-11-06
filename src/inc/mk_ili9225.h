@@ -120,6 +120,13 @@ void mk_ili9225_set_address(uint8_t x, uint8_t y);
 void mk_ili9225_write_pixels(const uint16_t *pixels, uint_fast16_t nmemb);
 
 /**
+ * Draw a full 160x144 Game Boy frame using hardware single-window continuous DMA.
+ * @param src_160x144 Pointer to full 160x144 RGB565 frame buffer.
+ * @param fps_val Current FPS to overlay, or 0 if FPS overlay is disabled.
+ */
+void mk_ili9225_draw_frame(const uint16_t *src_160x144, uint8_t fps_val);
+
+/**
  * Inverts the display.
  * @param invert
  */
@@ -146,7 +153,8 @@ void mk_ili9225_exit(void);
 /**
  * Fill a rectangle at the given location, size and color.
  */
-void mk_ili9225_fill_rect(uint8_t x,uint8_t y,uint8_t w,uint8_t h,uint16_t color);
+void mk_ili9225_fill_rect(uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint16_t color);
+void mk_ili9225_write_rect_565(int x, int y, int w, int h, const uint16_t *px);
 
 /**
  * Fill the entire screen with the specified RGB565 color
@@ -156,12 +164,12 @@ void mk_ili9225_fill(uint16_t color);
 /**
  * Set a specified pixel to the given color
  */
-void mk_ili9225_pixel(uint8_t x,uint8_t y,uint16_t color);
+void mk_ili9225_pixel(uint16_t x,uint16_t y,uint16_t color);
 
 /**
  * Copy the specified framebuffer at the given coordinates
  */
-void mk_ili9225_blit(uint16_t *fbuf,uint8_t x,uint8_t y,uint8_t w,uint8_t h);
+void mk_ili9225_blit(uint16_t *fbuf,uint16_t x,uint16_t y,uint16_t w,uint16_t h);
 
 /**
  * Return an 8x8 framebuffer for the given letter and color / background color
@@ -172,4 +180,30 @@ void mk_ili9225_get_letter(uint16_t *fbuf,char letter,uint16_t color,uint16_t bg
  * Write text to the screen using the the coordinates as the upper-left corner of the text.
  * All characters have dimensions of 8x8 pixels.
  */
-void mk_ili9225_text(char *s,uint8_t x,uint8_t y,uint16_t color,uint16_t bgcolor);
+void mk_ili9225_text(char *s,uint16_t x,uint16_t y,uint16_t color,uint16_t bgcolor);
+
+/**
+ * Enable or disable the LCD screen-door / grid effect.
+ */
+void mk_ili9225_set_grid_enabled(bool enabled);
+bool mk_ili9225_get_grid_enabled(void);
+
+/**
+ * Enable or disable the Sharp-Shimmerless box-filter scaling mode.
+ */
+void mk_ili9225_set_shimmerless_enabled(bool enabled);
+bool mk_ili9225_get_shimmerless_enabled(void);
+
+typedef enum {
+    SCALE_FIT = 0,     /* 266x240 (proportional, centered) */
+    SCALE_STRETCH = 1, /* 320x240 (full screen) */
+    SCALE_INTEGER = 2  /* 160x144 (1:1 pixel native, centered) */
+} ili9341_scale_mode_t;
+
+void mk_ili9225_set_scale_mode(ili9341_scale_mode_t mode);
+ili9341_scale_mode_t mk_ili9225_get_scale_mode(void);
+void mk_ili9225_draw_dimmed_frame(const uint16_t *src_160x144);
+void mk_ili9225_text_transparent(const char *s, uint16_t x, uint16_t y, uint16_t color, const uint16_t *src_160x144);
+void mk_ili9225_get_raw_glyph(uint8_t d[8], char l);
+void mk_ili9225_render_volume_hud(void);
+

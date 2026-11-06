@@ -122,11 +122,19 @@ static void update_env(struct chan *c)
 
 	while (c->env.counter > FREQ_INC_REF) {
 		if (c->env.step) {
-			c->volume += c->env.up ? 1 : -1;
-			if (c->volume == 0 || c->volume == MAX_CHAN_VOLUME) {
-				c->env.inc = 0;
+			if (c->env.up) {
+				if (c->volume < MAX_CHAN_VOLUME) {
+					c->volume++;
+				} else {
+					c->env.inc = 0;
+				}
+			} else {
+				if (c->volume > 0) {
+					c->volume--;
+				} else {
+					c->env.inc = 0;
+				}
 			}
-			c->volume = MAX(0, MIN(MAX_CHAN_VOLUME, c->volume));
 		}
 		c->env.counter -= FREQ_INC_REF;
 	}
@@ -171,14 +179,14 @@ static void update_sweep(struct chan *c)
 
 			c->freq += inc;
 			if (c->freq > 2047) {
-				c->enabled = 0;
+				chan_enable(0, 0);
 			} else {
 				set_note_freq(c,
 					DMG_CLOCK_FREQ_U / ((2048 - c->freq)<< 5));
 				c->freq_inc *= 8;
 			}
 		} else if (c->sweep.rate) {
-			c->enabled = 0;
+			chan_enable(0, 0);
 		}
 		c->sweep.counter -= FREQ_INC_REF;
 	}
@@ -231,7 +239,7 @@ static void update_square(int16_t* samples, const bool ch2)
 	}
 }
 
-static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
+static uint8_t wave_sample(const unsigned int pos)
 {
 	uint8_t sample;
 
@@ -241,7 +249,7 @@ static uint8_t wave_sample(const unsigned int pos, const unsigned int volume)
 	} else {
 		sample >>= 4;
 	}
-	return volume ? (sample >> (volume - 1)) : 0;
+	return sample;
 }
 
 static void update_wave(int16_t *samples)
@@ -267,24 +275,22 @@ static void update_wave(int16_t *samples)
 		uint32_t prev_pos = 0;
 		int32_t sample   = 0;
 
-		c->wave.sample = wave_sample(c->val, c->volume);
+		c->wave.sample = wave_sample(c->val);
 
 		while (update_freq(c, &pos)) {
 			c->val = (c->val + 1) & 31;
-			sample += ((pos - prev_pos) / c->freq_inc) *
-				((int)c->wave.sample - 8) * (INT16_MAX/64);
-			c->wave.sample = wave_sample(c->val, c->volume);
+			c->wave.sample = wave_sample(c->val);
 			prev_pos  = pos;
 		}
 
-		sample += ((int)c->wave.sample - 8) * (int)(INT16_MAX/64);
+		sample = ((int)c->wave.sample - 8) * (int)(INT16_MAX / 64);
 
 		if (c->volume == 0)
 			continue;
 
 		{
-			/* First element is unused. */
-			int16_t div[] = { INT16_MAX, 1, 2, 4 };
+			/* c->volume: 1 = 100%, 2 = 50%, 3 = 25% */
+			static const int16_t div[] = { INT16_MAX, 1, 2, 4 };
 			sample = sample / (div[c->volume]);
 		}
 
@@ -316,7 +322,7 @@ static void update_noise(int16_t *samples)
 	}
 
 	if (c->freq >= 14)
-		c->enabled = 0;
+		chan_enable(3, 0);
 
 	for (uint_fast16_t i = 0; i < AUDIO_NSAMPLES; i += 2) {
 		update_len(c);
@@ -382,19 +388,21 @@ static void chan_trigger(uint_fast8_t i)
 {
 	struct chan *c = chans + i;
 
+	if (!c->powered)
+		return;
+
 	chan_enable(i, 1);
 	c->volume = c->volume_init;
 
-	// volume envelope
-	{
+	// volume envelope (only channels 0, 1, 3 have envelope; channel 2 is wave!)
+	if (i != 2) {
 		uint8_t val =
 			audio_mem[(0xFF12 + (i * 5)) - AUDIO_ADDR_COMPENSATION];
 
 		c->env.step = val & 0x07;
 		c->env.up   = val & 0x08 ? 1 : 0;
 		c->env.inc  = c->env.step ?
-			(FREQ_INC_REF * 64ul) / ((uint32_t)c->env.step * AUDIO_SAMPLE_RATE) :
-			(8ul * FREQ_INC_REF) / AUDIO_SAMPLE_RATE ;
+			(FREQ_INC_REF * 64ul) / ((uint32_t)c->env.step * AUDIO_SAMPLE_RATE) : 0;
 		c->env.counter = 0;
 	}
 
@@ -431,6 +439,24 @@ static void chan_trigger(uint_fast8_t i)
  *				This is not checked in this function.
  * \return	Byte at address.
  */
+/* APU state for save states. With ENABLE_SOUND peanut_gb forwards every
+ * 0xFF10..0xFF3F access here and keeps none of it in struct gb_s, so a state
+ * without this block brought the game back with the APU as it was at boot --
+ * powered off (NR52 = 0), and the game had no reason to switch it on again:
+ * silence after a resume, until a reset re-ran the game's sound init. */
+/* The pieces, in file order, read and written in place: no intermediate
+ * buffer (the whole is over 300 bytes, too much for the menu's stack). */
+void *audio_state_part(unsigned int index, size_t *len)
+{
+	switch (index) {
+	case 0: *len = sizeof(audio_mem); return audio_mem;
+	case 1: *len = sizeof(chans);     return chans;
+	case 2: *len = sizeof(vol_l);     return &vol_l;
+	case 3: *len = sizeof(vol_r);     return &vol_r;
+	default: *len = 0;                return NULL;
+	}
+}
+
 uint8_t audio_read(const uint16_t addr)
 {
 	static const uint8_t ortab[] = {
@@ -443,6 +469,14 @@ uint8_t audio_read(const uint16_t addr)
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 	};
+
+	if (addr == 0xFF26) {
+		return (audio_mem[0xFF26 - AUDIO_ADDR_COMPENSATION] & 0x80) | 0x70 |
+			(chans[3].enabled ? (1 << 3) : 0) |
+			(chans[2].enabled ? (1 << 2) : 0) |
+			(chans[1].enabled ? (1 << 1) : 0) |
+			(chans[0].enabled ? (1 << 0) : 0);
+	}
 
 	return audio_mem[addr - AUDIO_ADDR_COMPENSATION] |
 		ortab[addr - AUDIO_ADDR_COMPENSATION];
@@ -488,23 +522,14 @@ void audio_write(const uint16_t addr, const uint8_t val)
 	case 0xFF17:
 	case 0xFF21: {
 		chans[i].volume_init = val >> 4;
-		chans[i].powered     = (val >> 3) != 0;
+		chans[i].powered     = (val & 0xF8) != 0;
+		if (!chans[i].powered) {
+			chan_enable(i, 0);
+		}
 
-		// "zombie mode" stuff, needed for Prehistorik Man and probably
-		// others
 		if (chans[i].powered && chans[i].enabled) {
-			if ((chans[i].env.step == 0 && chans[i].env.inc != 0)) {
-				if (val & 0x08) {
-					chans[i].volume++;
-				} else {
-					chans[i].volume += 2;
-				}
-			} else {
-				chans[i].volume = 16 - chans[i].volume;
-			}
-
-			chans[i].volume &= 0x0F;
 			chans[i].env.step = val & 0x07;
+			chans[i].env.up   = (val & 0x08) != 0;
 		}
 	} break;
 

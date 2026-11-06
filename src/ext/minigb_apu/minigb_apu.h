@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define AUDIO_SAMPLE_RATE	44100
 
@@ -38,3 +39,7 @@ void audio_write(const uint16_t addr, const uint8_t val);
  * Initialise audio driver.
  */
 void audio_init(void);
+
+/* Save-state support: the APU lives here, not in struct gb_s. */
+/* Part 0..3 of the APU state (NULL past the last); read/write in place. */
+void *audio_state_part(unsigned int index, size_t *len);
