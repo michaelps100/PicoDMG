@@ -13,8 +13,14 @@ int y8_abs(lua_State *state) {
 }
 
 int y8_flr(lua_State *state) {
-	const auto x = luaL_checknumber(state, 1);
+	const auto x = lua_tonumber(state, 1);
 	lua_pushnumber(state, floor(x));
+	return 1;
+}
+
+int y8_ceil(lua_State *state) {
+	const auto x = lua_tonumber(state, 1);
+	lua_pushnumber(state, LuaFix16::from_fix16(fix16_ceil(x.value)));
 	return 1;
 }
 
@@ -142,6 +148,13 @@ int y8_sgn(lua_State *state) {
 int y8_bnot(lua_State *state) {
 	const auto x = lua_tonumber(state, 1);
 	lua_pushnumber(state, LuaFix16::from_fix16(~x.value));
+	return 1;
+}
+
+int y8_p8idiv(lua_State *state) {
+	const auto x = lua_tonumber(state, 1);
+	const auto y = lua_tonumber(state, 2);
+	lua_pushnumber(state, x.int_division(y));
 	return 1;
 }
 

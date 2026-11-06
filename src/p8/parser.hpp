@@ -52,6 +52,9 @@ enum class ParserStatus {
 
 	/// Failed to match a SFX block
 	BAD_SFX_ROW,
+
+	/// Failed to load Lua script
+	BAD_LUA_SCRIPT,
 };
 
 enum class ParserState {

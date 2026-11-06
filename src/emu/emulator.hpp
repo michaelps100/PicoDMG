@@ -14,7 +14,8 @@
 namespace emu {
 
 struct EmulatorPersistentState {
-	std::array<char, 128> load_path_cstr;
+	std::array<char, 128> load_path_cstr{};
+	std::array<char, 128> breadcrumb_cstr{};
 };
 
 class Emulator {
@@ -31,9 +32,35 @@ class Emulator {
 
 	void set_active_cart_path(std::string_view cart_path);
 
+	void set_breadcrumb(std::string_view bc) {
+		std::size_t len = std::min(bc.size(), _persistent_state.breadcrumb_cstr.size() - 1);
+		std::memcpy(_persistent_state.breadcrumb_cstr.data(), bc.data(), len);
+		_persistent_state.breadcrumb_cstr[len] = '\0';
+	}
+
+	void clear_breadcrumb() {
+		_persistent_state.breadcrumb_cstr[0] = '\0';
+	}
+
+	std::string_view get_breadcrumb() const {
+		return {_persistent_state.breadcrumb_cstr.data()};
+	}
+
+	bool has_pending_load_cart() const {
+		return _persistent_state.load_path_cstr[0] != '\0';
+	}
+
+	std::string_view get_pending_load_cart() const {
+		return {_persistent_state.load_path_cstr.data()};
+	}
+
+	void clear_pending_load_cart() {
+		_persistent_state.load_path_cstr[0] = '\0';
+	}
+
 	void trigger_load_from_vm(std::string_view cart_path);
 	bool load_from_path(std::string_view cart_path);
-	void load_and_inject_header(Reader reader);
+	bool load_and_inject_header(Reader reader);
 	void exec(std::string_view buf);
 
 	void handle_repl();
@@ -61,6 +88,7 @@ class Emulator {
 	// TODO: implement repetition logic
 	// TODO: probably shouldn't use hal:: structs here
 	hal::ButtonState get_button_state() { return _button_state; }
+	void set_button_state(hal::ButtonState s) { _button_state = s; }
 
 	lua_State *lua() { return &_lua_preallocated_state.l.l; }
 
@@ -80,6 +108,7 @@ class Emulator {
 
 // NOLINTBEGIN
 extern Emulator emulator;
+extern char g_last_panic_msg[256];
 
 template <class Device, std::uint16_t map_address = Device::default_map_address>
 inline constexpr auto device = emulator.memory().device<Device>(map_address);

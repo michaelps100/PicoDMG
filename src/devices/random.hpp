@@ -45,8 +45,12 @@ struct Random : emu::MMIODevice<8> {
 	fix16_t next(fix16_t range) const {
 		step();
 
-		if (range <= 0) {
+		if (range == 0) {
 			return 0;
+		}
+
+		if (range < 0) {
+			return -fix16_mod(std::bit_cast<fix16_t>(uint32_t(hi_ref())), -range);
 		}
 
 		return fix16_mod(std::bit_cast<fix16_t>(uint32_t(hi_ref())), range);

@@ -1,12 +1,12 @@
 [submodule "pico-sdk"]
 	path = vendor/pico-sdk
-	url = git@github.com:raspberrypi/pico-sdk.git
+	url = https://github.com/raspberrypi/pico-sdk.git
 [submodule "lua"]
 	path = vendor/lua
-	url = git@github.com:yocto-8/lua.git
+	url = https://github.com/yocto-8/lua.git
 [submodule "libfixmath"]
 	path = vendor/libfixmath
-	url = git@github.com:yocto-8/libfixmath.git
+	url = https://github.com/yocto-8/libfixmath.git
 [submodule "vendor/zlib"]
 	path = vendor/zlib
-	url = git@github.com:madler/zlib.git
+	url = https://github.com/madler/zlib.git

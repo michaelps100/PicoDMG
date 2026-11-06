@@ -11,7 +11,11 @@
 #include <pico/rand.h>
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
+#if __has_include(<tusb.h>)
 #include <tusb.h>
+#endif
+
+#include <platform/platform.hpp>
 
 namespace hal {
 
@@ -20,7 +24,7 @@ namespace pico = arch::pico;
 // NOTE: some of the implementations are deferred to the platform.
 
 void present_frame() {
-	pico::run_blocking_command(arch::pico::IoThreadCommand::PUSH_FRAME);
+	arch::pico::platform::present_frame(nullptr);
 }
 
 void reset_timer() { pico::state.timer_start = get_absolute_time(); }
@@ -30,39 +34,30 @@ std::uint64_t measure_time_us() {
 	return absolute_time_diff_us(pico::state.timer_start, current_time);
 }
 
+#ifndef PICO_DEFAULT_LED_PIN
+#ifdef GB_LED_GPIO
+#define PICO_DEFAULT_LED_PIN GB_LED_GPIO
+#else
+#define PICO_DEFAULT_LED_PIN 25
+#endif
+#endif
+
 void delay_time_us(std::uint64_t time) {
-	// squared to compensate for non-linear power vs brightness curve
-	pwm_set_gpio_level(PICO_DEFAULT_LED_PIN, 0);
 	sleep_us(time);
-	pwm_set_gpio_level(PICO_DEFAULT_LED_PIN,
-	                   Y8_LED_PWM_SCALE * Y8_LED_PWM_SCALE);
 }
+
+extern "C" __attribute__((weak)) void tud_task(void) {}
 
 void post_frame_hooks() { tud_task(); }
 
 std::span<char> read_repl(std::span<char> target_buffer) {
-	// FIXME: at current this hangs both the picosystem and my setup if there is
-	// nothing receiving
-
-	int c = stdio_getchar_timeout_us(0);
-
-	if (c == PICO_ERROR_TIMEOUT || c == '\n' || c == '\r') {
-		return {};
-	}
-
-	std::size_t i = 0;
-	do {
-		target_buffer[i] = c;
-		c = getchar();
-		++i;
-	} while (c != '\r' && c != '\n');
-
-	return {target_buffer.data(), i};
+	(void)target_buffer;
+	return {};
 }
 
 void fs_set_working_directory(std::string_view path) {
 	// std::string_view is not a C string...
-	std::array<char, 128> filename_c_buffer;
+	std::array<char, 256> filename_c_buffer;
 
 	if (path.size() + 1 > filename_c_buffer.size()) {
 		return; // TODO: error status; or just exceptions...?
@@ -76,6 +71,8 @@ void fs_set_working_directory(std::string_view path) {
 
 FileOpenStatus fs_create_open_context(std::string_view path,
                                       FileReaderContext &ctx) {
+	ctx.is_bios_read = false;
+
 	if (path == "/bios/bios.p8") {
 		ctx.is_bios_read = true;
 		ctx.reader.bios_reader = emu::StringReader(bios_cartridge);
@@ -83,7 +80,7 @@ FileOpenStatus fs_create_open_context(std::string_view path,
 	}
 
 	// std::string_view is not a C string...
-	std::array<char, 128> filename_c_buffer;
+	std::array<char, 256> filename_c_buffer;
 
 	if (path.size() + 1 > filename_c_buffer.size()) {
 		return FileOpenStatus::FAIL;
@@ -95,6 +92,7 @@ FileOpenStatus fs_create_open_context(std::string_view path,
 	if (const auto open_status =
 	        f_open(&ctx.reader.fs_reader, filename_c_buffer.data(), FA_READ);
 	    open_status != FR_OK) {
+		printf("[Pico8] f_open('%s') failed: %d\n", filename_c_buffer.data(), (int)open_status);
 		return FileOpenStatus::FAIL;
 	}
 
@@ -115,14 +113,15 @@ const char *fs_read_buffer(void *context, std::size_t *size) {
 		emu::StringReader &bios_reader = real_context.reader.bios_reader;
 		return bios_reader.get_reader()(size);
 	} else {
+		UINT br = 0;
 		if (f_read(&real_context.reader.fs_reader,
 		           real_context.read_buffer.data(),
-		           real_context.read_buffer.size(), size) != FR_OK) {
-			// TODO: error handling
+		           real_context.read_buffer.size(), &br) != FR_OK) {
 			*size = 0;
 			return nullptr;
 		}
 
+		*size = br;
 		return *size != 0 ? real_context.read_buffer.data() : nullptr;
 	}
 

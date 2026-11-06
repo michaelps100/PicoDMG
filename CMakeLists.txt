@@ -23,8 +23,8 @@ function(add_y8_definition_flag OPTION_NAME OPTION_DEFAULT OPTION_DEFINITION)
 endfunction()
 
 add_y8_definition_flag(Y8_DEBUG_MEMCHECK OFF "On PSRAM-enabled systems, run a quick memory test script to sanity check whether the PSRAM appears functional and stable. If the memcheck fails, an error will be logged and the PSRAM heap will be disabled")
-add_y8_definition_flag(Y8_EXPERIMENTAL_GENGC ON "Enable the experimental Lua 5.2 generational GC, which is known to have bugs but can prove beneficial for performance")
-add_y8_definition_flag(Y8_LUA_REPL ON "Enable the stdin Lua REPL")
+add_y8_definition_flag(Y8_EXPERIMENTAL_GENGC OFF "Enable the experimental Lua 5.2 generational GC, which is known to have bugs but can prove beneficial for performance")
+add_y8_definition_flag(Y8_LUA_REPL OFF "Enable the stdin Lua REPL")
 add_y8_definition_string(Y8_RESERVED_FIRMWARE_SIZE 397312 "Reserved firmware size, in bytes. Must align to 4096. The rest may be used for the internal FAT storage. Modifying firmware size will break existing partitions. Defaults to 386KiB (up-aligned to 4K page)")
 add_y8_definition_string(Y8_LED_PWM_SCALE 80 "Max PWM value (out of 255) for the main onboard LED, if relevant.")
 
@@ -39,8 +39,12 @@ elseif(Y8_ARCH STREQUAL "pico")
     set(SKIP_PICO_MALLOC 1)
     set(PICO_CXX_ENABLE_EXCEPTIONS 1)
     set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src/arch/pico/platform/boards/)
-    set(LTO_FLAGS "-flto=auto" "-O2" "-fpeel-loops")
-    include(vendor/pico-sdk/pico_sdk_init.cmake)
+    set(LTO_FLAGS "-flto=auto" "-O3" "-fpeel-loops")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/pico-sdk/pico_sdk_init.cmake")
+        include(vendor/pico-sdk/pico_sdk_init.cmake)
+    else()
+        include(pico_sdk_import.cmake)
+    endif()
 else()
     message(FATAL_ERROR "Y8_ARCH not specified or illegal")
 endif()
@@ -50,8 +54,8 @@ project(yocto-8)
 # flags common to all TUs
 set(COMMON_FLAGS
 
-    # default to -Os for all sources, but we override it just later
-    "-Os"
+    # optimize for speed across all sources
+    "-O3"
 
     # ninja opens a pipe so the compiler disables ansi escape sequences by
     # default. let's force it for now
@@ -102,7 +106,7 @@ if(Y8_ARCH STREQUAL "desktop")
     set(CORE_LIBRARY_TARGET y8-core)
     add_library(${CORE_LIBRARY_TARGET} STATIC)
 elseif(Y8_ARCH STREQUAL "pico")
-    set(CORE_LIBRARY_TARGET y8)
+    set(CORE_LIBRARY_TARGET Pico8)
 endif()
 
 set(CORE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/")
@@ -119,6 +123,7 @@ set(CORE_SOURCES
     ${CORE_ROOT}/emu/bindings/video.cpp
     ${CORE_ROOT}/emu/bindings/fs.cpp
     ${CORE_ROOT}/p8/parser.cpp
+    ${CORE_ROOT}/p8/png_cart.cpp
 )
 
 set(LUA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lua/")
@@ -191,6 +196,10 @@ set(ZLIB_SOURCES
     ${ZLIB_ROOT}/deflate.c
     ${ZLIB_ROOT}/trees.c
     ${ZLIB_ROOT}/zutil.c
+    ${ZLIB_ROOT}/inflate.c
+    ${ZLIB_ROOT}/inftrees.c
+    ${ZLIB_ROOT}/inffast.c
+    ${ZLIB_ROOT}/uncompr.c
 )
 
 set(PNGENC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/pngenc/src/")
@@ -270,23 +279,70 @@ if(Y8_ARCH STREQUAL "desktop")
     add_compile_definitions(Y8_SRAM_SECTION=".text")
     add_compile_definitions(Y8_PSRAM_SECTION=".text")
 elseif(Y8_ARCH STREQUAL "pico")
+    if(Y8_PLATFORM STREQUAL "picodmg")
+        if(NOT HW_CONFIG)
+            set(HW_CONFIG 16 CACHE STRING "Select hardware configuration (16=Core2350B, 15=RP2350 Plus)")
+        endif()
+        if(HW_CONFIG EQUAL 16)
+            set(PICO_BOARD "waveshare_core2350b" CACHE STRING "Board type" FORCE)
+            set(GB_LED_GPIO 39)
+            set(GB_PSRAM_CS_PIN 47)
+            message(STATUS "HW_CONFIG 16: Waveshare Core2350B + 8 MB PSRAM on GP47")
+        elseif(HW_CONFIG EQUAL 15)
+            set(PICO_BOARD "waveshare_rp2350_plus_16mb" CACHE STRING "Board type" FORCE)
+            set(GB_LED_GPIO 25)
+            set(GB_PSRAM_CS_PIN 0)
+            message(STATUS "HW_CONFIG 15: Waveshare RP2350 Plus 16MB")
+        else()
+            set(PICO_BOARD "waveshare_core2350b" CACHE STRING "Board type" FORCE)
+            set(GB_LED_GPIO 39)
+            set(GB_PSRAM_CS_PIN 47)
+            message(STATUS "HW_CONFIG ${HW_CONFIG} unsupported, defaulting to 16")
+        endif()
+        set(GB_TFT_SPI "spi0")
+        set(GB_TFT_PIN_CS 17)
+        set(GB_TFT_PIN_SCK 18)
+        set(GB_TFT_PIN_MOSI 19)
+        set(GB_TFT_PIN_DC 20)
+        set(GB_TFT_PIN_RST 21)
+        set(GB_TFT_PIN_BL 22)
+        set(GB_SD_SPI "spi1")
+        set(GB_SD_PIN_MISO 12)
+        set(GB_SD_PIN_CS 13)
+        set(GB_SD_PIN_SCK 14)
+        set(GB_SD_PIN_MOSI 15)
+        set(GB_I2S_PIN_DATA 26)
+        set(GB_I2S_PIN_CLK 27)
+    endif()
+
     pico_sdk_init()
 
     set(ARCH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/arch/pico")
-    set(ARCH_SOURCES
-        ${ARCH_ROOT}/hal/hal.cpp
-        ${ARCH_ROOT}/hardwarestate.cpp
-        ${ARCH_ROOT}/cmdthread.cpp
-        ${ARCH_ROOT}/fs/fatfsimpl.cpp
-        ${ARCH_ROOT}/fs/hwinit.cpp
-        ${ARCH_ROOT}/usb/usb_descriptors.cpp
-        ${ARCH_ROOT}/usb/hwinit.cpp
-        ${ARCH_ROOT}/usb/msc_disk.cpp
-        ${ARCH_ROOT}/main/main.cpp
-        ${CORE_ROOT}/compilerhacks/gcc_stub_verbose_terminate_handler.cpp
-        ${CORE_ROOT}/compilerhacks/gcc_exception_static_alloc.cpp
-        ${FATFS_SOURCES}
-    )
+    if(Y8_PLATFORM STREQUAL "picodmg")
+        set(ARCH_SOURCES
+            ${ARCH_ROOT}/hal/hal.cpp
+            ${ARCH_ROOT}/hardwarestate.cpp
+            ${ARCH_ROOT}/cmdthread.cpp
+            ${ARCH_ROOT}/main/main.cpp
+            ${CORE_ROOT}/compilerhacks/gcc_stub_verbose_terminate_handler.cpp
+            ${CORE_ROOT}/compilerhacks/gcc_exception_static_alloc.cpp
+        )
+    else()
+        set(ARCH_SOURCES
+            ${ARCH_ROOT}/hal/hal.cpp
+            ${ARCH_ROOT}/hardwarestate.cpp
+            ${ARCH_ROOT}/cmdthread.cpp
+            ${ARCH_ROOT}/fs/fatfsimpl.cpp
+            ${ARCH_ROOT}/fs/hwinit.cpp
+            ${ARCH_ROOT}/usb/usb_descriptors.cpp
+            ${ARCH_ROOT}/usb/hwinit.cpp
+            ${ARCH_ROOT}/usb/msc_disk.cpp
+            ${ARCH_ROOT}/main/main.cpp
+            ${CORE_ROOT}/compilerhacks/gcc_stub_verbose_terminate_handler.cpp
+            ${CORE_ROOT}/compilerhacks/gcc_exception_static_alloc.cpp
+            ${FATFS_SOURCES}
+        )
+    endif()
     set(ARCH_HAL_ROOT "${ARCH_ROOT}/hal/")
 
     if(Y8_PLATFORM STREQUAL "asupico")
@@ -307,6 +363,30 @@ elseif(Y8_ARCH STREQUAL "pico")
             ${PLATFORM_ROOT}/picosystem.cpp
             ${PLATFORM_ROOT}/hal.cpp
             ${PLATFORM_ROOT}/platform.cpp)
+    elseif(Y8_PLATFORM STREQUAL "picodmg")
+        set(PLATFORM_ROOT "${ARCH_ROOT}/platform/picodmg")
+        set(SHARED_MENU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../shared_menu")
+        add_subdirectory(ext/FatFs_SPI build)
+
+        set(PLATFORM_SOURCES
+            ${PLATFORM_ROOT}/platform.cpp
+            ${PLATFORM_ROOT}/hal.cpp
+            ${PLATFORM_ROOT}/mk_st7789.c
+            ${PLATFORM_ROOT}/p8_audio.c
+            ${PLATFORM_ROOT}/pico8_menu.c
+            ${PLATFORM_ROOT}/pico8_state.cpp
+            ${PLATFORM_ROOT}/SetupPsram.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/ext/i2s/i2s.c
+            ${SHARED_MENU_ROOT}/dmg_menu.c
+            ${SHARED_MENU_ROOT}/dmg_panel.c
+            ${SHARED_MENU_ROOT}/dmg_combo.c
+            ${SHARED_MENU_ROOT}/dmg_power.c
+            ${SHARED_MENU_ROOT}/dmg_battery.c
+            ${SHARED_MENU_ROOT}/dmg_resume.c
+            ${SHARED_MENU_ROOT}/dmg_boot_intro.c
+            ${CORE_ROOT}/emu/tlsf.cpp
+        )
+        add_compile_definitions(Y8_USE_EXTMEM DMG_COMBO_EXIT_HOLD_FRAMES=30)
     else()
         message(FATAL_ERROR "Y8_PLATFORM not specified, illegal or not supported on the \"pico\" arch")
     endif()
@@ -319,68 +399,111 @@ elseif(Y8_ARCH STREQUAL "pico")
 
     add_executable(${CORE_LIBRARY_TARGET} ${ARCH_SOURCES} ${PLATFORM_SOURCES})
 
-    target_include_directories(${CORE_LIBRARY_TARGET} PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fatfs/"
-        "${ARCH_ROOT}/usb/"
-    )
+    if(Y8_PLATFORM STREQUAL "picodmg")
+        target_include_directories(${CORE_LIBRARY_TARGET} PUBLIC
+            ${PLATFORM_ROOT}
+            ${CMAKE_CURRENT_SOURCE_DIR}/inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/ext/i2s
+            ${SHARED_MENU_ROOT}
+        )
 
-    target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC
-        pico_stdlib
-        pico_multicore
-        pico_rand
-        pico_flash
-        hardware_xip_cache
-        hardware_pwm
-        pico_unique_id
-        tinyusb_device
-        tinyusb_board
-    )
+        target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC
+            pico_stdlib
+            pico_multicore
+            pico_rand
+            pico_flash
+            hardware_xip_cache
+            hardware_pwm
+            pico_unique_id
+            FatFs_SPI
+            hardware_spi
+            hardware_dma
+            hardware_pio
+            hardware_clocks
+            hardware_vreg
+            hardware_watchdog
+            hardware_xosc
+            hardware_adc
+            hardware_rosc
+        )
+    else()
+        target_include_directories(${CORE_LIBRARY_TARGET} PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fatfs/"
+            "${ARCH_ROOT}/usb/"
+        )
+
+        target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC
+            pico_stdlib
+            pico_multicore
+            pico_rand
+            pico_flash
+            hardware_xip_cache
+            hardware_pwm
+            pico_unique_id
+            tinyusb_device
+            tinyusb_board
+        )
+    endif()
 
     target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC Y8_INFINITE_LOOP_EXIT)
-
-    # We use SKIP_PICO_MALLOC so that we wrap the C alloc functions ourselves
     target_link_options(${CORE_LIBRARY_TARGET} PUBLIC -Wl,--wrap=malloc,--wrap=free,--wrap=realloc)
-
-    # Let the pico-sdk configure the MPU to protect the end of the stack, to
-    # detect certain kinds of stack overflows (presumably not all if large
-    # buffers aren't entirely written to, etc.)
     target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_USE_STACK_GUARDS=1)
-
-    # 12KiB core0 stack because Lua stacks can get pretty deep
-    # This requires the linker script to swap out SCRATCH_X and SCRATCH_Y:
-    # The ARM stack grows downwards, so we let it overflow into main RAM (but we
-    # restrict the heap not to ever overflow there).
-    #
-    # See memmap_asupico.ld for proper implementation
-    # FIXME: memmap_picosystem.ld does not have this implemented
-    target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_STACK_SIZE=0x3000)
-
-    # 0.25KiB core1 worker stack because it never recurses much
-    # Leaves plenty of space for stuff there.
-    target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_CORE1_STACK_SIZE=0x200)
-
+    target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_STACK_SIZE=0x4000)
+    target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_CORE1_STACK_SIZE=0x1000)
     target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_STDIO_ENABLE_CRLF_SUPPORT=0)
 
-    # NOTE: as of 2.0.0, the pico-sdk is not including XIP setup code for the
-    # flash, resulting in suboptimal timing for the stock flash
-    # https://github.com/raspberrypi/pico-sdk/issues/1903
-    # however, enabling it does mess up debugging for some reason
-    # target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_EMBED_XIP_SETUP=1)
-
-    # needed for a LTO hack
-    # target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC PICO_STDIO_SHORT_CIRCUIT_CLIB_FUNCS=0)
     if(Y8_PLATFORM STREQUAL "asupico")
         target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC hardware_spi hardware_dma hardware_pio)
         pico_generate_pio_header(${CORE_LIBRARY_TARGET} ${ARCH_ROOT}/video/dwoqspipio.pio)
-
         pico_set_linker_script(${CORE_LIBRARY_TARGET} "${PLATFORM_ROOT}/memmap_asupico.ld")
     elseif(Y8_PLATFORM STREQUAL "picosystem")
-        # target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC hardware_spi hardware_pio hardware_dma)
         target_link_libraries(${CORE_LIBRARY_TARGET} PUBLIC hardware_spi hardware_dma)
-
-        # pico_generate_pio_header(${CORE_LIBRARY_TARGET} ${PLATFORM_ROOT}/screen.pio)
         pico_set_linker_script(${CORE_LIBRARY_TARGET} "${PLATFORM_ROOT}/memmap_picosystem.ld")
         pico_enable_stdio_usb(${CORE_LIBRARY_TARGET} 1)
+    elseif(Y8_PLATFORM STREQUAL "picodmg")
+        pico_generate_pio_header(${CORE_LIBRARY_TARGET} ${CMAKE_CURRENT_SOURCE_DIR}/ext/i2s/audio_i2s.pio)
+
+        target_compile_definitions(${CORE_LIBRARY_TARGET} PUBLIC
+            HW_CONFIG=${HW_CONFIG}
+            GB_LED_GPIO=${GB_LED_GPIO}
+            GB_PSRAM_CS_PIN=${GB_PSRAM_CS_PIN}
+            GB_TFT_SPI="${GB_TFT_SPI}"
+            GB_TFT_PIN_CS=${GB_TFT_PIN_CS}
+            GB_TFT_PIN_SCK=${GB_TFT_PIN_SCK}
+            GB_TFT_PIN_MOSI=${GB_TFT_PIN_MOSI}
+            GB_TFT_PIN_DC=${GB_TFT_PIN_DC}
+            GB_TFT_PIN_RST=${GB_TFT_PIN_RST}
+            GB_TFT_PIN_BL=${GB_TFT_PIN_BL}
+            GB_SD_SPI="${GB_SD_SPI}"
+            GB_SD_PIN_CS=${GB_SD_PIN_CS}
+            GB_SD_PIN_SCK=${GB_SD_PIN_SCK}
+            GB_SD_PIN_MOSI=${GB_SD_PIN_MOSI}
+            GB_SD_PIN_MISO=${GB_SD_PIN_MISO}
+            GB_I2S_PIN_DATA=${GB_I2S_PIN_DATA}
+            GB_I2S_PIN_CLK=${GB_I2S_PIN_CLK}
+            SD_SPI_BAUD_RATE=20000000
+            GB_SD_SPI_BAUD_HZ=20000000
+        )
+
+        pico_enable_stdio_usb(${CORE_LIBRARY_TARGET} 0)
+        pico_enable_stdio_uart(${CORE_LIBRARY_TARGET} 1)
+
+        option(BUILD_FOR_BOOTLOADER "Link application for pico-bootLoader at 0x10080000" OFF)
+        if(BUILD_FOR_BOOTLOADER)
+            include(cmake/BootPartition.cmake)
+            frens_offset_for_bootloader(${CORE_LIBRARY_TARGET} "${PLATFORM_ROOT}/memmap_picodmg.ld")
+        else()
+            pico_set_linker_script(${CORE_LIBRARY_TARGET} "${PLATFORM_ROOT}/memmap_picodmg.ld")
+        endif()
+
+        function(pico_add_verbose_dis_output TARGET)
+            add_custom_command(TARGET ${TARGET} POST_BUILD
+                COMMAND ${CMAKE_OBJDUMP} -h $<TARGET_FILE:${TARGET}> >$<IF:$<BOOL:$<TARGET_PROPERTY:${TARGET},OUTPUT_NAME>>,$<TARGET_PROPERTY:${TARGET},OUTPUT_NAME>,$<TARGET_PROPERTY:${TARGET},NAME>>.dis
+                COMMAND ${CMAKE_OBJDUMP} -drwCSl $<TARGET_FILE:${TARGET}> >>$<IF:$<BOOL:$<TARGET_PROPERTY:${TARGET},OUTPUT_NAME>>,$<TARGET_PROPERTY:${TARGET},OUTPUT_NAME>,$<TARGET_PROPERTY:${TARGET},NAME>>.dis
+            )
+        endfunction()
+        pico_add_verbose_dis_output(${CORE_LIBRARY_TARGET})
+
     endif()
 
     set(SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/pico-sdk/")
@@ -390,6 +513,7 @@ elseif(Y8_ARCH STREQUAL "pico")
     add_compile_definitions(Y8_CORE1_SRAM_SECTION="${Y8_SRAM_SECTION}")
 
     pico_add_extra_outputs(${CORE_LIBRARY_TARGET})
+    add_custom_target(y8 DEPENDS ${CORE_LIBRARY_TARGET})
 endif()
 
 target_sources(${CORE_LIBRARY_TARGET} PRIVATE ${CORE_SOURCES})

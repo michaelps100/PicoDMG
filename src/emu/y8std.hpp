@@ -31,10 +31,15 @@ static constexpr auto y8_std = std::to_array<Binding>({
 	{"sset", bindings::y8_sset},
 	{"sget", bindings::y8_sget},
 	{"fget", bindings::y8_fget},
+	{"fset", bindings::y8_fset},
 	{"cls", bindings::y8_cls},
 	{"line", bindings::y8_line},
+	{"circ", bindings::y8_circ},
 	{"circfill", bindings::y8_circfill},
+	{"rect", bindings::y8_rect},
 	{"rectfill", bindings::y8_rectfill},
+	{"oval", bindings::y8_oval},
+	{"ovalfill", bindings::y8_ovalfill},
 	{"spr", bindings::y8_spr},
 	{"sspr", bindings::y8_sspr},
 	{"pal", bindings::y8_pal},
@@ -67,6 +72,7 @@ static constexpr auto y8_std = std::to_array<Binding>({
 
 	{"abs", bindings::y8_abs},
 	{"flr", bindings::y8_flr},
+	{"ceil", bindings::y8_ceil},
 	{"mid", bindings::y8_mid},
 	{"min", bindings::y8_min},
 	{"max", bindings::y8_max},
@@ -85,6 +91,7 @@ static constexpr auto y8_std = std::to_array<Binding>({
 	{"bxor", bindings::y8_bxor},
 	{"sgn", bindings::y8_sgn},
 	{"bnot", bindings::y8_bnot},
+	{"p8idiv", bindings::y8_p8idiv},
 
 	{"cursor", bindings::y8_cursor},
 	{"printh", bindings::y8_printh},
@@ -93,6 +100,17 @@ static constexpr auto y8_std = std::to_array<Binding>({
 	{"stat", bindings::y8_stat},
 	{"sub", bindings::y8_sub},
 	{"ord", bindings::y8_ord},
+	{"chr", bindings::y8_chr},
+	{"menuitem", bindings::y8_menuitem},
+	{"extcmd", bindings::y8_extcmd},
+	{"cartdata", bindings::y8_cartdata},
+	{"dget", bindings::y8_dget},
+	{"dset", bindings::y8_dset},
+	{"run", bindings::y8_run},
+	{"reboot", bindings::y8_reboot},
+	{"reset", bindings::y8_reset},
+	{"stop", bindings::y8_reboot},
+	{"exit", bindings::y8_exit},
 	{"_exit", bindings::y8_exit},
 	{"_gc", bindings::y8_gc},
 
@@ -104,47 +122,88 @@ static constexpr auto y8_std = std::to_array<Binding>({
 
 	{"add", bindings::y8_add},
 	{"del", bindings::y8_del},
+	{"deli", bindings::y8_deli},
 	{"foreach", bindings::y8_foreach},
 	{"split", bindings::y8_split},
+	{"pack", bindings::y8_pack},
 	{"unpack", bindings::y8_unpack},
 });
 
 struct NumericGlobal {
-	const char8_t *name;
+	const char *name;
 	lua_Number value;
 };
 
 // Populated manually from the list of identifiers listed on the pico-8 wiki for
-// the header page
-// TODO: check if still accurate
+// the header page, supporting both raw P8SCII bytes (0x80..0x99) and UTF-8 glyphs.
 static constexpr auto y8_numeric_globals = std::to_array<NumericGlobal>({
-	// joystick
-	{u8"⬅️", 0},
-	{u8"➡️", 1},
-	{u8"⬆️", 2},
-	{u8"⬇️", 3},
-	{u8"🅾️", 4},
-	{u8"❎", 5},
-	{u8"█", 0x0000'8000_raw_fix16},
-	{u8"▒", 0x5A5A'8000_raw_fix16},
-	{u8"░", 0x7D7D'8000_raw_fix16},
-	{u8"🐱", 0x511F'8000_raw_fix16},
-	{u8"▥", 0x5555'8000_raw_fix16},
-	{u8"▤", 0x0F0F'8000_raw_fix16},
-	{u8"✽", 0xB81D'8000_raw_fix16},
-	{u8"●", 0xF99F'8000_raw_fix16},
-	{u8"♥", 0x51BF'8000_raw_fix16},
-	{u8"☉", 0xB5BF'8000_raw_fix16},
-	{u8"웃", 0x999F'8000_raw_fix16},
-	{u8"⌂", 0xB11F'8000_raw_fix16},
-	{u8"😐", 0xA0E0'8000_raw_fix16},
-	{u8"♪", 0x9B3F'8000_raw_fix16},
-	{u8"◆", 0xB1BF'8000_raw_fix16},
-	{u8"…", 0xF5FF'8000_raw_fix16},
-	{u8"★", 0xB15F'8000_raw_fix16},
-	{u8"⧗", 0x1B1F'8000_raw_fix16},
-	{u8"ˇ", 0xF5BF'8000_raw_fix16},
-	{u8"∧", 0x7ADF'8000_raw_fix16},
+	// P8SCII single-byte joystick button glyphs (Shift+L, Shift+R, Shift+U, Shift+D, Shift+O, Shift+X)
+	{"\x8b", 0}, // 139: ⬅️ Left
+	{"\x91", 1}, // 145: ➡️ Right
+	{"\x94", 2}, // 148: ⬆️ Up
+	{"\x83", 3}, // 131: ⬇️ Down
+	{"\x8e", 4}, // 142: 🅾️ Button O
+	{"\x97", 5}, // 151: ❎ Button X
+
+	// UTF-8 joystick button glyphs (with variation selector)
+	{"⬅️", 0},
+	{"➡️", 1},
+	{"⬆️", 2},
+	{"⬇️", 3},
+	{"🅾️", 4},
+	{"❎", 5},
+
+	// UTF-8 joystick button glyphs (without variation selector)
+	{"⬅", 0},
+	{"➡", 1},
+	{"⬆", 2},
+	{"⬇", 3},
+	{"🅾", 4},
+
+	// P8SCII single-byte graphic glyphs
+	{"\x80", 0x0000'8000_raw_fix16},
+	{"\x81", 0x5A5A'8000_raw_fix16},
+	{"\x82", 0x7D7D'8000_raw_fix16},
+	{"\x84", 0x7D7D'8000_raw_fix16},
+	{"\x85", 0x511F'8000_raw_fix16},
+	{"\x86", 0x5555'8000_raw_fix16},
+	{"\x87", 0x0F0F'8000_raw_fix16},
+	{"\x88", 0xB81D'8000_raw_fix16},
+	{"\x89", 0xF99F'8000_raw_fix16},
+	{"\x8a", 0x51BF'8000_raw_fix16},
+	{"\x8c", 0xB5BF'8000_raw_fix16},
+	{"\x8d", 0x999F'8000_raw_fix16},
+	{"\x8f", 0xB11F'8000_raw_fix16},
+	{"\x90", 0xA0E0'8000_raw_fix16},
+	{"\x92", 0x9B3F'8000_raw_fix16},
+	{"\x93", 0xB1BF'8000_raw_fix16},
+	{"\x95", 0xF5FF'8000_raw_fix16},
+	{"\x96", 0xB15F'8000_raw_fix16},
+	{"\x98", 0x1B1F'8000_raw_fix16},
+	{"\x99", 0xF5BF'8000_raw_fix16},
+	{"\x9a", 0x7ADF'8000_raw_fix16},
+
+	// UTF-8 graphic glyphs
+	{"█", 0x0000'8000_raw_fix16},
+	{"▒", 0x5A5A'8000_raw_fix16},
+	{"░", 0x7D7D'8000_raw_fix16},
+	{"🐱", 0x511F'8000_raw_fix16},
+	{"▥", 0x5555'8000_raw_fix16},
+	{"▤", 0x0F0F'8000_raw_fix16},
+	{"✽", 0xB81D'8000_raw_fix16},
+	{"●", 0xF99F'8000_raw_fix16},
+	{"♥", 0x51BF'8000_raw_fix16},
+	{"☉", 0xB5BF'8000_raw_fix16},
+	{"웃", 0x999F'8000_raw_fix16},
+	{"⌂", 0xB11F'8000_raw_fix16},
+	{"😐", 0xA0E0'8000_raw_fix16},
+	{"♪", 0x9B3F'8000_raw_fix16},
+	{"◆", 0xB1BF'8000_raw_fix16},
+	{"…", 0xF5FF'8000_raw_fix16},
+	{"★", 0xB15F'8000_raw_fix16},
+	{"⧗", 0x1B1F'8000_raw_fix16},
+	{"ˇ", 0xF5BF'8000_raw_fix16},
+	{"∧", 0x7ADF'8000_raw_fix16},
 });
 
 } // namespace emu

@@ -20,13 +20,19 @@ struct Image : emu::MMIODevice<8192> {
 		fill(pixel_pair_byte);
 	}
 
-	void set_pixel(std::uint8_t x, std::uint8_t y,
+	void set_pixel(int x, int y,
 	               std::uint8_t palette_entry) const {
+		if (unsigned(x) >= frame_width || unsigned(y) >= frame_height) {
+			return;
+		}
 		set_nibble(x + (y * frame_width), palette_entry,
 		           emu::NibbleOrder::LSB_FIRST);
 	}
 
-	std::uint8_t get_pixel(std::uint8_t x, std::uint8_t y) const {
+	std::uint8_t get_pixel(int x, int y) const {
+		if (unsigned(x) >= frame_width || unsigned(y) >= frame_height) {
+			return 0;
+		}
 		return get_nibble(x + (y * frame_width), emu::NibbleOrder::LSB_FIRST);
 	}
 };

@@ -10,7 +10,7 @@ struct Map : emu::MMIODevice<8192> {
 	// NOTE: the first 4096 bytes overlap with the bottom of the sprite sheet
 	static constexpr std::uint16_t default_map_address = 0x1000;
 
-	static constexpr std::size_t width = 128, height = 128;
+	static constexpr std::size_t width = 128, height = 64;
 
 	static constexpr bool in_bounds(int x, int y) {
 		return x >= 0 && y >= 0 && x < int(width) && y < int(height);

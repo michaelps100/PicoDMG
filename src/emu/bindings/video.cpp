@@ -6,6 +6,7 @@
 #include <lauxlib.hpp>
 #include <lua.hpp>
 
+#include <devices/buttonstate.hpp>
 #include <devices/clippingrectangle.hpp>
 #include <devices/drawpalette.hpp>
 #include <devices/drawstatemisc.hpp>
@@ -36,18 +37,60 @@ inline void set_pixel(Point p, std::uint8_t pen_color) {
 	device<devices::Framebuffer>.set_pixel(p.x, p.y, resolved_color);
 }
 
+inline void draw_hline_solid(int x0, int x1, int y, std::uint8_t resolved_color) {
+	const auto clip = device<devices::ClippingRectangle>;
+	if (y < (int)clip.y_begin() || y >= (int)clip.y_end()) return;
+	if (x0 > x1) std::swap(x0, x1);
+	x0 = std::max(x0, (int)clip.x_begin());
+	x1 = std::min(x1, (int)clip.x_end() - 1);
+	if (x0 > x1) return;
+
+	uint8_t *row = device<devices::Framebuffer>.raw_view.data() + (y * 64);
+	const uint8_t c = resolved_color & 0x0Fu;
+	const uint8_t pair = (uint8_t)((c << 4) | c);
+
+	int x = x0;
+	if (x & 1) {
+		uint8_t &b = row[x >> 1];
+		b = (b & 0x0Fu) | (uint8_t)(c << 4);
+		x++;
+	}
+
+	const int full_bytes = (x1 - x + 1) / 2;
+	if (full_bytes > 0) {
+		std::memset(&row[x >> 1], pair, (size_t)full_bytes);
+		x += full_bytes * 2;
+	}
+
+	if (x <= x1) {
+		uint8_t &b = row[x >> 1];
+		b = (b & 0xF0u) | c;
+	}
+}
+
 inline void set_pixel_with_pattern(Point p, std::uint8_t raw_color) {
 	auto draw_state = device<devices::DrawStateMisc>;
+	const uint16_t pat = draw_state.fill_pattern();
 
-	if (draw_state.fill_pattern_at(p.x, p.y)) {
+	if (__builtin_expect(pat == 0 && !draw_state.fill_zero_is_transparent(), 1)) {
+		set_pixel(p, raw_color & 0x0Fu);
+		return;
+	}
+
+	const auto bit_index = (p.x & 0b11) | ((p.y & 0b11) << 2);
+	if ((pat >> bit_index) & 0b1) {
 		set_pixel(p, raw_color >> 4);
 	} else if (!draw_state.fill_zero_is_transparent()) {
-		set_pixel(p, raw_color & 0b1111);
+		set_pixel(p, raw_color & 0x0Fu);
 	}
 }
 
 inline void draw_line(Point a, Point b, std::uint8_t raw_color) {
 	const auto clip = device<devices::ClippingRectangle>;
+	auto draw_state = device<devices::DrawStateMisc>;
+	const bool is_solid = (draw_state.fill_pattern() == 0 && !draw_state.fill_zero_is_transparent());
+	const uint8_t resolved_color = is_solid ?
+		device<devices::DrawPalette>.get_color(raw_color & 0x0Fu) : 0;
 
 	const bool steep = std::abs(b.y - a.y) > std::abs(b.x - a.x);
 
@@ -74,7 +117,11 @@ inline void draw_line(Point a, Point b, std::uint8_t raw_color) {
 		}
 
 		if (clip.contains(plot_point)) {
-			detail::set_pixel_with_pattern(plot_point, raw_color);
+			if (is_solid) {
+				device<devices::Framebuffer>.set_pixel(plot_point.x, plot_point.y, resolved_color);
+			} else {
+				detail::set_pixel_with_pattern(plot_point, raw_color);
+			}
 		}
 
 		error -= dy;
@@ -128,15 +175,22 @@ inline void draw_sprite(Point sprite_origin, int sprite_width,
 		target_origin.y -= target_height;
 	}
 
+	if (target_width <= 0 || target_height <= 0 || sprite_width <= 0 || sprite_height <= 0) {
+		return;
+	}
+
 	// compute screenspace coordinates (possibly out-of-bounds, incl. negative)
 	const Point target_tl = target_origin;
-	const Point target_br = target_tl.with_offset(target_width, target_height);
 
 	// compute screenspace clipped coordinates
 	const Point clipped_tl = target_origin.max(clip.top_left());
 	const Point clipped_br =
 		target_origin.with_offset(target_width, target_height)
 			.min(clip.bottom_right());
+
+	if (clipped_tl.x >= clipped_br.x || clipped_tl.y >= clipped_br.y) {
+		return;
+	}
 
 	// step value added to the sprite coordinate for each real pixel
 	// this will be flipped later when using x_ or y_ flip
@@ -159,34 +213,43 @@ inline void draw_sprite(Point sprite_origin, int sprite_width,
 		x_spr_start = LuaFix16(sprite_origin.x) +
 		              LuaFix16(clipped_tl.x - target_tl.x) * x_spr_step;
 	} else {
-		x_spr_step = -x_spr_step;
-		x_spr_start = LuaFix16(sprite_origin.x + sprite_width - 1) +
-		              LuaFix16(target_br.x - clipped_br.x) * x_spr_step;
+		LuaFix16 step = x_spr_step;
+		x_spr_step = -step;
+		LuaFix16 x_spr_at_target_tl = LuaFix16(sprite_origin.x) +
+		                              LuaFix16(target_width - 1) * step;
+		x_spr_start = x_spr_at_target_tl +
+		              LuaFix16(clipped_tl.x - target_tl.x) * x_spr_step;
 	}
 
 	if (!y_flip) {
 		y_spr_start = LuaFix16(sprite_origin.y) +
 		              LuaFix16(clipped_tl.y - target_tl.y) * y_spr_step;
 	} else {
-		y_spr_step = -y_spr_step;
-		y_spr_start = LuaFix16(sprite_origin.y + sprite_height - 1) +
-		              LuaFix16(target_br.y - clipped_br.y) * y_spr_step;
+		LuaFix16 step = y_spr_step;
+		y_spr_step = -step;
+		LuaFix16 y_spr_at_target_tl = LuaFix16(sprite_origin.y) +
+		                              LuaFix16(target_height - 1) * step;
+		y_spr_start = y_spr_at_target_tl +
+		              LuaFix16(clipped_tl.y - target_tl.y) * y_spr_step;
 	}
 
-	// TODO: could this be made faster by calculating it as an offset within
-	// the framebuffer directly?
+	// Pre-cache palette lookup to eliminate 2 MMIO reads per pixel in inner loop
+	uint8_t pal_resolved[16];
+	bool pal_transparent[16];
+	for (int i = 0; i < 16; ++i) {
+		pal_resolved[i] = palette.get_color((uint8_t)i);
+		pal_transparent[i] = palette.is_transparent((uint8_t)i);
+	}
 
 	auto sprite_y = y_spr_start;
 	for (int y = clipped_tl.y; y < clipped_br.y; ++y) {
 		auto sprite_x = x_spr_start;
 		for (int x = clipped_tl.x; x < clipped_br.x; ++x) {
 			const u8 sprite_color =
-				sprite.get_pixel(int(sprite_x), int(sprite_y));
-			const std::uint8_t resolved_color =
-				palette.get_color(sprite_color & 0x0F);
+				sprite.get_pixel(int(sprite_x), int(sprite_y)) & 0x0Fu;
 
-			if (!palette.is_transparent(sprite_color)) {
-				fb.set_pixel(x, y, resolved_color);
+			if (!pal_transparent[sprite_color]) {
+				fb.set_pixel(x, y, pal_resolved[sprite_color]);
 			}
 
 			sprite_x += x_spr_step;
@@ -229,20 +292,84 @@ inline void draw_circle(Point origin, int radius,
 	}
 }
 
+template <typename PlotPixel>
+inline void draw_ellipse_rect(int x0, int y0, int x1, int y1, PlotPixel &&plot) {
+	int a = std::abs(x1 - x0);
+	int b = std::abs(y1 - y0);
+	int b1 = b & 1;
+
+	if (x0 > x1) {
+		std::swap(x0, x1);
+	}
+	if (y0 > y1) {
+		std::swap(y0, y1);
+	}
+
+	if (a == 0 && b == 0) {
+		plot(x0, y0);
+		return;
+	}
+	if (a == 0) {
+		for (int y = y0; y <= y1; ++y) {
+			plot(x0, y);
+		}
+		return;
+	}
+	if (b == 0) {
+		for (int x = x0; x <= x1; ++x) {
+			plot(x, y0);
+		}
+		return;
+	}
+
+	int64_t a_step = 8LL * a * a;
+	int64_t b_step = 8LL * b * b;
+	int64_t dx = 4LL * (1 - a) * b * b;
+	int64_t dy = 4LL * (b1 + 1) * a * a;
+	int64_t err = dx + dy;
+
+	y0 += (b + 1) / 2;
+	y1 = y0 - b1;
+
+	while (x0 <= x1) {
+		plot(x1, y0);
+		plot(x0, y0);
+		plot(x0, y1);
+		plot(x1, y1);
+		int64_t e2 = 2 * err;
+		if (e2 <= dy) {
+			y0++;
+			y1--;
+			dy += a_step;
+			err += dy;
+		}
+		if (e2 >= dx || 2 * err > dy) {
+			x0++;
+			x1--;
+			dx += b_step;
+			err += dx;
+		}
+	}
+
+	while (y0 - y1 < b) {
+		plot(x0 - 1, y0);
+		plot(x1 + 1, y0++);
+		plot(x0 - 1, y1);
+		plot(x1 + 1, y1--);
+	}
+}
+
 // returns the glyph width in pixels
-// FIXME: uhhhhhhh this should return height too, or just transform the point.
 inline int draw_glyph(Point origin, std::uint8_t glyph,
-                      std::span<const std::uint8_t, 2048> font,
+                      const std::uint8_t *font,
+                      int font_w_low, int font_w_high, int font_h,
                       std::uint8_t pen_color) {
 	const auto clip = device<devices::ClippingRectangle>;
 
 	const auto glyph_offset = std::size_t(glyph) * 8;
 
-	// TODO: this works differently on custom fonts, the default font should be
-	// modified to have the same properties header in the special glyph 0 and
-	// this function should read it. when that is done, make sure to min(,8)
-	int glyph_width = (glyph >= 128) ? 8 : 4;
-	int glyph_height = 6;
+	int glyph_width = (glyph >= 128) ? font_w_high : font_w_low;
+	int glyph_height = font_h;
 
 	for (int local_y = 0; local_y < glyph_height; ++local_y) {
 		for (int local_x = 0; local_x < glyph_width; ++local_x) {
@@ -262,67 +389,35 @@ inline int draw_glyph(Point origin, std::uint8_t glyph,
 
 // returns the new mouse cursor
 inline Point draw_text(Point origin, std::string_view text,
-                       std::span<const std::uint8_t, 2048> font,
+                       const std::uint8_t *font,
+                       int font_w_low, int font_w_high, int font_h,
                        std::uint8_t pen_color, bool terminal) {
 	Point current_position = origin;
 
-	int glyph_height = 5;
+	int glyph_height = font_h;
 
 	for (const char c : text) {
 		int glyph_width = 0;
+		uint8_t uc = static_cast<uint8_t>(c);
 
 		// P8SCII handling
-		switch (c) {
+		switch (uc) {
 		case 0: // '\0' => terminate printing
 			goto terminate_printing;
-		case 1: // '\*' => repeat next character P0 times
-			// TODO
-			break;
-		case 2: // '\#' => draw solid background
-			// TODO
-			break;
-		case 3: // '\-' => move cursor horizontally by P0 -16
-			// TODO
-			break;
-		case 4: // '\|' => move cursor vertically by P0 -16
-			// TODO
-			break;
-		case 5: // '\+' => move cursor horizontally by P0 -16, vertically by P1
-		        // -16
-			// TODO
-			break;
-		case 6: // '\^' => special command
-			// TODO
-			break;
-		case 7: // '\a' => audio command
-			// TODO
-			break;
-		case 8: // '\b' => backspace
-			// TODO
-			break;
-		case 9: // '\t' => tab
-			// TODO
-			break;
 		case 10: // '\n' => newline
-			// TODO
-			break;
-		case 11: // '\v' => decorate previous character
-			// TODO
-			break;
-		case 12: // '\f' => set foreground color
-			// TODO
-			break;
-		case 13: // '\r' => carriage return
-			// TODO
+			current_position.x = origin.x;
+			current_position.y += glyph_height + 1;
 			break;
 		case 14: // '\14' => switch font defined at 0x5600
-			// TODO
 			break;
 		case 15: // '\15' => switch font to default
-			// TODO
 			break;
 		default: {
-			glyph_width = draw_glyph(current_position, c, font, pen_color);
+			if (uc < 32 && uc != 0) {
+				// control characters not rendered as glyphs
+				break;
+			}
+			glyph_width = draw_glyph(current_position, uc, font, font_w_low, font_w_high, font_h, pen_color);
 			break;
 		}
 		}
@@ -334,18 +429,12 @@ inline Point draw_text(Point origin, std::string_view text,
 			} else {
 				current_position.x += glyph_width;
 			}
-
-			// TODO: scroll text with some memcpy/memset to the framebuffer when
-			// needed
 		} else {
 			current_position.x += glyph_width;
 		}
 	}
 
 terminate_printing:
-	current_position.x = origin.x;
-	current_position.y += glyph_height + 1;
-
 	return current_position;
 }
 
@@ -355,27 +444,33 @@ enum class Palette {
 	SCREEN_SECRET_PALETTE = 2
 };
 
-inline void set_palette_color(std::uint8_t source_color,
-                              std::uint8_t target_color, Palette palette) {
-	// source_color seems to be %16 on pico-8
+inline void set_palette_color(int source_color,
+                              int target_color, Palette palette) {
+	if (source_color < 0 || source_color > 15) {
+		return;
+	}
 
-	// target_color can have the higher nibble non-zero for
-	// - setting a pixel as transparent (draw palette)
-	// - using the secret 16 colors (screen palette)
-
-	source_color &= 0b0000'1111;
+	std::uint8_t raw_target = 0;
+	if (target_color < 0) {
+		// PICO-8: -1..-16 map to secret colors 143..128 (0x8F..0x80)
+		raw_target = (std::uint8_t)(128 + (16 + (target_color % 16)) % 16);
+	} else if (target_color >= 16 && target_color <= 31) {
+		// 16..31 map to secret colors 128..143 (0x80..0x8F)
+		raw_target = (std::uint8_t)((target_color - 16) | 0x80);
+	} else {
+		raw_target = (std::uint8_t)target_color;
+	}
 
 	switch (palette) {
 	case Palette::PEN_PALETTE:
-		device<devices::DrawPalette>.set_color(source_color, target_color);
+		device<devices::DrawPalette>.set_color(source_color, raw_target);
 		break;
 	case Palette::SCREEN_PALETTE:
 		device<devices::ScreenPalette>.set_raw_color(source_color,
-		                                             target_color);
+		                                             raw_target);
 		break;
-	// TODO: Palette::SCREEN_SECRET_PALETTE
 	default:
-		break; // verified pico-8 behavior: other values do nothing
+		break;
 	}
 }
 
@@ -490,6 +585,29 @@ int y8_fget(lua_State *state) {
 	return 1;
 }
 
+int y8_fset(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+	const auto sprite_flags = device<devices::SpriteFlags>;
+	const auto sprite_id = lua_tounsigned(state, 1);
+
+	if (argument_count >= 3) {
+		const auto flag_index = lua_tounsigned(state, 2);
+		bool val = false;
+		if (lua_isboolean(state, 3)) {
+			val = lua_toboolean(state, 3);
+		} else {
+			val = lua_tounsigned(state, 3) != 0;
+		}
+		sprite_flags.set_flag(sprite_id, flag_index, val);
+		return 0;
+	} else if (argument_count >= 2) {
+		const auto val = lua_tounsigned(state, 2);
+		sprite_flags.flags_for(sprite_id) = static_cast<std::uint8_t>(val);
+		return 0;
+	}
+	return 0;
+}
+
 int y8_cls(lua_State *state) {
 	std::uint8_t palette_entry = 0;
 
@@ -550,6 +668,38 @@ int y8_line(lua_State *state) {
 	return 0;
 }
 
+int y8_circ(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+
+	const Point world_origin(lua_tointeger(state, 1), lua_tointeger(state, 2));
+	const Point screen_origin = detail::worldspace_to_screenspace(world_origin);
+
+	const auto clip = device<devices::ClippingRectangle>;
+
+	int radius = 4;
+	std::uint8_t raw_color = device<devices::DrawStateMisc>.raw_pen_color();
+
+	if (argument_count >= 3) {
+		radius = lua_tointeger(state, 3);
+	}
+
+	if (argument_count >= 4) {
+		raw_color = lua_tounsigned(state, 4);
+	}
+
+	const auto plot_point = [&](Point p) {
+		if (clip.contains(p)) {
+			detail::set_pixel_with_pattern(p, raw_color);
+		}
+	};
+
+	detail::draw_circle(
+		screen_origin, radius, [&](Point p) { plot_point(p); },
+		[](int, int, int) {});
+
+	return 0;
+}
+
 int y8_circfill(lua_State *state) {
 	const auto argument_count = lua_gettop(state);
 
@@ -572,22 +722,64 @@ int y8_circfill(lua_State *state) {
 		raw_color = lua_tounsigned(state, 4);
 	}
 
-	const auto plot_point = [&](Point p) {
-		if (clip.contains(p)) {
-			detail::set_pixel_with_pattern(p, raw_color);
-		}
-	};
+	auto draw_state = device<devices::DrawStateMisc>;
+	if (__builtin_expect(draw_state.fill_pattern() == 0 && !draw_state.fill_zero_is_transparent(), 1)) {
+		const uint8_t resolved_color =
+			device<devices::DrawPalette>.get_color(raw_color & 0x0Fu);
 
-	detail::draw_circle(
-		screen_origin, radius, [&](Point p) { plot_point(p); },
-		[&](int x1, int x2, int y) {
-			const int x_min = std::max(std::min(x1, x2), int(clip.x_begin()));
-			const int x_max = std::min(std::max(x1, x2), int(clip.x_end() - 1));
-
-			for (int x = x_min; x <= x_max; ++x) {
-				detail::set_pixel_with_pattern({x, y}, raw_color);
+		detail::draw_circle(
+			screen_origin, radius,
+			[&](Point p) {
+				if (clip.contains(p)) {
+					device<devices::Framebuffer>.set_pixel(p.x, p.y, resolved_color);
+				}
+			},
+			[&](float x1, float x2, float y) {
+				detail::draw_hline_solid((int)x1, (int)x2, (int)y, resolved_color);
+			});
+	} else {
+		const auto plot_point = [&](Point p) {
+			if (clip.contains(p)) {
+				detail::set_pixel_with_pattern(p, raw_color);
 			}
-		});
+		};
+
+		detail::draw_circle(
+			screen_origin, radius, [&](Point p) { plot_point(p); },
+			[&](float x1, float x2, float y) {
+				const int x_min = std::max(std::min((int)x1, (int)x2), int(clip.x_begin()));
+				const int x_max = std::min(std::max((int)x1, (int)x2), int(clip.x_end() - 1));
+
+				for (int x = x_min; x <= x_max; ++x) {
+					detail::set_pixel_with_pattern({x, (int)y}, raw_color);
+				}
+			});
+	}
+
+	return 0;
+}
+
+int y8_rect(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+
+	auto world_x0 = lua_tointeger(state, 1);
+	auto world_y0 = lua_tointeger(state, 2);
+	auto world_x1 = lua_tointeger(state, 3);
+	auto world_y1 = lua_tointeger(state, 4);
+
+	std::uint8_t raw_color = device<devices::DrawStateMisc>.raw_pen_color();
+
+	if (argument_count >= 5) {
+		raw_color = lua_tounsigned(state, 5);
+	}
+
+	Point p0 = detail::worldspace_to_screenspace(Point(world_x0, world_y0));
+	Point p1 = detail::worldspace_to_screenspace(Point(world_x1, world_y1));
+
+	detail::draw_line(Point(p0.x, p0.y), Point(p1.x, p0.y), raw_color);
+	detail::draw_line(Point(p1.x, p0.y), Point(p1.x, p1.y), raw_color);
+	detail::draw_line(Point(p1.x, p1.y), Point(p0.x, p1.y), raw_color);
+	detail::draw_line(Point(p0.x, p1.y), Point(p0.x, p0.y), raw_color);
 
 	return 0;
 }
@@ -600,10 +792,15 @@ int y8_rectfill(lua_State *state) {
 	auto world_x1 = lua_tointeger(state, 3);
 	auto world_y1 = lua_tointeger(state, 4);
 
+	int min_x = std::min(world_x0, world_x1);
+	int max_x = std::max(world_x0, world_x1);
+	int min_y = std::min(world_y0, world_y1);
+	int max_y = std::max(world_y0, world_y1);
+
 	Point top_left =
-		detail::worldspace_to_screenspace(Point(world_x0, world_y0));
+		detail::worldspace_to_screenspace(Point(min_x, min_y));
 	Point bottom_right =
-		detail::worldspace_to_screenspace(Point(world_x1, world_y1));
+		detail::worldspace_to_screenspace(Point(max_x, max_y));
 
 	auto clip = device<devices::ClippingRectangle>;
 
@@ -618,9 +815,145 @@ int y8_rectfill(lua_State *state) {
 	bottom_right.x = std::min(bottom_right.x, int(clip.x_end() - 1));
 	bottom_right.y = std::min(bottom_right.y, int(clip.y_end() - 1));
 
-	for (int y = top_left.y; y <= bottom_right.y; ++y) {
-		for (int x = top_left.x; x <= bottom_right.x; ++x) {
+	if (top_left.x > bottom_right.x || top_left.y > bottom_right.y) {
+		return 0;
+	}
+
+	auto draw_state = device<devices::DrawStateMisc>;
+	if (__builtin_expect(draw_state.fill_pattern() == 0 && !draw_state.fill_zero_is_transparent(), 1)) {
+		const uint8_t resolved_color =
+			device<devices::DrawPalette>.get_color(raw_color & 0x0Fu);
+		for (int y = top_left.y; y <= bottom_right.y; ++y) {
+			detail::draw_hline_solid(top_left.x, bottom_right.x, y, resolved_color);
+		}
+	} else {
+		for (int y = top_left.y; y <= bottom_right.y; ++y) {
+			for (int x = top_left.x; x <= bottom_right.x; ++x) {
+				detail::set_pixel_with_pattern(Point(x, y), raw_color);
+			}
+		}
+	}
+
+	return 0;
+}
+
+int y8_oval(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+
+	auto world_x0 = lua_tointeger(state, 1);
+	auto world_y0 = lua_tointeger(state, 2);
+	auto world_x1 = lua_tointeger(state, 3);
+	auto world_y1 = lua_tointeger(state, 4);
+
+	auto &raw_color = device<devices::DrawStateMisc>.raw_pen_color();
+	if (argument_count >= 5) {
+		raw_color = lua_tounsigned(state, 5);
+	}
+
+	Point p0 = detail::worldspace_to_screenspace(Point(world_x0, world_y0));
+	Point p1 = detail::worldspace_to_screenspace(Point(world_x1, world_y1));
+
+	int x0 = p0.x;
+	int y0 = p0.y;
+	int x1 = p1.x;
+	int y1 = p1.y;
+
+	if (x0 > x1) std::swap(x0, x1);
+	if (y0 > y1) std::swap(y0, y1);
+
+	const auto clip = device<devices::ClippingRectangle>;
+	if (x1 < (int)clip.x_begin() || x0 >= (int)clip.x_end() ||
+	    y1 < (int)clip.y_begin() || y0 >= (int)clip.y_end()) {
+		return 0;
+	}
+
+	const auto plot_point = [&](int x, int y) {
+		if (clip.contains(Point(x, y))) {
 			detail::set_pixel_with_pattern(Point(x, y), raw_color);
+		}
+	};
+
+	detail::draw_ellipse_rect(x0, y0, x1, y1, plot_point);
+	return 0;
+}
+
+int y8_ovalfill(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+
+	auto world_x0 = lua_tointeger(state, 1);
+	auto world_y0 = lua_tointeger(state, 2);
+	auto world_x1 = lua_tointeger(state, 3);
+	auto world_y1 = lua_tointeger(state, 4);
+
+	auto &raw_color = device<devices::DrawStateMisc>.raw_pen_color();
+	if (argument_count >= 5) {
+		raw_color = lua_tounsigned(state, 5);
+	}
+
+	Point p0 = detail::worldspace_to_screenspace(Point(world_x0, world_y0));
+	Point p1 = detail::worldspace_to_screenspace(Point(world_x1, world_y1));
+
+	int x0 = p0.x;
+	int y0 = p0.y;
+	int x1 = p1.x;
+	int y1 = p1.y;
+
+	if (x0 > x1) std::swap(x0, x1);
+	if (y0 > y1) std::swap(y0, y1);
+
+	const auto clip = device<devices::ClippingRectangle>;
+	if (x1 < (int)clip.x_begin() || x0 >= (int)clip.x_end() ||
+	    y1 < (int)clip.y_begin() || y0 >= (int)clip.y_end()) {
+		return 0;
+	}
+
+	int scan_y0 = std::max(y0, (int)clip.y_begin());
+	int scan_y1 = std::min(y1, (int)clip.y_end() - 1);
+	if (scan_y0 > scan_y1) {
+		return 0;
+	}
+
+	int16_t span_min[128];
+	int16_t span_max[128];
+	for (int y = scan_y0; y <= scan_y1; ++y) {
+		span_min[y] = 32767;
+		span_max[y] = -32768;
+	}
+
+	const auto mark_span = [&](int x, int y) {
+		if (y >= scan_y0 && y <= scan_y1) {
+			if (x < span_min[y]) span_min[y] = (int16_t)x;
+			if (x > span_max[y]) span_max[y] = (int16_t)x;
+		}
+	};
+
+	detail::draw_ellipse_rect(x0, y0, x1, y1, mark_span);
+
+	const int clip_x0 = (int)clip.x_begin();
+	const int clip_x1 = (int)clip.x_end() - 1;
+
+	auto draw_state = device<devices::DrawStateMisc>;
+	if (__builtin_expect(draw_state.fill_pattern() == 0 && !draw_state.fill_zero_is_transparent(), 1)) {
+		const uint8_t resolved_color =
+			device<devices::DrawPalette>.get_color(raw_color & 0x0Fu);
+		for (int y = scan_y0; y <= scan_y1; ++y) {
+			if (span_min[y] <= span_max[y]) {
+				int sx0 = std::max((int)span_min[y], clip_x0);
+				int sx1 = std::min((int)span_max[y], clip_x1);
+				if (sx0 <= sx1) {
+					detail::draw_hline_solid(sx0, sx1, y, resolved_color);
+				}
+			}
+		}
+	} else {
+		for (int y = scan_y0; y <= scan_y1; ++y) {
+			if (span_min[y] <= span_max[y]) {
+				int sx0 = std::max((int)span_min[y], clip_x0);
+				int sx1 = std::min((int)span_max[y], clip_x1);
+				for (int x = sx0; x <= sx1; ++x) {
+					detail::set_pixel_with_pattern(Point(x, y), raw_color);
+				}
+			}
 		}
 	}
 
@@ -732,21 +1065,22 @@ int y8_pal(lua_State *state) {
 			target_palette = lua_tounsigned(state, 2);
 		}
 
-		const auto num_entries = lua_rawlen(state, 1);
-
-		for (std::size_t i = 1; i <= num_entries; ++i) {
-			lua_rawgeti(state, 1, int(i));
-			const auto target_color = lua_tointeger(state, -1);
-			detail::set_palette_color(i, target_color,
-			                          detail::Palette(target_palette));
+		lua_pushnil(state);
+		while (lua_next(state, 1) != 0) {
+			if (lua_isnumber(state, -2) && lua_isnumber(state, -1)) {
+				int src = lua_tointeger(state, -2);
+				int dst = lua_tointeger(state, -1);
+				detail::set_palette_color(src, dst,
+				                          detail::Palette(target_palette));
+			}
 			lua_pop(state, 1);
 		}
 
 		return 0;
 	}
 
-	const auto source_color = lua_tounsigned(state, 1);
-	const auto target_color = lua_tounsigned(state, 2);
+	const int source_color = lua_tointeger(state, 1);
+	const int target_color = lua_tointeger(state, 2);
 
 	if (argument_count >= 3) {
 		target_palette = lua_tounsigned(state, 3);
@@ -786,44 +1120,72 @@ int y8_fillp(lua_State *state) {
 
 	const auto argument_count = lua_gettop(state);
 
-	std::uint16_t pattern = 0;
-
 	if (argument_count >= 1) {
-		// FIXME: decimal part used for flags
-		pattern = lua_tounsigned(state, 1);
-	}
+		LuaFix16 val = luaL_checknumber(state, 1);
+		uint32_t raw = static_cast<uint32_t>(val.value);
+		uint16_t pattern = static_cast<uint16_t>(raw >> 16);
+		uint16_t frac = static_cast<uint16_t>(raw & 0xFFFF);
 
-	draw_state_misc.fill_pattern() = pattern;
+		uint8_t flags = 0;
+		if (frac & (1u << 15)) flags |= (1u << 0);
+		if (frac & (1u << 14)) flags |= (1u << 1);
+		if (frac & (1u << 13)) flags |= (1u << 2);
+		if (frac & (1u << 12)) flags |= (1u << 3);
+
+		draw_state_misc.fill_pattern() = pattern;
+		draw_state_misc.get_byte(0x33) = flags;
+	} else {
+		draw_state_misc.fill_pattern() = 0;
+		draw_state_misc.get_byte(0x33) = 0;
+	}
 
 	return 0;
 }
 
 int y8_clip(lua_State *state) {
-	std::uint8_t x = 0, y = 0;
-	std::uint8_t width = 128, height = 128;
-
 	const auto argument_count = lua_gettop(state);
-
-	if (argument_count >= 4) {
-		x = lua_tounsigned(state, 1);
-		y = lua_tounsigned(state, 2);
-		width = lua_tounsigned(state, 3);
-		height = lua_tounsigned(state, 4);
-	}
-
-	// FIXME: clip_previous optional parameter
-
 	const auto clip = device<devices::ClippingRectangle>;
 
-	lua_pushunsigned(state, clip.x_begin());
-	lua_pushunsigned(state, clip.y_begin());
-	lua_pushunsigned(state, clip.width());
-	lua_pushunsigned(state, clip.height());
+	lua_pushinteger(state, clip.x_begin());
+	lua_pushinteger(state, clip.y_begin());
+	lua_pushinteger(state, std::max(0, int(clip.x_end()) - int(clip.x_begin())));
+	lua_pushinteger(state, std::max(0, int(clip.y_end()) - int(clip.y_begin())));
 
-	clip.x_begin() = x;
-	clip.y_begin() = y;
-	clip.x_end() = x + width;
-	clip.y_end() = y + height;
+	if (argument_count >= 4) {
+		int x0 = lua_tointeger(state, 1);
+		int y0 = lua_tointeger(state, 2);
+		int w  = lua_tointeger(state, 3);
+		int h  = lua_tointeger(state, 4);
+
+		if (w <= 0 || h <= 0) {
+			clip.x_begin() = 0;
+			clip.y_begin() = 0;
+			clip.x_end() = 0;
+			clip.y_end() = 0;
+			return 4;
+		}
+
+		int x1 = x0 + w;
+		int y1 = y0 + h;
+
+		x0 = std::clamp(x0, 0, 128);
+		y0 = std::clamp(y0, 0, 128);
+		x1 = std::clamp(x1, 0, 128);
+		y1 = std::clamp(y1, 0, 128);
+
+		if (x1 < x0) x1 = x0;
+		if (y1 < y0) y1 = y0;
+
+		clip.x_begin() = static_cast<std::uint8_t>(x0);
+		clip.y_begin() = static_cast<std::uint8_t>(y0);
+		clip.x_end()   = static_cast<std::uint8_t>(x1);
+		clip.y_end()   = static_cast<std::uint8_t>(y1);
+	} else {
+		clip.x_begin() = 0;
+		clip.y_begin() = 0;
+		clip.x_end() = 128;
+		clip.y_end() = 128;
+	}
 
 	return 4;
 }
@@ -858,6 +1220,9 @@ int y8_mget(lua_State *state) {
 }
 
 int y8_flip([[maybe_unused]] lua_State *state) {
+	const auto btn_state = hal::update_button_state();
+	emu::emulator.set_button_state(btn_state);
+	device<devices::ButtonState>.for_player(0) = btn_state.held_key_mask;
 	emu::emulator.flip();
 	return 0;
 }
@@ -874,7 +1239,7 @@ int y8_map(lua_State *state) {
 	const Point screen_origin = detail::worldspace_to_screenspace(world_origin);
 
 	int tile_width = 128;
-	int tile_height = 128;
+	int tile_height = 64;
 
 	unsigned layer_mask = 0;
 
@@ -894,7 +1259,7 @@ int y8_map(lua_State *state) {
 	const auto tile_x_origin = std::max(tile_x_raw_origin, 0);
 	const auto tile_y_origin = std::max(tile_y_raw_origin, 0);
 	const auto tile_x_end = std::min(tile_x_raw_origin + tile_width, 128);
-	const auto tile_y_end = std::min(tile_y_raw_origin + tile_height, 128);
+	const auto tile_y_end = std::min(tile_y_raw_origin + tile_height, 64);
 
 	const auto map = device<devices::Map>;
 
@@ -945,7 +1310,6 @@ int y8_cursor(lua_State *state) {
 }
 
 int y8_print(lua_State *state) {
-	const std::span font(video::pico8_builtin_font);
 	const auto draw_misc = device<devices::DrawStateMisc>;
 
 	const auto argument_count = lua_gettop(state);
@@ -955,9 +1319,8 @@ int y8_print(lua_State *state) {
 		return 0;
 	}
 
-	// FIXME: this should allow numbers etc and do the same stuff as printh(?)
-	const char *str = lua_tostring(state, 1);
-
+	size_t str_len = 0;
+	const char *str = luaL_tolstring(state, 1, &str_len);
 	if (str == nullptr) {
 		return 0;
 	}
@@ -986,12 +1349,27 @@ int y8_print(lua_State *state) {
 		terminal_scrolling = true;
 	}
 
+	const uint8_t *font_ptr = video::pico8_builtin_font.data();
+	int w_low = 4, w_high = 8, h = 6;
+
+	// Check if custom font is enabled (bit 7 of 0x5F58)
+	if ((emulator.memory().get_byte(0x5F58) & 0x80) != 0) {
+		font_ptr = emulator.memory().raw_view.data() + 0x5600;
+		uint8_t cfg_w_low = emulator.memory().get_byte(0x5600);
+		uint8_t cfg_w_high = emulator.memory().get_byte(0x5601);
+		uint8_t cfg_h = emulator.memory().get_byte(0x5602);
+		if (cfg_w_low > 0) w_low = cfg_w_low;
+		if (cfg_w_high > 0) w_high = cfg_w_high;
+		if (cfg_h > 0) h = cfg_h;
+	}
+
 	const Point screen_point(detail::worldspace_to_screenspace(world_point));
 	const Point updated_point =
 		detail::screenspace_to_worldspace(detail::draw_text(
-			screen_point, str, font, raw_color, terminal_scrolling));
+			screen_point, std::string_view{str, str_len}, font_ptr, w_low, w_high, h, raw_color, terminal_scrolling));
 	draw_misc.set_text_point(updated_point);
 
+	lua_pop(state, 1); // pop string pushed by luaL_tolstring
 	return 0;
 }
 

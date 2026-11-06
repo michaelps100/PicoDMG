@@ -8,6 +8,7 @@
 
 #ifdef Y8_USE_EXTMEM
 extern tlsf_t global_heap;
+extern tlsf_t extmem_heap;
 #endif
 
 extern "C" {

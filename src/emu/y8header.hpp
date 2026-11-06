@@ -1,12 +1,10 @@
 #include <string_view>
 
-// TODO: minify (or eliminate) lua header
-/// @brief This header is injected at the start of every cart.
-/// Whatever symbols it brings to the `local` scope will be visible to the cart.
+// Header injected at the start of every cart in Lua
 static constexpr std::string_view app_header =
 	R"(
-local all = function(t)
-	if t == nil or #t == 0 then
+all = function(t)
+	if t == nil or type(t) ~= 'table' or #t == 0 then
 		return function() end
 	end
 
@@ -15,11 +13,11 @@ local all = function(t)
 
 	return function()
 		if t[i] == prev then
-			i += 1
+			i = i + 1
 		end
 
 		while t[i] == nil and i <= #t do
-			i += 1
+			i = i + 1
 		end
 
 		prev = t[i]
@@ -28,50 +26,39 @@ local all = function(t)
 	end
 end
 
-local inext = function(t, idx)
-	if (idx == nil) idx = 1 else idx += 1
+inext = function(t, idx)
+	if idx == nil then idx = 1 else idx = idx + 1 end
 	local x = t[idx]
-	if (x == nil) return nil
+	if x == nil then return nil end
 	return idx, x
 end
 
-local count = function(t, v)
+count = function(t, v)
+	if t == nil or type(t) ~= 'table' then return 0 end
 	local n = 0
 	if v == nil then
-		for i = 1,#t do
+		for i = 1, #t do
 			if t[i] ~= nil then
-				n += 1
+				n = n + 1
 			end
 		end
 	else
-		for i = 1,#t do
+		for i = 1, #t do
 			if t[i] == v then
-				n += 1
+				n = n + 1
 			end
 		end
 	end
 	return n
 end
-)"
 
-	/// This re-exports certain globals into the `local` scope of the cart.
-    /// Calling these is faster, but there is a 200 limit on locals (including
-    /// the cart's own), so it shouldn't be used a ton. That limit only affects
-    /// the number of locals that are used, AFAICT.
-    ///
-    /// This should preferably only re-export standard functions that are used
-    /// in hot loops.
-    ///
-    /// When re-exported in the `local` scope, any use gets added to the upvalue
-    /// table of a function. Usually, this is a net performance benefit, because
-    /// upvalue accesses can be done directly rather than through an environment
-    /// lookup by string key (even if this usecase was optimized for in y8).
-    ///
-    /// However, it also results in longer upvalue construction time
-    /// per-function... For how carts normally behave, this is probably fine.
+__p8_env = function(t)
+	if type(t) ~= 'table' then return t end
+	if getmetatable(t) == nil then
+		setmetatable(t, {__index = _G})
+	end
+	return t
+end
 
-	R"(local color, pset, pget, sset, sget, fget, line, circfill, rectfill, spr, sspr, pal, palt, fillp, clip, mset, mget, map, peek, peek2, peek4, poke, poke2, poke4, memcpy, memset, abs, flr, mid, min, max, sin, cos, sqrt, shl, shr, band, bor, rnd, t, time, add, foreach, split, unpack, ord =
-color, pset, pget, sset, sget, fget, line, circfill, rectfill, spr, sspr, pal, palt, fillp, clip, mset, mget, map, peek, peek2, peek4, poke, poke2, poke4, memcpy, memset, abs, flr, mid, min, max, sin, cos, sqrt, shl, shr, band, bor, rnd, t, time, add, foreach, split, unpack, ord
-)"
-
-	R"(_gc(); printh(stat(0) .. "KB at boot"))";
+_gc();
+)";

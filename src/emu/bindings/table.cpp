@@ -320,25 +320,69 @@ int y8_unpack(lua_State *state) {
 	// stack[2] (optional default 1): first index to unpack
 	// stack[3] (optional default #tbl): last index to unpack
 
+	if (!lua_istable(state, 1)) {
+		return 0;
+	}
+
 	const auto arg_count = lua_gettop(state);
 
 	int start_index = 1;
-	if (arg_count >= 2) {
+	if (arg_count >= 2 && !lua_isnil(state, 2)) {
 		start_index = lua_tointeger(state, 2);
 	}
 
 	int end_index;
-	if (arg_count >= 3) {
+	if (arg_count >= 3 && !lua_isnil(state, 3)) {
 		end_index = lua_tointeger(state, 3);
 	} else {
 		end_index = int(lua_rawlen(state, 1));
 	}
 
+	int n = end_index - start_index + 1;
+	if (n <= 0) {
+		return 0;
+	}
+
+	lua_checkstack(state, n);
+
 	for (int i = start_index; i <= end_index; ++i) {
 		lua_rawgeti(state, 1, i);
 	}
 
-	return end_index - start_index + 1;
+	return n;
+}
+
+int y8_deli(lua_State *state) {
+	if (!lua_istable(state, 1)) {
+		lua_pushnil(state);
+		return 1;
+	}
+	int len = int(lua_rawlen(state, 1));
+	int i = lua_isnoneornil(state, 2) ? len : int(lua_tointeger(state, 2));
+	if (i < 1 || i > len) {
+		lua_pushnil(state);
+		return 1;
+	}
+	lua_rawgeti(state, 1, i); // return value
+	for (int j = i; j < len; j++) {
+		lua_rawgeti(state, 1, j + 1);
+		lua_rawseti(state, 1, j);
+	}
+	lua_pushnil(state);
+	lua_rawseti(state, 1, len);
+	return 1;
+}
+
+int y8_pack(lua_State *state) {
+	int n = lua_gettop(state);
+	lua_createtable(state, n, 1);
+	lua_pushinteger(state, n);
+	lua_setfield(state, -2, "n");
+	for (int i = 1; i <= n; i++) {
+		lua_pushvalue(state, i);
+		lua_rawseti(state, -2, i);
+	}
+	return 1;
 }
 
 } // namespace emu::bindings

@@ -9,13 +9,25 @@
 namespace emu::bindings {
 
 int y8_rnd(lua_State *state) {
-	// FIXME: this does not handle passing a table as a parameter yet
-
 	const auto argument_count = lua_gettop(state);
+
+	if (argument_count >= 1 && lua_istable(state, 1)) {
+		const auto len = lua_rawlen(state, 1);
+		if (len == 0) {
+			lua_pushnil(state);
+			return 1;
+		}
+		const auto r = device<devices::Random>.next(fix16_from_int((int)len));
+		int idx = fix16_to_int(r) + 1;
+		if (idx < 1) idx = 1;
+		if (idx > (int)len) idx = (int)len;
+		lua_rawgeti(state, 1, idx);
+		return 1;
+	}
 
 	auto range = LuaFix16(1);
 
-	if (argument_count >= 1) {
+	if (argument_count >= 1 && !lua_isnil(state, 1)) {
 		range = lua_tonumber(state, 1);
 	}
 

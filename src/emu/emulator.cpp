@@ -21,6 +21,22 @@
 #include <devices/screenpalette.hpp>
 #include <hal/hal.hpp>
 #include <p8/parser.hpp>
+#include <p8/png_cart.hpp>
+
+#if defined(PICO_BOARD) || defined(PICO_PLATFORM) || defined(PICO_RP2350) || defined(PICO_BUILD) || __has_include(<hardware/watchdog.h>)
+#include <hardware/watchdog.h>
+#define Y8_WATCHDOG_UPDATE() watchdog_update()
+#else
+#define Y8_WATCHDOG_UPDATE() do {} while (0)
+#endif
+
+extern "C" {
+void mk_ili9225_text(char *s, uint16_t x, uint16_t y, uint16_t color, uint16_t bgcolor);
+void mk_ili9225_fill(uint16_t color);
+void pico8_show_error(const char *title, const char *msg);
+void p8_state_init_lua(lua_State *L);
+bool pico8_menu_get_turbo(void);
+}
 
 namespace emu {
 
@@ -31,6 +47,11 @@ Emulator::~Emulator() {
 }
 
 void Emulator::init() {
+	if (_lua_ready) {
+		lua_close(lua());
+		_lua_ready = false;
+	}
+
 	const auto default_palette = hal::get_default_palette();
 	std::copy(default_palette.begin(), default_palette.end(), _palette.begin());
 
@@ -41,6 +62,10 @@ void Emulator::init() {
 #ifdef Y8_EXPERIMENTAL_GENGC
 	// printf("Buggy Lua 5.2 Generational GC enabled\n");
 	luaC_changemode(lua(), KGC_GEN);
+#else
+	// Tune incremental GC for steady 30/60 fps without frame-drop spikes
+	lua_gc(lua(), LUA_GCSETPAUSE, 100);
+	lua_gc(lua(), LUA_GCSETSTEPMUL, 250);
 #endif
 	hal::load_rgb_palette(_palette);
 
@@ -49,6 +74,10 @@ void Emulator::init() {
 	lua_rawseti(lua(), LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS);
 
 	bind_globals();
+
+#if defined(PICO_BOARD) || defined(PICO_PLATFORM) || defined(PICO_RP2350) || defined(PICO_BUILD)
+	p8_state_init_lua(lua());
+#endif
 
 	_memory.fill(0);
 	device<devices::DrawPalette>.reset();
@@ -59,15 +88,30 @@ void Emulator::init() {
 	_button_state = {};
 }
 
+extern "C" {
+__attribute__((weak)) void p8_audio_sfx(int sfx_id, int channel, int offset, int length) { (void)sfx_id; (void)channel; (void)offset; (void)length; }
+__attribute__((weak)) void p8_audio_music(int pattern, int fade_len, int channel_mask) { (void)pattern; (void)fade_len; (void)channel_mask; }
+}
+
+static int y8_sfx(lua_State *state) {
+	int id = luaL_optinteger(state, 1, -1);
+	int channel = luaL_optinteger(state, 2, -1);
+	int offset = luaL_optinteger(state, 3, 0);
+	int length = luaL_optinteger(state, 4, 32);
+	p8_audio_sfx(id, channel, offset, length);
+	return 0;
+}
+
+static int y8_music(lua_State *state) {
+	int pattern = luaL_optinteger(state, 1, -1);
+	int fade_len = luaL_optinteger(state, 2, 0);
+	int channel_mask = luaL_optinteger(state, 3, 0);
+	p8_audio_music(pattern, fade_len, channel_mask);
+	return 0;
+}
+
 void Emulator::bind_globals() {
 	luaL_openlibs(lua());
-
-	const auto stub = [&](const char *name) {
-		lua_register(lua(), name, [](lua_State *) {
-			// printf("unimplemented blahblah\n");
-			return 0;
-		});
-	};
 
 	for (const auto &binding : y8_std) {
 		lua_register(lua(), binding.name, binding.callback);
@@ -78,8 +122,25 @@ void Emulator::bind_globals() {
 		lua_setglobal(lua(), reinterpret_cast<const char *>(binding.name));
 	}
 
-	stub("music");
-	stub("sfx");
+	lua_register(lua(), "sfx", y8_sfx);
+	lua_register(lua(), "music", y8_music);
+
+	/* PICO-8 coroutine aliases */
+	lua_getglobal(lua(), "coroutine");
+	if (lua_istable(lua(), -1)) {
+		lua_getfield(lua(), -1, "create");  lua_setglobal(lua(), "cocreate");
+		lua_getfield(lua(), -1, "resume");  lua_setglobal(lua(), "coresume");
+		lua_getfield(lua(), -1, "status");  lua_setglobal(lua(), "costatus");
+		lua_getfield(lua(), -1, "yield");   lua_setglobal(lua(), "yield");
+	}
+	lua_pop(lua(), 1);
+
+	/* Ensure unpack is available globally */
+	lua_getglobal(lua(), "table");
+	if (lua_istable(lua(), -1)) {
+		lua_getfield(lua(), -1, "unpack"); lua_setglobal(lua(), "unpack");
+	}
+	lua_pop(lua(), 1);
 }
 
 void Emulator::set_active_cart_path(std::string_view cart_path) {
@@ -110,6 +171,10 @@ bool Emulator::load_from_path(std::string_view cart_path) {
 		hal::fs_set_working_directory(cart_path.substr(0, last_dash_pos));
 	}
 
+	if (p8::is_png_cart(cart_path)) {
+		return p8::load_png_cart(cart_path, *this);
+	}
+
 	hal::FileReaderContext reader;
 
 	const hal::FileOpenStatus status =
@@ -132,7 +197,7 @@ bool Emulator::load_from_path(std::string_view cart_path) {
 	return true;
 }
 
-void Emulator::load_and_inject_header(Reader reader) {
+bool Emulator::load_and_inject_header(Reader reader) {
 	CartImporterReader state{.header_reader{app_header}, .cart_reader = reader};
 
 	const int load_status = lua_load(
@@ -143,10 +208,18 @@ void Emulator::load_and_inject_header(Reader reader) {
 		&state, "/bios/header.lua", "t");
 
 	if (load_status != 0) {
-		printf("Script load failed: %s\n", lua_tostring(lua(), -1));
-		panic(lua_tostring(lua(), -1));
+		const char *err = lua_tostring(lua(), -1);
+		printf("[Pico8] Script load failed (%d): %s\n", load_status, err ? err : "(null)");
+		if (err) {
+			std::strncpy(g_last_panic_msg, err, sizeof(g_last_panic_msg) - 1);
+			g_last_panic_msg[sizeof(g_last_panic_msg) - 1] = '\0';
+		} else {
+			snprintf(g_last_panic_msg, sizeof(g_last_panic_msg), "lua_load erro %d", load_status);
+		}
 		lua_pop(lua(), 1);
+		return false;
 	}
+	return true;
 }
 
 void Emulator::exec(std::string_view buf) {
@@ -191,9 +264,11 @@ void Emulator::run_until_shutdown() {
 			run_once();
 			break;
 		} catch (const EmulatorReset &e) {
-			goto reset_handler;
+			throw;
 		} catch (const EmulatorPanic &e) {
 			goto panic_handler;
+		} catch (const EmulatorExit &e) {
+			break;
 		}
 
 	reset_handler: {
@@ -207,6 +282,11 @@ void Emulator::run_until_shutdown() {
 	}
 
 	panic_handler: {
+#if defined(PICO_BOARD) || defined(PICO_PLATFORM) || defined(PICO_RP2350) || defined(PICO_BUILD)
+		extern char g_last_panic_msg[256];
+		pico8_show_error("PICO-8 PANIC (ERRO):", g_last_panic_msg);
+		break;
+#else
 		for (;;) {
 			try {
 				handle_repl();
@@ -214,8 +294,10 @@ void Emulator::run_until_shutdown() {
 				goto reset_handler;
 			} catch (...) {
 			}
+			hal::update_button_state();
 			flip();
 		}
+#endif
 	}
 	}
 }
@@ -239,6 +321,7 @@ void Emulator::run_once() {
 	bool has_any_hook_defined;
 
 	do {
+		Y8_WATCHDOG_UPDATE();
 		has_any_hook_defined = false;
 
 		/// execute a hook and updates has_any_hook_defined for this iteration
@@ -277,7 +360,22 @@ void Emulator::run_once() {
 }
 
 void Emulator::flip() {
-	hal::present_frame();
+	Y8_WATCHDOG_UPDATE();
+
+#if defined(PICO_BOARD) || defined(PICO_PLATFORM) || defined(PICO_RP2350) || defined(PICO_BUILD)
+	const bool is_turbo = pico8_menu_get_turbo();
+	static bool s_turbo_flip = false;
+	/* In turbo mode, skip every second screen blit to maintain full 2x speed without SPI ceiling */
+	const bool skip_blit = is_turbo && s_turbo_flip;
+	s_turbo_flip = !s_turbo_flip;
+#else
+	const bool is_turbo = false;
+	const bool skip_blit = false;
+#endif
+
+	if (!skip_blit) {
+		hal::present_frame();
+	}
 
 	// printf("%f\n", double(taken_time) / 1000.0);
 
@@ -290,9 +388,10 @@ void Emulator::flip() {
 	hal::post_frame_hooks();
 
 	const auto taken_time = hal::measure_time_us() - _frame_start_time;
+	const auto target_time = is_turbo ? (_frame_target_time / 2) : _frame_target_time;
 
-	if (taken_time < _frame_target_time) {
-		hal::delay_time_us(_frame_target_time - taken_time);
+	if (taken_time < target_time) {
+		hal::delay_time_us(target_time - taken_time);
 	}
 
 	_frame_start_time = hal::measure_time_us();
@@ -328,29 +427,16 @@ Emulator::HookResult Emulator::run_hook(const char *name) {
 	return HookResult::SUCCESS;
 }
 
+char g_last_panic_msg[256] = {0};
+
 void Emulator::panic(const char *message) {
-	device<devices::DrawPalette>.reset();
-	device<devices::ScreenPalette>.reset();
-	device<devices::DrawStateMisc>.reset();
-	device<devices::Framebuffer>.clear(0);
-	device<devices::DrawStateMisc>.set_text_point({4, 4});
-
-	printf("PANIC: %s\n", message);
-
-	device<devices::DrawStateMisc>.raw_pen_color() = 7;
-	lua_getglobal(lua(), "print");
-	lua_pushstring(lua(), "unrecoverable error");
-	lua_pcall(lua(), 1, 0, 0);
-
-	device<devices::DrawStateMisc>.raw_pen_color() = 6;
-	lua_getglobal(lua(), "print");
-	lua_pushstring(lua(), message);
-	lua_pcall(lua(), 1, 0, 0);
-
-	hal::present_frame();
+	printf("[Pico8] PANIC: %s\n", message ? message : "(null)");
+	if (message) {
+		std::strncpy(g_last_panic_msg, message, sizeof(g_last_panic_msg) - 1);
+		g_last_panic_msg[sizeof(g_last_panic_msg) - 1] = '\0';
+	}
 
 #ifdef Y8_INFINITE_LOOP_EXIT
-	// TODO: optional breakpoint?
 	throw EmulatorPanic();
 #else
 	exit(1);

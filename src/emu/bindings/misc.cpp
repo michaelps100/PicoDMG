@@ -7,9 +7,15 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <devices/clippingrectangle.hpp>
+#include <devices/drawpalette.hpp>
+#include <devices/drawstatemisc.hpp>
+#include <devices/screenpalette.hpp>
 #include <emu/emulator.hpp>
 #include <lauxlib.hpp>
+#include <ldo.hpp>
 #include <lua.hpp>
+#include <string>
 
 namespace emu::bindings {
 
@@ -87,6 +93,67 @@ int y8_stat(lua_State *state) {
 		break;
 	}
 
+	case StatEntry::CURRENT_FPS:
+	case StatEntry::TARGET_FPS:
+	case StatEntry::SYSTEM_FPS:
+		lua_pushinteger(state, 30);
+		break;
+
+	case StatEntry::P8_VERSION:
+		lua_pushinteger(state, 42); // 0.2.4b / modern PICO-8
+		break;
+
+	case StatEntry::LOAD_PARAMETER: {
+		std::string_view bc = emu::emulator.get_breadcrumb();
+		lua_pushlstring(state, bc.data(), bc.size());
+		break;
+	}
+
+	case StatEntry::CLIPBOARD_STRING:
+		lua_pushstring(state, "");
+		break;
+
+	case StatEntry(80): // UTC year
+	case StatEntry(90): // Local year
+		lua_pushinteger(state, 2026);
+		break;
+
+	case StatEntry(81): // UTC month
+	case StatEntry(91): // Local month
+		lua_pushinteger(state, 1);
+		break;
+
+	case StatEntry(82): // UTC day
+	case StatEntry(92): // Local day
+		lua_pushinteger(state, 1);
+		break;
+
+	case StatEntry(83): // UTC hour
+	case StatEntry(93): // Local hour
+	{
+		uint32_t sec = (uint32_t)(hal::measure_time_us() / 1000000ULL);
+		uint32_t hour = (12 + (sec / 3600)) % 24;
+		lua_pushinteger(state, hour);
+		break;
+	}
+
+	case StatEntry(84): // UTC minute
+	case StatEntry(94): // Local minute
+	{
+		uint32_t sec = (uint32_t)(hal::measure_time_us() / 1000000ULL);
+		uint32_t min = (sec / 60) % 60;
+		lua_pushinteger(state, min);
+		break;
+	}
+
+	case StatEntry(85): // UTC second
+	case StatEntry(95): // Local second
+	{
+		uint32_t sec = (uint32_t)(hal::measure_time_us() / 1000000ULL);
+		lua_pushinteger(state, sec % 60);
+		break;
+	}
+
 	default: {
 		// unhandled; return 0 by default
 		lua_pushnumber(state, LuaFix16());
@@ -97,7 +164,42 @@ int y8_stat(lua_State *state) {
 	return 1;
 }
 
-int y8_exit(lua_State *state) { std::exit(lua_tounsigned(state, 1)); }
+int y8_exit(lua_State *state) {
+	(void)state;
+	throw EmulatorExit();
+}
+
+int y8_run(lua_State *state) {
+	const auto argument_count = lua_gettop(state);
+	if (argument_count >= 1 && !lua_isnil(state, 1)) {
+		std::size_t bc_len = 0;
+		const char *bc_str = lua_tolstring(state, 1, &bc_len);
+		if (bc_str) {
+			emulator.set_breadcrumb({bc_str, bc_len});
+		} else {
+			emulator.clear_breadcrumb();
+		}
+	} else {
+		emulator.clear_breadcrumb();
+	}
+
+	emulator.clear_pending_load_cart();
+	throw EmulatorReset();
+}
+
+int y8_reboot(lua_State *state) {
+	(void)state;
+	throw EmulatorExit();
+}
+
+int y8_reset(lua_State *state) {
+	(void)state;
+	device<devices::DrawPalette>.reset();
+	device<devices::DrawStateMisc>.reset();
+	device<devices::ScreenPalette>.reset();
+	device<devices::ClippingRectangle>.reset();
+	return 0;
+}
 
 int y8_gc(lua_State *state) {
 	lua_gc(state, LUA_GCCOLLECT, 0);
@@ -387,6 +489,53 @@ int y8_ord(lua_State *state) {
 	return count;
 }
 
-int y8_chr(lua_State *state) { const auto arg_count = lua_gettop(state); }
+int y8_chr(lua_State *state) {
+	const auto arg_count = lua_gettop(state);
+	std::string s;
+	s.reserve(arg_count > 0 ? arg_count : 1);
+	for (int i = 1; i <= arg_count; ++i) {
+		int val = lua_tointeger(state, i);
+		s.push_back((char)(val & 0xFF));
+	}
+	lua_pushlstring(state, s.data(), s.size());
+	return 1;
+}
+
+int y8_menuitem(lua_State *state) {
+	(void)state;
+	return 0;
+}
+
+int y8_extcmd(lua_State *state) {
+	(void)state;
+	return 0;
+}
+
+static int32_t s_cartdata_storage[64] = {0};
+
+int y8_cartdata(lua_State *state) {
+	(void)state;
+	lua_pushboolean(state, 1);
+	return 1;
+}
+
+int y8_dget(lua_State *state) {
+	int index = luaL_optinteger(state, 1, 0);
+	if (index >= 0 && index < 64) {
+		lua_pushnumber(state, lua_Number::from_fix16(s_cartdata_storage[index]));
+	} else {
+		lua_pushnumber(state, 0);
+	}
+	return 1;
+}
+
+int y8_dset(lua_State *state) {
+	int index = luaL_optinteger(state, 1, 0);
+	if (index >= 0 && index < 64) {
+		lua_Number val = luaL_optnumber(state, 2, 0);
+		s_cartdata_storage[index] = val.value;
+	}
+	return 0;
+}
 
 } // namespace emu::bindings

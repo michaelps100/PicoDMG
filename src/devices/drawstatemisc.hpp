@@ -14,6 +14,11 @@ struct DrawStateMisc : emu::MMIODevice<64> {
 
 	void reset() const {
 		raw_pen_color() = 6; // light gray
+		set_camera_position({0, 0});
+		set_text_point({0, 0});
+		set_line_endpoint_valid(false);
+		get<std::uint16_t>(0x31) = 0;
+		get_byte(0x33) = 0;
 	}
 
 	std::uint8_t &raw_pen_color() const { return get_byte(0x25); }

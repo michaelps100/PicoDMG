@@ -6,6 +6,7 @@
 #include <coredefs.hpp>
 #include <emu/emulator.hpp>
 #include <lauxlib.hpp>
+#include <ldo.hpp>
 #include <lua.hpp>
 
 using namespace y8;
@@ -95,7 +96,7 @@ int y8_poke2(lua_State *state) {
 	const PicoAddr base = lua_tounsigned(state, 1);
 
 	for (int i = 0; i < argument_count - 1; ++i) {
-		const auto addr = base + i * 4;
+		const auto addr = base + i * 2;
 		const u16 value = lua_tounsigned(state, i + 2);
 		byte_at(addr + 0) = (value >> 0) & 0xFF;
 		byte_at(addr + 1) = (value >> 8) & 0xFF;
@@ -197,18 +198,35 @@ int y8_reload(lua_State *state) {
 }
 
 int y8_load(lua_State *state) {
-	// const auto argument_count = lua_gettop(state);
+	const auto argument_count = lua_gettop(state);
 
 	std::string_view cart_path;
-	{
-		std::size_t cart_path_len;
+	if (argument_count >= 1 && !lua_isnil(state, 1)) {
+		std::size_t cart_path_len = 0;
 		const char *cart_path_buf = lua_tolstring(state, 1, &cart_path_len);
-		cart_path = {cart_path_buf, cart_path_len};
+		if (cart_path_buf) {
+			cart_path = {cart_path_buf, cart_path_len};
+		}
 	}
 
-	if (cart_path != "") {
-		// will throw
+	if (argument_count >= 2 && !lua_isnil(state, 2)) {
+		std::size_t bc_len = 0;
+		const char *bc_str = lua_tolstring(state, 2, &bc_len);
+		if (bc_str) {
+			emulator.set_breadcrumb({bc_str, bc_len});
+		} else {
+			emulator.clear_breadcrumb();
+		}
+	} else {
+		emulator.clear_breadcrumb();
+	}
+
+	if (!cart_path.empty()) {
+		// will throw EmulatorReset
 		emu::emulator.trigger_load_from_vm(cart_path);
+	} else {
+		emu::emulator.clear_pending_load_cart();
+		throw EmulatorReset();
 	}
 
 	return 0;

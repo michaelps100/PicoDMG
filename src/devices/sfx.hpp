@@ -4,7 +4,7 @@
 
 namespace devices {
 
-struct Sfx : emu::MMIODevice<256> {
+struct Sfx : emu::MMIODevice<4352> {
 	using MMIODevice::MMIODevice;
 
 	static constexpr y8::PicoAddr default_map_address = 0x3200;

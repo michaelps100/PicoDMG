@@ -8,6 +8,10 @@
 #include <emu/emulator.hpp>
 #include <emu/mmio.hpp>
 
+#include <devices/drawpalette.hpp>
+#include <devices/drawstatemisc.hpp>
+#include <devices/screenpalette.hpp>
+#include <devices/clippingrectangle.hpp>
 #include "lstate.hpp"
 #include <array>
 
@@ -184,7 +188,9 @@ ParserStatus Parser::consume(hal::ReaderCallback &fs_reader, void *fs_ud) {
 
 		case ParserState::PARSING_LUA: {
 			LuaBlockReaderState lua_block_state{r, _lua_global_state};
-			emu::emulator.load_and_inject_header(lua_block_state.get_reader());
+			if (!emu::emulator.load_and_inject_header(lua_block_state.get_reader())) {
+				return ParserStatus::BAD_LUA_SCRIPT;
+			}
 			_current_state = ParserState::EXPECT_BLOCK;
 			break;
 		}
@@ -314,6 +320,11 @@ ParserStatus Parser::consume(hal::ReaderCallback &fs_reader, void *fs_ud) {
 			break;
 		}
 	}
+
+	emu::device<devices::DrawPalette>.reset();
+	emu::device<devices::DrawStateMisc>.reset();
+	emu::device<devices::ScreenPalette>.reset();
+	emu::device<devices::ClippingRectangle>.reset();
 
 	return ParserStatus::OK;
 }
