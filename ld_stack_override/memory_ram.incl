@@ -1,0 +1,16 @@
+MEMORY
+{
+    /* Shrink main RAM by the reserved core0 stack (0x5000 = 20 KB), which is
+     * carved out as its own STACK region in memory_extra.incl. Keeping RAM at
+     * full 512 KB would let .data/.bss/.heap grow into the stack's address
+     * range; __StackLimit/__HeapLimit stop before STACK and, in diagnostic
+     * builds, before the retained report bank below STACK.
+     *
+     * 20 KB, not the SDK default 4 KB: on the ILI9341 port chd_read() (up to
+     * ~10 KB per libchdr's own notes) is reached from inside the frame loop
+     * rather than from a vsync-wait task, so the chain below the frame loop has
+     * to fit as well. See the CMakeLists for the full reasoning. */
+    /* Diagnostics reserve 256 bytes immediately below STACK. The normal
+     * build passes zero, keeping its original RAM/heap layout. */
+    RAM(rwx) : ORIGIN = RAM_ORIGIN, LENGTH = RAM_LENGTH - 0x5000 - __pce_diag_bytes
+}

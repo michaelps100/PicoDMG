@@ -19,6 +19,10 @@
 #include "pce.h"
 #include "cd.h"
 #include "cd_chd.h"
+#include "../pce_diag.h"
+
+// TEMPORARY CD-load milestone hook (defined in main.cpp, weak in pce-go.c).
+extern void cdload_progress(int step, const char *msg) __attribute__((weak));
 
 // Persistent BIN file handle, allocated from PSRAM while a disc is open.
 static FIL *bin_fil = NULL;
@@ -326,11 +330,15 @@ static uint32_t crc32_of_file(const char *path)
 	// Both buffers are static: the chunked read buffer is too large for the
 	// 3 KB stack configured in CMakeLists.txt (PICO_STACK_SIZE=3072), and
 	// FatFS's FIL is itself ~600 bytes — combined with the caller's DIR /
-	// FILINFO / path locals, a stack-resident buf[4096] would overflow and
+	// FILINFO / path locals, a stack-resident buf[8192] would overflow and
 	// corrupt SRAM (we saw a core1 hardfault from exactly that).
 	// CRC computation is single-threaded, so static is safe.
+	// 8 KB chunks instead of 512 B: FatFS f_read gathers contiguous sectors
+	// and issues a single multi-block CMD18 per disk_read, so a ~256 KB BIOS
+	// drops from ~512 single-block transactions (which took >30s in hardware
+	// on the PCE-Card SD) to ~32 multi-block ones.
 	static FIL     fil;
-	static uint8_t buf[512];
+	static uint8_t buf[8192];
 
 	if (f_open(&fil, path, FA_READ) != FR_OK)
 		return 0;
@@ -423,6 +431,12 @@ static int scan_bios_dir(const char *dir_in,
 	}
 	f_closedir(&dir);
 
+	if (cdload_progress) {
+		char rep[64];
+		snprintf(rep, sizeof(rep), "BIOS scan %d file(s) done", candidates);
+		cdload_progress(2, rep);
+	}
+
 	if (best_entry) {
 		strncpy(out_path, best_path, out_size - 1);
 		out_path[out_size - 1] = '\0';
@@ -456,29 +470,20 @@ int
 cd_find_bios(char *out_path, size_t size, const char *primary_dir,
              bios_variant_t *out_variant)
 {
+	(void)primary_dir;
 	if (!out_path || size < 32)
 		return -1;
 
-	// Per-game override: if the CUE's own folder contains a BIOS, use it
-	// (lets users ship a region-specific BIOS alongside a patched game
-	// without touching /bios/). Falls through to /bios/ when the primary
-	// dir has no .pce files at all.
-	if (primary_dir && primary_dir[0]) {
-		printf("cd_find_bios: trying CUE folder %s first\n", primary_dir);
-		if (scan_bios_dir(primary_dir, out_path, size, out_variant) == 0) {
-			printf("cd_find_bios: using BIOS from CUE folder (skipping /bios/)\n");
-			return 0;
-		}
-		printf("cd_find_bios: no BIOS in %s, falling back to /bios/\n",
-		       primary_dir);
-	} else {
-		printf("cd_find_bios: no CUE folder provided, scanning /bios/ only\n");
-	}
+	// Scan ONLY /bios/. The per-game override (scanning the disc image's own
+	// folder first) was removed on request: on a slow SD card CRC-scanning
+	// every .pce next to a large .cue/.chd added tens of seconds before the
+	// disc even opened. Put extra BIOS files in /bios/ instead.
+	printf("cd_find_bios: scanning /bios/ only\n");
 
 	if (scan_bios_dir("/bios/", out_path, size, out_variant) == 0)
 		return 0;
 
-	printf("cd_find_bios: FAILED — no usable BIOS in CUE folder or /bios/\n");
+	printf("cd_find_bios: FAILED - no usable BIOS in /bios/\n");
 	if (out_variant) *out_variant = BIOS_UNKNOWN;
 	return -1;
 }
@@ -875,6 +880,7 @@ static int open_bin_for_track(int idx)
 
 static int read_sector(uint32_t lba)
 {
+	pce_diag_stage(PCE_DIAG_SECTOR_READ);
 	int idx = find_track(lba);
 	if (idx < 0) return -1;
 	cd_track_t *t = &CD.tracks[idx];
@@ -892,10 +898,10 @@ static int read_sector(uint32_t lba)
 	// SCSI layer the same 2048-byte MODE1 payload it gets for CUE+BIN.
 	if (CD.is_chd) {
 		static uint8_t raw_sector[CD_RAW_SECTOR_SIZE];
-		mutex_enter_blocking(&sd_mutex);
-		int rc = cd_chd_read_raw_sector(lba, raw_sector);
-		mutex_exit(&sd_mutex);
-		if (rc != 0) return -1;
+	mutex_enter_blocking(&sd_mutex);
+	int rc = cd_chd_read_raw_sector(lba, raw_sector);
+	mutex_exit(&sd_mutex);
+	if (rc != 0) return -1;
 		memcpy(CD.sector_buf, raw_sector + 16, CD_SECTOR_SIZE);
 		return 0;
 	}
@@ -1399,6 +1405,7 @@ static void adpcm_run_dma(void)
 	if (CD.phase != CDC_PHASE_DATA_IN) return;
 	if (!scsi_req) return;
 	if (!CD.adpcm_ram) return;
+	pce_diag_stage(PCE_DIAG_ADPCM_DMA);
 
 	while (scsi_req && CD.phase == CDC_PHASE_DATA_IN) {
 		CD.adpcm_ram[CD.adpcm_write_addr++] = scsi_read_port;
@@ -2214,6 +2221,7 @@ static void cd_audio_flush_ring(void)
 void
 cd_audio_update(void)
 {
+	pce_diag_stage(PCE_DIAG_AUDIO);
 	if (CD.audio_status != 0)  // 0 = Playing
 		return;
 	if (!CD.audio_ring_buf)
@@ -2264,6 +2272,8 @@ cd_audio_update(void)
 			}
 			if (off != audio_next_file_off) {
 				if (f_lseek(audio_fil, off) != FR_OK) {
+					// Must still drop the lock: returning with sd_mutex held
+					// deadlocks the next reader, permanently.
 					mutex_exit(&sd_mutex);
 					break;
 				}

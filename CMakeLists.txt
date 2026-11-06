@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-set(projectname picopcePlus)
+set(projectname PicoPCE)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -43,7 +43,13 @@ message("* Current build type is : ${CMAKE_BUILD_TYPE}")
 # ---------------------------------------------------------------------------
 # Hardware / board selection (project-specific)
 # ---------------------------------------------------------------------------
-if(NOT HW_CONFIG)
+if(NOT DEFINED USE_ILI9341)
+    set(USE_ILI9341 0 CACHE STRING "Use ILI9341 SPI TFT display instead of DVI/HSTX")
+endif()
+
+if(USE_ILI9341 AND NOT HW_CONFIG)
+    set(HW_CONFIG 15 CACHE STRING "Select the hardware configuration for your board")
+elseif(NOT HW_CONFIG)
     set(HW_CONFIG 8 CACHE STRING "Select the hardware configuration for your board")
 endif()
 
@@ -89,8 +95,35 @@ endif()
 project(${projectname} C CXX ASM)
 
 if(NOT DEFINED ENABLE_CHD)
-    set(ENABLE_CHD 1)
+    set(ENABLE_CHD 0)
 endif()
+set(_pce_diagnostics_default OFF)
+if(USE_ILI9341 AND PICO_PLATFORM STREQUAL "rp2350-arm-s")
+    set(_pce_diagnostics_default ON)
+endif()
+option(PCE_DIAGNOSTICS "Enable automatic on-screen fault recovery" ${_pce_diagnostics_default})
+
+# ---------------------------------------------------------------------------
+# Fallback panel when /boot.txt is absent or has no ST7789= key.
+#
+# The panel itself is a runtime choice read by shared_menu/dmg_panel.c, not a
+# build choice, so this only decides what a card with no /boot.txt gets.
+# Defaults to 0 (ILI9341) so every existing build keeps its current display; a
+# build that can only be an ST7789 -- such as the HW_CONFIG 16 console build --
+# overrides it with -DDEFAULT_PANEL_ST7789=1.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED DEFAULT_PANEL_ST7789)
+    set(DEFAULT_PANEL_ST7789 0 CACHE STRING
+        "Fallback panel when /boot.txt is absent: 0=ILI9341 1=ST7789")
+endif()
+if(HW_CONFIG EQUAL 16 AND NOT DEFAULT_PANEL_ST7789)
+    # The Core2350B console is an ST7789, so a card with a missing or
+    # ST7789-less /boot.txt would otherwise come up on the wrong driver and
+    # show nothing at all. Matches the bootloader's default for this board.
+    set(DEFAULT_PANEL_ST7789 1 CACHE STRING
+        "Fallback panel when /boot.txt is absent: 0=ILI9341 1=ST7789" FORCE)
+endif()
+message("* Fallback display panel (no ST7789= in /boot.txt): ${DEFAULT_PANEL_ST7789}")
 
 pico_sdk_init()
 
@@ -119,6 +152,13 @@ add_executable(${projectname}
     EmuOverlay444.c
     EmuOverlay555.c
     state.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_menu.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_panel.c
+${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_combo.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_power.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_battery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_resume.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_boot_intro.c
 )
 
 pico_set_program_name(${projectname} "${projectname}")
@@ -216,6 +256,15 @@ target_compile_definitions(${projectname} PRIVATE
     DI_RING_BUFFER_SIZE=512
     USE_PCE_FRAMEBUFFER_PACING=1
     SGX=1
+    USE_ILI9341=${USE_ILI9341}
+    ILI9341_PIN_CS=${ILI9341_PIN_CS}
+    ILI9341_PIN_SCK=${ILI9341_PIN_SCK}
+    ILI9341_PIN_MOSI=${ILI9341_PIN_MOSI}
+    ILI9341_PIN_DC=${ILI9341_PIN_DC}
+    ILI9341_PIN_RST=${ILI9341_PIN_RST}
+    ILI9341_PIN_BL=${ILI9341_PIN_BL}
+    ILI9341_SPI_INST=${ILI9341_SPI_INST}
+    DMG_DEFAULT_PANEL_ST7789=${DEFAULT_PANEL_ST7789}
     #HSTX_DEBUG=1
 )
 # ---------------------------------------------------------------------------
@@ -261,10 +310,43 @@ if(USB_MSC_ENABLED)
 endif()
 if(NOT PICO_PLATFORM STREQUAL "rp2040")
     message(STATUS "Using PICO_PIO_USE_GPIO_BASE=1 for non-rp2040 platforms.")
-    target_compile_definitions(${projectname} PRIVATE
-        PICO_PIO_USE_GPIO_BASE=1
-        PICO_STACK_SIZE=3072
-    )
+    if(USE_ILI9341)
+        # Core0 main stack moves from SCRATCH_Y (4 KB) into a dedicated STACK
+        # region carved from the top of main RAM, and is sized 20 KB.
+        #
+        # Upstream's own CMakeLists notes that libchdr's chd_read needs ~6-10 KB
+        # of stack. That budget was set for the display paths upstream supports,
+        # where cd_audio_update() runs in the vsync-wait task rather than inside
+        # the frame loop. This is not true for the ILI9341 port: there
+        # cd_audio_update() (and so chd_read) is called from
+        # pushAudioAndOverlay() in the middle of the frame loop, on top of that
+        # call chain's own frames. At 12 KB the chain overflowed during CD
+        # gameplay and the console stalled, while the same image ran for
+        # thousands of frames on the host harness with its unbounded stack.
+        #
+        # ld_stack_override/*.incl relocate the main stack; PICO_STACK_SIZE must
+        # match the STACK region LENGTH (0x5000 = 20480) and PICO_CORE1_STACK_SIZE
+        # must stay explicit at 3072 (it defaults to PICO_STACK_SIZE and would
+        # blow up SCRATCH_X's 4 KB bank otherwise).
+        target_compile_definitions(${projectname} PRIVATE
+            PICO_PIO_USE_GPIO_BASE=1
+            PICO_STACK_SIZE=20480
+            PICO_CORE1_STACK_SIZE=3072
+        )
+        if(PCE_DIAGNOSTICS)
+            target_link_options(${projectname} PRIVATE "LINKER:--defsym=__pce_diag_bytes=256")
+        else()
+            target_link_options(${projectname} PRIVATE "LINKER:--defsym=__pce_diag_bytes=0")
+        endif()
+        pico_add_linker_script_override_path(${projectname}
+            ${CMAKE_CURRENT_LIST_DIR}/ld_stack_override
+            FILES memory_ram.incl memory_extra.incl sections_stack.incl section_end.incl)
+    else()
+        target_compile_definitions(${projectname} PRIVATE
+            PICO_PIO_USE_GPIO_BASE=1
+            PICO_STACK_SIZE=3072
+        )
+    endif()
 endif()
 
 if(DEFINED PICO_DEFAULT_UART_TX_PIN)
@@ -317,6 +399,9 @@ target_link_libraries(${projectname} PRIVATE
     hardware_interp
     hardware_timer
     hardware_clocks
+    hardware_xosc
+    hardware_adc
+    hardware_rosc
     hardware_pwm
     hardware_flash
     dvi
@@ -326,7 +411,12 @@ target_link_libraries(${projectname} PRIVATE
     pico_shared
     xinput_host
 )
-
+target_sources(${projectname} PRIVATE pce_diag.cpp)
+if(PCE_DIAGNOSTICS)
+    target_compile_definitions(${projectname} PRIVATE PCE_DIAGNOSTICS=1)
+else()
+    target_compile_definitions(${projectname} PRIVATE PCE_DIAGNOSTICS=0)
+endif()
 # Optional CHD support (feasibility spike). The pre-empted pico_malloc above
 # (when ENABLE_CHD=1) routes stdlib malloc through PSRAM, which is required
 # for libchdr's chd_open allocations. Links libchdr_pico and exposes
@@ -355,7 +445,9 @@ target_include_directories(${projectname} PRIVATE
     pico_lib
     tusb_xinput
     pico_shared
+    pico_shared/drivers/ili9341
     pce-go
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu
     .
 )
 

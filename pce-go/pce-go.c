@@ -196,6 +196,15 @@ static const struct {
 };
 
 static bool running = false;
+static bool cached_rom_predecoded = false;
+static uint32_t cached_rom_raw_crc = 0;
+
+void
+SetPCECachedRomInfo(bool predecoded, uint32_t raw_crc)
+{
+	cached_rom_predecoded = predecoded;
+	cached_rom_raw_crc = raw_crc;
+}
 
 /**
  * Load card into memory and set its memory map
@@ -210,7 +219,7 @@ LoadCard(uint8_t *data, size_t size)
 		return -1;
 	}
 
-	if (PCE.ROM != NULL)
+	if (PCE.ROM != NULL && (uintptr_t)PCE.ROM < 0x10000000)
 		free(PCE.ROM);
 
 	int offset = size & 0x1fff;
@@ -219,7 +228,8 @@ LoadCard(uint8_t *data, size_t size)
 	PCE.ROM = data;
 	PCE.ROM_SIZE = (size - offset) / 0x2000;
 	PCE.ROM_DATA = PCE.ROM + offset;
-	PCE.ROM_CRC = crc32_le(0, PCE.ROM, size);
+	PCE.ROM_CRC = cached_rom_predecoded ? cached_rom_raw_crc :
+	              crc32_le(0, PCE.ROM, size);
 
 	uint32_t IDX = 0;
 	uint32_t ROM_MASK = 1;
@@ -249,7 +259,8 @@ LoadCard(uint8_t *data, size_t size)
 	PCE.Quirks = romFlags[IDX].Flags;
 
 	// US Encrypted
-	if ((romFlags[IDX].Flags & US_ENCODED) || PCE.ROM_DATA[0x1FFF] < 0xE0)
+	if (!cached_rom_predecoded &&
+	    ((romFlags[IDX].Flags & US_ENCODED) || PCE.ROM_DATA[0x1FFF] < 0xE0))
 	{
 		MESSAGE_INFO("This rom is probably US encrypted, decrypting...\n");
 
@@ -393,15 +404,16 @@ static void unload_disc_state(void)
 int
 LoadDisc(const char *cue_path)
 {
-	if (!cue_path) return -2;
+	if (!cue_path) return DISC_ERR_NO_BIOS;
 
 	// Start from a clean slate — if the previous game was also a CD this
 	// frees the prior BIOS/CD allocations.
 	unload_disc_state();
 	if (cd_init() != 0) {
 		MESSAGE_ERROR("cd_init failed\n");
-		return -2;
+		return DISC_ERR_IMAGE_OPEN;
 	}
+
 
 	// --- 1. Find BIOS ---
 	// Static for stack safety (FF_MAX_LFN+8 buffer + ~600 B FIL would push
@@ -424,32 +436,32 @@ LoadDisc(const char *cue_path)
 	if (cd_find_bios(bios_path, sizeof(bios_path), cue_dir, &variant) != 0) {
 		MESSAGE_ERROR("No CD BIOS found in %s or /bios/\n",
 		              cue_dir[0] ? cue_dir : "(CUE dir)");
-		return -1;
+		return DISC_ERR_NO_BIOS;
 	}
 
 	// --- 2. Load BIOS into PSRAM ---
 	if (f_open(&fil, bios_path, FA_READ) != FR_OK) {
 		MESSAGE_ERROR("Cannot open BIOS %s\n", bios_path);
-		return -2;
+		return DISC_ERR_BIOS_OPEN;
 	}
 	FSIZE_t bios_size = f_size(&fil);
 	if (bios_size < 0x2000 || bios_size > 0x100000) {
 		MESSAGE_ERROR("BIOS size unreasonable: %lu\n", (unsigned long)bios_size);
 		f_close(&fil);
-		return -2;
+		return DISC_ERR_BIOS_SIZE;
 	}
 	PCE.ROM = (uint8_t *)frens_f_malloc(bios_size);
 	if (!PCE.ROM) {
 		MESSAGE_ERROR("Cannot allocate %lu bytes for BIOS\n", (unsigned long)bios_size);
 		f_close(&fil);
-		return -2;
+		return DISC_ERR_BIOS_ALLOC;
 	}
 	UINT br = 0;
 	if (f_read(&fil, PCE.ROM, bios_size, &br) != FR_OK || br != bios_size) {
 		MESSAGE_ERROR("BIOS read failed (got %u of %lu)\n", br, (unsigned long)bios_size);
 		f_close(&fil);
 		unload_disc_state();
-		return -2;
+		return DISC_ERR_BIOS_READ;
 	}
 	f_close(&fil);
 
@@ -479,7 +491,7 @@ LoadDisc(const char *cue_path)
 	    || !CD.audio_ring_buf) {
 		MESSAGE_ERROR("CD/Arcade Card RAM allocation failed\n");
 		unload_disc_state();
-		return -2;
+		return DISC_ERR_CD_ALLOC;
 	}
 	memset(CD.cd_ram,    0,    CD_RAM_SIZE);
 	memset(CD.scd_ram,   0,    SCD_RAM_SIZE);
@@ -502,16 +514,13 @@ LoadDisc(const char *cue_path)
 		MESSAGE_ERROR("%s failed for %s\n",
 		              path_is_chd ? "cd_chd_open" : "cd_load_cue", cue_path);
 		unload_disc_state();
-		return -2;
+		return DISC_ERR_IMAGE_OPEN;
 	}
 
 	// --- 5. Wire memory map and reset ---
 	cd_setup_memory_map();
 	CD.cd_attached = true;
 	CD.bram_locked = true;     // real hardware boots with BRAM locked
-
-	MESSAGE_INFO("LoadDisc: BIOS=%s (variant=%d, %s), CD attached\n",
-	             bios_path, (int)variant, CD.bios_is_us ? "US" : "JP");
 
 	ResetPCE(true);
 	return 0;

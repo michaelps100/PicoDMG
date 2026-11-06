@@ -426,7 +426,7 @@ static void __not_in_flash_func(draw_sprites)(const vdc_ctx_t *ctx, const uint64
 		TRACE_SPR("Sprite 0x%02X : X = %d, Y = %d, attr = %d, no = %d\n", n, x, y, attr, no);
 
 		// Sprite is completely outside our window, skip it
-		if (y >= Y2 || y + (cgy + 1) * 16 < Y1 || x >= XBUF_WIDTH || x + (cgx + 1) * 16 < 0) {
+		if (y >= Y2 || y + (cgy + 1) * 16 < Y1 || x >= XBUF_WIDTH || x + (cgx + 1) * 16 <= 0) {
 			continue;
 		}
 
@@ -453,7 +453,7 @@ static void __not_in_flash_func(draw_sprites)(const vdc_ctx_t *ctx, const uint64
 			// rendering screen_buffer is a virtual offset, so we cannot rely
 			// on P-advancement deltas between iterations — a skipped segment
 			// must not leave P pointing into unrelated BSS.
-			uint8_t *P = screen_buffer + (segment_top + t) * XBUF_WIDTH + x;
+			uint8_t *row = screen_buffer + (segment_top + t) * XBUF_WIDTH;
 
 			// Pick the row offset within this cell-pair that draw_sprite needs.
 			// Non-V_FLIP reads C[0..height-1] forward, so start at row t.
@@ -463,8 +463,13 @@ static void __not_in_flash_func(draw_sprites)(const vdc_ctx_t *ctx, const uint64
 			             + ((attr & V_FLIP) ? (16 - t - height) : t);
 
 			for (int j = 0; j <= cgx; j++) {
-				draw_sprite(P + (attr & H_FLIP ? cgx - j : j) * 16,
-				            C + j * 64, height, attr);
+				int cell_x = x + (attr & H_FLIP ? cgx - j : j) * 16;
+				// A partly visible 32px sprite can have one whole 16px cell
+				// off-screen. Do not draw it: a single-line OSD only reserves
+				// 16 bytes before the row. Virtual framebuffer_top does not
+				// protect that physical row on scanlines after the first.
+				if (cell_x + 16 <= 0 || cell_x >= XBUF_WIDTH) continue;
+				draw_sprite(row + cell_x, C + j * 64, height, attr);
 			}
 		}
 	}

@@ -88,11 +88,21 @@ static const core_file_callbacks fatfs_cb = {
 };
 
 // --- Hunk cache ----------------------------------------------------------
-// Small LRU keyed by hunk index. Sized to hold one full per-frame-group in
-// each entry; 4 entries cover ~16-32 sequential sectors which is enough for
-// CD-DA streaming and bursty data reads without thrash.
-
-#define CHD_CACHE_ENTRIES 4
+// LRU keyed by hunk index; each entry holds one whole hunk (8 CD frames for the
+// 19584-byte hunks these discs use).
+//
+// The original 4 entries were sized on the assumption that disc access is
+// sequential, "enough for CD-DA streaming and bursty data reads". That holds
+// while the System Card BIOS boots, but once a game is running it reads the
+// DATA track (level, graphics) at the same time as CD-DA streams the AUDIO
+// track, so the two evict each other and every sector costs a fresh seek, read
+// and inflate. That is what capped the frame rate and eventually stalled the
+// game once gameplay started.
+//
+// 32 entries cover 4.4 MB of decompressed disc, which is a comfortable working
+// set for both streams; the allocation lives in PSRAM, where a few hundred KB
+// against 8 MB is affordable.
+#define CHD_CACHE_ENTRIES 32
 
 typedef struct {
 	uint32_t hunk_index;
@@ -264,11 +274,18 @@ static int load_tracks_from_metadata(chd_file *chd)
 		//   * the track contributes `frames` LBAs to the disc layout
 		//   * the data portion (after the pregap) is (frames - pregap) LBAs
 		//   * the on-disc INDEX 01 lba_start is running_lba + pregap
-		//   * the CHD storage base for this track is chd_frame_cursor; the
-		//     INDEX 01 frame lives `pregap` frames in
 		// Tracks are then padded to CD_TRACK_PADDING (4) frames in storage.
+		//
+		// chd_frame_start is the CHD frame backing the track's INDEX 01. It is
+		// chd_frame_cursor, NOT cursor + pregap: chdman does not store the
+		// pregap in the image, and FRAMES already accounts for it. Adding the
+		// pregap here shifted every data-track read 150 frames late, so the
+		// System Card BIOS read garbage for LBA 3890 and gave up with
+		// "LOAD ERROR" -- while the same disc as CUE/BIN, which seeks by disc
+		// LBA, worked. probe_track_frame_maps() below confirms the choice
+		// against the actual sync header instead of trusting the convention.
 		uint32_t data_lbas = (uint32_t)frames - (uint32_t)pregap;
-		t->chd_frame_start = chd_frame_cursor + (uint32_t)pregap;
+		t->chd_frame_start = chd_frame_cursor;
 		t->lba_start      = running_lba + (uint32_t)pregap;
 		t->lba_end        = t->lba_start + data_lbas;
 
@@ -310,6 +327,8 @@ bool cd_chd_is_active(void)
 {
 	return CD.is_chd && CD.chd_handle != NULL;
 }
+
+static void probe_track_frame_maps(void);
 
 int cd_chd_open(const char *path)
 {
@@ -356,6 +375,7 @@ int cd_chd_open(const char *path)
 		cd_chd_close();
 		return -1;
 	}
+	probe_track_frame_maps();
 
 	CD.is_chd = true;
 	return 0;
@@ -386,6 +406,50 @@ static int chd_find_track(uint32_t lba)
 			return i;
 	}
 	return -1;
+}
+
+// A MODE1 data sector opens with the 12-byte sync pattern 00 FF*10 followed by
+// the MSF header. Audio has no sync at all, so this only applies to data tracks.
+static bool is_mode1_sector(const uint8_t *s){
+	if (s[0] != 0x00) return false;
+	for (int i = 1; i <= 10; i++) if (s[i] != 0xFF) return false;
+	return s[11] == 0x00;
+}
+
+// Confirm each data track's chd_frame_start against the bytes actually stored
+// in the image, and correct it if the alternative convention matches instead.
+//
+// chdman normally does not store a track's pregap, so INDEX 01 sits at
+// chd_frame_cursor; some images do store it. Getting this wrong shifts every
+// read of that track by the pregap, and the only symptom is the System Card
+// BIOS aborting the boot with "LOAD ERROR" -- no error anywhere else, since the
+// bytes returned are still valid sectors from somewhere in the image. Checking
+// the sync header of the track's first sector settles it either way.
+static void probe_track_frame_maps(void)
+{
+	static uint8_t probe[CD_RAW_SECTOR_SIZE];
+
+	for (int i = 0; i < CD.num_tracks; i++) {
+		cd_track_t *t = &CD.tracks[i];
+		if (t->type != 1) continue;                 // data tracks only
+		if (t->pregap_lbas == 0) continue;           // nothing to disagree about
+
+		uint32_t saved = t->chd_frame_start;
+		uint32_t frame = saved / chd_frames_per_hunk;
+		uint32_t in_hunk = saved % chd_frames_per_hunk;
+		uint8_t *hunk = cache_get(frame);
+		bool ok = false;
+		if (hunk) {
+			memcpy(probe, hunk + (size_t)in_hunk * CD_FRAME_SIZE, CD_RAW_SECTOR_SIZE);
+			ok = is_mode1_sector(probe);
+		}
+		if (ok) continue;
+
+		// Try the other convention: INDEX 01 one pregap further in.
+		t->chd_frame_start = saved + t->pregap_lbas;
+		printf("cd_chd: track %u frame map: pregap is stored in the image\n",
+		       t->track_no);
+	}
 }
 
 int cd_chd_read_raw_sector(uint32_t lba, uint8_t *dest)

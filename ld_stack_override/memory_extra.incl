@@ -1,0 +1,28 @@
+/* Extra memory region: a dedicated STACK bank carved from the top of main RAM.
+ *
+ * Core0's main stack (.stack_dummy) moves here from SCRATCH_Y (4 KB) so the
+ * deep call chains of chd_read / libchdr do not overflow. The region is 20 KB
+ * (0x5000) and sits at the very top of RAM, right below SCRATCH_X:
+ *
+ *   0x20000000  +-----------------------+
+ *               |  RAM (shrunk: memory_ram.incl)  LENGTH = RAM_LENGTH - 0x5000 |
+ *               |  ... data/bss/heap ...                                      |
+ *               |  Optional PCE_DIAG_RAM (256 bytes, outside heap)           |
+ *   0x2007B000  +-----------------------+  <- ORIGIN(STACK)
+ *               |  STACK (20 KB)        |
+ *   0x20080000  +-----------------------+  <- ORIGIN(SCRATCH_X), top of main RAM
+ *               |  SCRATCH_X (4 KB)     |
+ *   0x20081000  +-----------------------+
+ *               |  SCRATCH_Y (4 KB)     |  (now unused by the core0 stack)
+ *   0x20082000  +-----------------------+
+ *
+ * Requirements (enforced in CMakeLists.txt):
+ *   - PICO_STACK_SIZE = 20480  (must match LENGTH below)
+ *   - PICO_CORE1_STACK_SIZE = 3072 (must stay explicit; it defaults to
+ *     PICO_STACK_SIZE and would blow up SCRATCH_X's 4 KB bank otherwise)
+ */
+MEMORY
+{
+    PCE_DIAG_RAM(rw) : ORIGIN = RAM_ORIGIN + RAM_LENGTH - 0x5000 - __pce_diag_bytes, LENGTH = __pce_diag_bytes
+    STACK(rwx) : ORIGIN = RAM_ORIGIN + RAM_LENGTH - 0x5000, LENGTH = 0x5000
+}

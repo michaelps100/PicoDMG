@@ -98,11 +98,23 @@ int InitPCE(int samplerate, bool stereo);
 // second VRAM and expand work RAM to 32 KB. Pass true for .sgx ROMs, false
 // otherwise. The PCE/CD path is unchanged when this is false.
 void SetSgxModePCE(bool is_sgx);
+void SetPCECachedRomInfo(bool predecoded, uint32_t raw_crc);
 int LoadCard(uint8_t *data, size_t size);
 int LoadFile(const char *name);
 // Load a PC Engine CD-ROM game. Scans /bios/ for a System Card / Arcade Card
 // BIOS, loads it into PSRAM, sets up CD/SCD/ADPCM/Arcade Card RAM, parses the
 // CUE sheet and opens the BIN file. Requires PSRAM. Returns 0 on success.
+//
+// Failure codes are distinct so the caller can tell the user WHICH step failed
+// instead of a single opaque "CD load failed". All are negative.
+#define DISC_OK            0
+#define DISC_ERR_NO_BIOS  -3   // no BIOS in /bios/
+#define DISC_ERR_BIOS_OPEN -4  // f_open on the BIOS failed
+#define DISC_ERR_BIOS_SIZE -5  // BIOS size out of range
+#define DISC_ERR_BIOS_ALLOC -6 // PSRAM allocation for the BIOS failed
+#define DISC_ERR_BIOS_READ -7  // short read on the BIOS
+#define DISC_ERR_CD_ALLOC -8   // CD/SCD/ADPCM/Arcade/BRAM/audio ring alloc
+#define DISC_ERR_IMAGE_OPEN -9 // cd_chd_open / cd_load_cue failed
 int LoadDisc(const char *cue_path);
 void *PalettePCE(int bitdepth);
 

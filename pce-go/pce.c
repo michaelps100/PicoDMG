@@ -5,6 +5,7 @@
 #include "pico.h"
 #include "pce-go.h"
 #include "pce.h"
+#include "../pce_diag.h"
 #include "gfx.h"
 #include "cd.h"
 
@@ -210,6 +211,7 @@ pce_term(void)
   **/
 void __not_in_flash_func(pce_run)(void)
 {
+	pce_diag_stage(PCE_DIAG_CPU);
 	// Handle pending video mode changes
 	if (PCE.VDC.mode_chg) {
 		PCE.VDC.screen_width = IO_VDC_SCREEN_WIDTH;
@@ -223,6 +225,7 @@ void __not_in_flash_func(pce_run)(void)
 	}
 	// Emulate!
 	for (PCE.Scanline = 0; PCE.Scanline < 263; ++PCE.Scanline) {
+		pce_diag_stage(PCE_DIAG_CPU);
 		PCE.MaxCycles += PCE.Timer.cycles_per_line;
 		/*while (PCE.MaxCycles > 0) */ {
 			h6280_run(PCE.MaxCycles);
@@ -478,6 +481,8 @@ static inline void __not_in_flash_func(vdc_io_write)(vdc_t *vdc, uint16_t *vram,
 				int src_inc = (VR(DCR).W & 8) ? -1 : 1;
 				int dst_inc = (VR(DCR).W & 4) ? -1 : 1;
 				int dma_words = 0;
+				pce_diag_vram_dma(VR(SOUR).W, VR(DISTR).W,
+				                  0xFFFFu - VR(LENR).W);
 				while (VR(LENR).W != 0xFFFF) {
 					if (VR(DISTR).W < 0x8000) {
 						vram[VR(DISTR).W] = vram[VR(SOUR).W];
