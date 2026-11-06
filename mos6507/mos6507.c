@@ -10,10 +10,12 @@
 #ifdef PRINT_STATE
     #include "../test/debug.h"
 #endif
+#include <stdbool.h>
 #include "mos6507.h"
 
 /* Representation of our CPU */
 static mos6507 cpu = {0};
+static bool s_instruction_active = false;
 
 /* Invoking this function causes the state of the CPU to update
  * as if receiving an external clock tick. Note that the 6507
@@ -26,8 +28,9 @@ int mos6507_clock_tick(void)
      * operation then continue execution. Otherwise, read the next 
      * opcode out of memory and begin decode.
      */
-    if (!cpu.current_instruction) {
+    if (!s_instruction_active) {
         memmap_read(&cpu.current_instruction);
+        s_instruction_active = true;
     }
     if (opcode_validate(cpu.current_instruction)) {
 #ifdef PRINT_STATE
@@ -41,7 +44,8 @@ int mos6507_clock_tick(void)
 
     cpu.current_clock = opcode_execute(cpu.current_instruction);
 
-    if(!cpu.current_clock) {
+    if (!cpu.current_clock) {
+        s_instruction_active = false;
         cpu.current_instruction = 0;
     }
     return 0;
@@ -99,6 +103,7 @@ void mos6507_init(void)
     cpu.address_bus = 0;
     cpu.current_instruction = 0;
     cpu.current_clock = 0;
+    s_instruction_active = false;
 }
 
 void mos6507_set_register(mos6507_register_t reg, uint8_t value)
@@ -239,4 +244,9 @@ void mos6507_pull_stack(uint8_t *byte)
 #ifdef PRINT_STATE
     debug_print_stack_action(DEBUG_STACK_ACTION_PULL);
 #endif /* PRINT_STATE */
+}
+
+mos6507 *mos6507_get_cpu(void)
+{
+    return &cpu;
 }

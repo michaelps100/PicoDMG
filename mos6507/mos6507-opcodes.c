@@ -49,9 +49,7 @@ int opcode_execute(uint8_t opcode)
 
 int opcode_validate(uint8_t opcode)
 {
-    if (ISA_table[opcode].opcode == opcode_ILL) {
-        return -1;
-    }
+    (void)opcode;
     return 0;
 }
 
@@ -490,13 +488,65 @@ void opcode_populate_ISA_table(void)
     ISA_table[0x77].opcode = opcode_NOP;
     ISA_table[0x77].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
 
-    ISA_table[0x9C].opcode = opcode_NOP;
-    ISA_table[0x9C].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    /* Unofficial / Undocumented NOPs common in Atari 2600 games */
+    ISA_table[0x1A].opcode = opcode_NOP;
+    ISA_table[0x1A].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    ISA_table[0x3A].opcode = opcode_NOP;
+    ISA_table[0x3A].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    ISA_table[0x5A].opcode = opcode_NOP;
+    ISA_table[0x5A].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    ISA_table[0x7A].opcode = opcode_NOP;
+    ISA_table[0x7A].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    ISA_table[0xDA].opcode = opcode_NOP;
+    ISA_table[0xDA].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
+    ISA_table[0xFA].opcode = opcode_NOP;
+    ISA_table[0xFA].addressing_mode = OPCODE_ADDRESSING_MODE_IMPLIED;
 
+    ISA_table[0x80].opcode = opcode_NOP;
+    ISA_table[0x80].addressing_mode = OPCODE_ADDRESSING_MODE_IMMEDIATE;
+    ISA_table[0x82].opcode = opcode_NOP;
+    ISA_table[0x82].addressing_mode = OPCODE_ADDRESSING_MODE_IMMEDIATE;
+    ISA_table[0x89].opcode = opcode_NOP;
+    ISA_table[0x89].addressing_mode = OPCODE_ADDRESSING_MODE_IMMEDIATE;
+    ISA_table[0xC2].opcode = opcode_NOP;
+    ISA_table[0xC2].addressing_mode = OPCODE_ADDRESSING_MODE_IMMEDIATE;
+    ISA_table[0xE2].opcode = opcode_NOP;
+    ISA_table[0xE2].addressing_mode = OPCODE_ADDRESSING_MODE_IMMEDIATE;
 
-    /* WTF */
-    ISA_table[0x04].opcode = opcode_TSB;
+    ISA_table[0x04].opcode = opcode_NOP;
     ISA_table[0x04].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE;
+    ISA_table[0x44].opcode = opcode_NOP;
+    ISA_table[0x44].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE;
+    ISA_table[0x64].opcode = opcode_NOP;
+    ISA_table[0x64].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE;
+
+    ISA_table[0x14].opcode = opcode_NOP;
+    ISA_table[0x14].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+    ISA_table[0x34].opcode = opcode_NOP;
+    ISA_table[0x34].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+    ISA_table[0x54].opcode = opcode_NOP;
+    ISA_table[0x54].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+    ISA_table[0x74].opcode = opcode_NOP;
+    ISA_table[0x74].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+    ISA_table[0xD4].opcode = opcode_NOP;
+    ISA_table[0xD4].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+    ISA_table[0xF4].opcode = opcode_NOP;
+    ISA_table[0xF4].addressing_mode = OPCODE_ADDRESSING_MODE_ZERO_PAGE_X_INDEXED;
+
+    ISA_table[0x0C].opcode = opcode_NOP;
+    ISA_table[0x0C].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE;
+    ISA_table[0x1C].opcode = opcode_NOP;
+    ISA_table[0x1C].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
+    ISA_table[0x3C].opcode = opcode_NOP;
+    ISA_table[0x3C].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
+    ISA_table[0x5C].opcode = opcode_NOP;
+    ISA_table[0x5C].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
+    ISA_table[0x7C].opcode = opcode_NOP;
+    ISA_table[0x7C].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
+    ISA_table[0xDC].opcode = opcode_NOP;
+    ISA_table[0xDC].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
+    ISA_table[0xFC].opcode = opcode_NOP;
+    ISA_table[0xFC].addressing_mode = OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED;
 }
 
 /******************************************************************************
@@ -511,7 +561,9 @@ void opcode_populate_ISA_table(void)
 
 int opcode_ILL(int cycle, addressing_mode_t address_mode)
 {
-    /* Halt and catch fire!! */
+    (void)cycle;
+    (void)address_mode;
+    END_OPCODE()
     return 0;
 }
 
@@ -725,7 +777,7 @@ int opcode_BVS(int cycle, addressing_mode_t address_mode)
 
     CALC_BRANCH()
 
-    END_OPCODE()
+    mos6507_set_address_bus(mos6507_get_PC());
     return 0;
 }
 
@@ -1105,16 +1157,10 @@ int opcode_LSR(int cycle, addressing_mode_t address_mode)
 
 int opcode_NOP(int cycle, addressing_mode_t address_mode)
 {
-    switch(cycle) {
-        case 0:
-            /* Consume clock cycle for fetching op-code */
-            return -1;
-        case 1: ;
-            /* Intentional fall-through */
-        default:
-            /* End of op-code execution */
-            break;
-    }
+    static uint8_t adl, adh, ial, bal, bah, data = 0;
+    uint8_t X, Y, c = 0;
+
+    FETCH_DATA()
     END_OPCODE()
     return 0;
 }
@@ -1452,7 +1498,7 @@ int opcode_SEI(int cycle, addressing_mode_t address_mode)
 
 int opcode_STA(int cycle, addressing_mode_t address_mode)
 {
-    static uint8_t adl, adh, bah, bal, data = 0;
+    static uint8_t adl, adh, bah, bal, ial, data = 0;
     uint8_t X, Y, c = 0;
 
     FETCH_STORE_ADDRESS()
@@ -1465,7 +1511,7 @@ int opcode_STA(int cycle, addressing_mode_t address_mode)
 
 int opcode_STX(int cycle, addressing_mode_t address_mode)
 {
-    static uint8_t adl, adh, bah, bal, data = 0;
+    static uint8_t adl, adh, bah, bal, ial, data = 0;
     uint8_t X, Y, c = 0;
 
     FETCH_STORE_ADDRESS()
@@ -1478,7 +1524,7 @@ int opcode_STX(int cycle, addressing_mode_t address_mode)
 
 int opcode_STY(int cycle, addressing_mode_t address_mode)
 {
-    static uint8_t adl, adh, bah, bal, data = 0;
+    static uint8_t adl, adh, bah, bal, ial, data = 0;
     uint8_t X, Y, c = 0;
 
     FETCH_STORE_ADDRESS()

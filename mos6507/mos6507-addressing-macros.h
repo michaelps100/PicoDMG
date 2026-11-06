@@ -18,13 +18,7 @@
             return -1; \
         case 2: \
             mos6507_increment_PC(); \
-            if (offset & 0x80) { \
-                compliment = ~(offset & 0x7F); \
-                compliment++; \
-                addr = mos6507_get_PC() - (compliment & 0x7F); \
-            } else { \
-                addr = mos6507_get_PC() + (offset & 0x7F); \
-            } \
+            addr = (uint16_t)((int32_t)mos6507_get_PC() + (int8_t)offset); \
             if (NOT_SAME_PAGE(mos6507_get_PC(), addr)) { \
                 return -1; \
             } \
@@ -229,7 +223,7 @@
             mos6507_set_address_bus_hl(0, bal + X); \
         default: \
             break; \
-    } \
+    }
 
 #define FETCH_STORE_ADDRESS_ZERO_PAGE_Y_INDEXED() \
     switch(cycle) { \
@@ -248,7 +242,41 @@
             mos6507_set_address_bus_hl(0, bal + Y); \
         default: \
             break; \
-    } \
+    }
+
+#define FETCH_STORE_ADDRESS_INDIRECT_Y_INDEXED() \
+    switch(cycle) { \
+        case 0: \
+            return -1; \
+        case 1: \
+            mos6507_increment_PC(); \
+            mos6507_set_address_bus(mos6507_get_PC()); \
+            memmap_read(&ial); \
+            return -1; \
+        case 2: \
+            mos6507_set_address_bus_hl(0, ial); \
+            memmap_read(&bal); \
+            return -1; \
+        case 3: \
+            mos6507_set_address_bus_hl(0, (uint8_t)(ial + 1)); \
+            memmap_read(&bah); \
+            return -1; \
+        case 4: \
+            mos6507_get_register(MOS6507_REG_Y, &Y); \
+            adl = bal + Y; \
+            c = ((bal + Y) > 0xFF) ? 1 : 0; \
+            adh = bah + c; \
+            mos6507_set_address_bus_hl(adh, adl); \
+            return -1; \
+        case 5: \
+            mos6507_get_register(MOS6507_REG_Y, &Y); \
+            adl = bal + Y; \
+            c = ((bal + Y) > 0xFF) ? 1 : 0; \
+            adh = bah + c; \
+            mos6507_set_address_bus_hl(adh, adl); \
+        default: \
+            break; \
+    }
 
 
 
@@ -550,6 +578,8 @@
         FETCH_STORE_ADDRESS_ABSOLUTE() \
     } else if (OPCODE_ADDRESSING_MODE_INDIRECT_X_INDEXED == address_mode) { \
         FETCH_STORE_ADDRESS_INDIRECT_X_INDEXED() \
+    } else if (OPCODE_ADDRESSING_MODE_INDIRECT_Y_INDEXED == address_mode) { \
+        FETCH_STORE_ADDRESS_INDIRECT_Y_INDEXED() \
     } else if (OPCODE_ADDRESSING_MODE_ABSOLUTE_X_INDEXED == address_mode) { \
         FETCH_STORE_ADDRESS_ABSOLUTE_X_INDEXED() \
     } else if (OPCODE_ADDRESSING_MODE_ABSOLUTE_Y_INDEXED == address_mode) { \

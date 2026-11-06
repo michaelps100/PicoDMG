@@ -40,7 +40,7 @@ typedef enum {
 
 typedef struct {
     uint8_t counter;
-    uint8_t interval_timer;
+    uint16_t interval_timer;
     uint8_t fired;
     mos6532_timer_divisor_t timer_set;
 } mos6532_timer_t;
@@ -61,6 +61,12 @@ void mos6532_get_interval(mos6532_timer_divisor_t *divisor);
 void mos6532_get_counter(uint8_t *counter);
 char * mos6532_get_divisor_str(mos6532_timer_divisor_t divisor);
 void mos6532_map_mirrored_addresses(uint16_t *address);
+uint8_t *mos6532_get_raw_memory(void);
+mos6532_timer_t *mos6532_get_timer(void);
+uint8_t mos6532_get_joy1(void);
+void mos6532_set_joy1(uint8_t val);
+uint8_t mos6532_get_switches(void);
+void mos6532_set_switches(uint8_t val);
 
 #endif /* _MOS6532_H */
 

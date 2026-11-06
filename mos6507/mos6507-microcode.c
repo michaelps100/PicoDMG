@@ -20,17 +20,27 @@
  */
 void mos6507_ADC(uint8_t data)
 {
-    uint16_t tmp = 0;
     uint8_t accumulator = 0;
     mos6507_get_register(MOS6507_REG_A, &accumulator);
+    uint8_t carry = mos6507_get_status_flag(MOS6507_STATUS_FLAG_CARRY) ? 1 : 0;
 
     if (mos6507_get_status_flag(MOS6507_STATUS_FLAG_DECIMAL)) {
-        /* Interesting! According to Bill Mensch of MOS Technologies this
-         * feature did actually get used by Atari for their port of Asteroids.
-         * https://www.youtube.com/watch?v=Ne1ApyqSvm0 (55:00)
-         */
+        uint16_t al = (accumulator & 0x0F) + (data & 0x0F) + carry;
+        if (al > 9) al += 6;
+        uint16_t ah = (accumulator >> 4) + (data >> 4) + (al > 0x0F ? 1 : 0);
+        uint16_t binary_sum = (uint16_t)accumulator + (uint16_t)data + carry;
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(binary_sum & 0xFF));
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (ah << 4) & 0x80);
+        mos6507_set_status_flag(
+            MOS6507_STATUS_FLAG_OVERFLOW,
+            !((accumulator ^ data) & 0x80) && ((accumulator ^ binary_sum) & 0x80)
+        );
+        if (ah > 9) ah += 6;
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (ah > 0x0F));
+        uint8_t result = (uint8_t)(((ah & 0x0F) << 4) | (al & 0x0F));
+        mos6507_set_register(MOS6507_REG_A, result);
     } else {
-        tmp = data + accumulator + (mos6507_get_status_flag(MOS6507_STATUS_FLAG_CARRY) ? 1 : 0);
+        uint16_t tmp = (uint16_t)data + (uint16_t)accumulator + carry;
         mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (tmp & 0x80));
         mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (tmp > 0xFF));
         mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(tmp & 0xFF));
@@ -38,9 +48,8 @@ void mos6507_ADC(uint8_t data)
             MOS6507_STATUS_FLAG_OVERFLOW,
             !((accumulator ^ data) & 0x80) && ((accumulator ^ tmp) & 0x80)
         );
+        mos6507_set_register(MOS6507_REG_A, (uint8_t)(tmp & 0xFF));
     }
-
-    mos6507_set_register(MOS6507_REG_A, (tmp & 0xFF));
 }
 
 /* Logical AND memory with Accumulator.
@@ -139,15 +148,13 @@ void mos6507_BIT(uint8_t data)
  */
 void mos6507_CMP(uint8_t data)
 {
-    uint16_t tmp = 0;
     uint8_t accumulator = 0;
-
     mos6507_get_register(MOS6507_REG_A, &accumulator);
+    uint8_t diff = accumulator - data;
 
-    tmp = accumulator - data;
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (tmp < 0x0100));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (tmp & 0x80));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(tmp & 0xFF));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (accumulator >= data));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (diff & 0x80));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, (accumulator == data));
 }
 
 /* Compare memory with Index X.
@@ -160,15 +167,13 @@ void mos6507_CMP(uint8_t data)
  */
 void mos6507_CPX(uint8_t data)
 {
-    uint16_t tmp = 0;
     uint8_t X = 0;
-
     mos6507_get_register(MOS6507_REG_X, &X);
+    uint8_t diff = X - data;
 
-    tmp = X - data;
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (tmp < 0x0100));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (tmp & 0x80));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(tmp & 0xFF));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (X >= data));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (diff & 0x80));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, (X == data));
 }
 
 /* Compare memory with Index Y.
@@ -181,15 +186,13 @@ void mos6507_CPX(uint8_t data)
  */
 void mos6507_CPY(uint8_t data)
 {
-    uint16_t tmp = 0;
     uint8_t Y = 0;
-
     mos6507_get_register(MOS6507_REG_Y, &Y);
+    uint8_t diff = Y - data;
 
-    tmp = Y - data;
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (tmp < 0x0100));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (tmp & 0x80));
-    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(tmp & 0xFF));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (Y >= data));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (diff & 0x80));
+    mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, (Y == data));
 }
 
 /* Exclusive OR memory with Accumulator.
@@ -385,22 +388,35 @@ void mos6507_ROR_Accumulator(void)
  */
 void mos6507_SBC(uint8_t data)
 {
-    uint16_t tmp = 0;
     uint8_t accumulator = 0;
     mos6507_get_register(MOS6507_REG_A, &accumulator);
+    uint8_t borrow = mos6507_get_status_flag(MOS6507_STATUS_FLAG_CARRY) ? 0 : 1;
 
     if (mos6507_get_status_flag(MOS6507_STATUS_FLAG_DECIMAL)) {
-        // TODO
+        int diff = (int)accumulator - (int)data - (int)borrow;
+        int al = (accumulator & 0x0F) - (data & 0x0F) - (int)borrow;
+        if (al < 0) al -= 6;
+        int ah = (accumulator >> 4) - (data >> 4) - (al < 0 ? 1 : 0);
+        if (ah < 0) ah -= 6;
+
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (diff & 0x80));
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(diff & 0xFF));
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (diff >= 0));
+        mos6507_set_status_flag(
+            MOS6507_STATUS_FLAG_OVERFLOW,
+            ((accumulator ^ data) & 0x80) && ((accumulator ^ diff) & 0x80)
+        );
+        uint8_t result = (uint8_t)(((ah & 0x0F) << 4) | (al & 0x0F));
+        mos6507_set_register(MOS6507_REG_A, result);
     } else {
-        tmp = accumulator - data - (mos6507_get_status_flag(MOS6507_STATUS_FLAG_CARRY) ? 1 : 0);
+        int tmp = (int)accumulator - (int)data - (int)borrow;
         mos6507_set_status_flag(MOS6507_STATUS_FLAG_NEGATIVE, (tmp & 0x80));
-        mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, !(tmp & 0x8000));
+        mos6507_set_status_flag(MOS6507_STATUS_FLAG_CARRY, (tmp >= 0));
         mos6507_set_status_flag(MOS6507_STATUS_FLAG_ZERO, !(tmp & 0xFF));
         mos6507_set_status_flag(
             MOS6507_STATUS_FLAG_OVERFLOW,
-            !((accumulator ^ data) & 0x80) && ((accumulator ^ tmp) & 0x80)
+            ((accumulator ^ data) & 0x80) && ((accumulator ^ tmp) & 0x80)
         );
+        mos6507_set_register(MOS6507_REG_A, (uint8_t)(tmp & 0xFF));
     }
-
-    mos6507_set_register(MOS6507_REG_A, (tmp & 0xFF));
 }

@@ -9,11 +9,12 @@
 #include <string.h>
 #include <stdio.h>
 #include "Atari-TIA.h"
+#include "atari_audio.h"
 
 atari_tia tia;
 
-uint32_t tia_raw_buffer[160];
-tia_pixel_t tia_line_buffer[160];
+uint16_t tia_line_buffer[160];
+uint16_t tia_color_map_rgb565[128];
 
 /* See page 40 of docs/Stella Programmer's Guide.pdf */
 uint16_t tia_player_size_map[] = {
@@ -173,11 +174,12 @@ tia_pixel_t tia_colour_map[] = {
  */
 void TIA_init(void)
 {
-    #if PICO_ON_DEVICE
-    for( int i = 0; i<sizeof(tia_rgb_color_map);++i) {
-        tia_rgb_color_map[i] = VGA_RGB_222(tia_colour_map[i].R >> 6,  tia_colour_map[i].G >> 6,  tia_colour_map[i].B >> 6);
+    for (int i = 0; i < 128; ++i) {
+        uint16_t r = tia_colour_map[i].R >> 3;
+        uint16_t g = tia_colour_map[i].G >> 2;
+        uint16_t b = tia_colour_map[i].B >> 3;
+        tia_color_map_rgb565[i] = (r << 11) | (g << 5) | b;
     }
-    #endif
 
     memset(tia.write_regs, 0, sizeof(tia.write_regs));
     memset(tia.read_regs, 0, sizeof(tia.read_regs));
@@ -204,7 +206,12 @@ void TIA_init(void)
  */
 void TIA_read_register(uint8_t reg, uint8_t *value)
 {
-    *value = tia.read_regs[reg];
+    reg &= 0x0F;
+    if (reg < TIA_READ_REG_LEN) {
+        *value = tia.read_regs[reg];
+    } else {
+        *value = 0x00;
+    }
 }
 
 /* Writes a value into a register location
@@ -213,25 +220,16 @@ void TIA_read_register(uint8_t reg, uint8_t *value)
  */
 void TIA_write_register(uint8_t reg, uint8_t value)
 {
+    reg &= 0x3F;
+    if (reg >= TIA_WRITE_REG_LEN) {
+        return;
+    }
+
     /* Perform special state logic on strobing registers which influence
      * state regardless of value written. E.g., writing a 0 to WSYNC still
      * results in the processor clock suspending
      */
     switch (reg) {
-        case TIA_WRITE_REG_COLUBK:
-            tia.write_regs[reg] = value;
-            break;
-        case TIA_WRITE_REG_PF0:
-            /* Intentional fallthrough */
-        case TIA_WRITE_REG_PF1:
-            /* Intentional fallthrough */
-        case TIA_WRITE_REG_PF2:
-            /* Intentional fallthrough */
-        case TIA_WRITE_REG_CTRLPF:
-            tia.write_regs[reg] = value;
-            TIA_update_playfield();
-            TIA_update_ball_buffer();
-            break;
         case TIA_WRITE_REG_WSYNC:
             tia.write_regs[TIA_WRITE_REG_WSYNC] = 1;
             break;
@@ -256,75 +254,75 @@ void TIA_write_register(uint8_t reg, uint8_t value)
 
         case TIA_WRITE_REG_RESMP0:
             tia.write_regs[TIA_WRITE_REG_RESMP0] = value;
-
-            if ((value & 0b01) ? 1 : 0) {
+            if (value & 0x02) {
                 tia.missiles[0].position_clock = tia.players[0].position_clock;
             }
-            TIA_update_missile_buffer(0);
-        break;    
-        
+            break;
         case TIA_WRITE_REG_RESMP1:
             tia.write_regs[TIA_WRITE_REG_RESMP1] = value;
-
-            if ((value & 0b01) ? 1 : 0) {
+            if (value & 0x02) {
                 tia.missiles[1].position_clock = tia.players[1].position_clock;
             }
-            TIA_update_missile_buffer(1);
-        break;    
-        case TIA_WRITE_REG_VDELP0:      
+            break;
+
+        case TIA_WRITE_REG_VDELP0:
+            tia.write_regs[reg] = value;
+            if (!(value & 1)) {
+                tia.players[0].grp = tia.write_regs[TIA_WRITE_REG_GRP0];
+            }
+            break;
         case TIA_WRITE_REG_VDELP1:
+            tia.write_regs[reg] = value;
+            if (!(value & 1)) {
+                tia.players[1].grp = tia.write_regs[TIA_WRITE_REG_GRP1];
+            }
+            break;
         case TIA_WRITE_REG_VDELBL:
             tia.write_regs[reg] = value;
+            if (!(value & 1)) {
+                tia.ball.vertical_delay = tia.write_regs[TIA_WRITE_REG_ENABL];
+            }
             break;
+
         case TIA_WRITE_REG_GRP0:
-            // If VDELP1 set
-            if ((tia.write_regs[TIA_WRITE_REG_VDELP0]) ? 1 : 0) {
-                tia.players[0].vertical_delay = value;
+            if (tia.write_regs[TIA_WRITE_REG_VDELP0] & 1) {
+                tia.players[0].grp_old = value; /* buffer */
             } else {
-                tia.write_regs[reg] = value;
-                TIA_update_player_buffer(0);
+                tia.players[0].grp = value;     /* direct */
             }
-
-            // Если GRP1 ждет нашей записи, то запишем и обновим буфер
-            if ((tia.write_regs[TIA_WRITE_REG_VDELP1]) ? 1 : 0) {
-                tia.write_regs[TIA_WRITE_REG_GRP1] = tia.players[1].vertical_delay;
-                TIA_update_player_buffer(1);
-            };
+            if (tia.write_regs[TIA_WRITE_REG_VDELP1] & 1) {
+                tia.players[1].grp = tia.players[1].grp_old; /* transfer P1 buffer to active */
+            }
+            tia.write_regs[reg] = value;
             break;
+
         case TIA_WRITE_REG_GRP1:
-            // If VDELP1 set
-            if ((tia.write_regs[TIA_WRITE_REG_VDELP1]) ? 1 : 0) {
-                tia.players[1].vertical_delay = value;
+            if (tia.write_regs[TIA_WRITE_REG_VDELP1] & 1) {
+                tia.players[1].grp_old = value; /* buffer */
             } else {
-                tia.write_regs[reg] = value;
-                TIA_update_player_buffer(1);
+                tia.players[1].grp = value;     /* direct */
             }
-
-            // Если GRP0 ждет нашей записи, то запишем и обновим буфер
-            if ((tia.write_regs[TIA_WRITE_REG_VDELP0]) ? 1 : 0) {
-                tia.write_regs[TIA_WRITE_REG_GRP0] = tia.players[0].vertical_delay;
-                TIA_update_player_buffer(0);
-            };
-            break;
-
-        case TIA_WRITE_REG_HMOVE:
-            if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) {
-                TIA_apply_HMOVE();           
-                 }
-            break;
-
-        case TIA_WRITE_REG_ENAM0:
+            if (tia.write_regs[TIA_WRITE_REG_VDELP0] & 1) {
+                tia.players[0].grp = tia.players[0].grp_old; /* transfer P0 buffer to active */
+            }
+            if (tia.write_regs[TIA_WRITE_REG_VDELBL] & 1) {
+                tia.ball.vertical_delay = tia.ball.enabled; /* transfer BL buffer to active */
+            }
             tia.write_regs[reg] = value;
-            TIA_update_missile_buffer(0);
-            break;
-        case TIA_WRITE_REG_ENAM1:
-            tia.write_regs[reg] = value;
-            TIA_update_missile_buffer(1);
             break;
 
         case TIA_WRITE_REG_ENABL:
+            if (tia.write_regs[TIA_WRITE_REG_VDELBL] & 1) {
+                tia.ball.enabled = value; /* buffer */
+            } else {
+                tia.ball.vertical_delay = value; /* direct */
+            }
             tia.write_regs[reg] = value;
-            TIA_update_ball_buffer();
+            break;
+
+        case TIA_WRITE_REG_HMOVE:
+            tia.write_regs[TIA_WRITE_REG_HMOVE] = 1;
+            TIA_apply_HMOVE();
             break;
 
         case TIA_WRITE_REG_HMP0:
@@ -333,7 +331,7 @@ void TIA_write_register(uint8_t reg, uint8_t value)
             break;
         case TIA_WRITE_REG_HMP1:
             tia.write_regs[reg] = value;
-            TIA_update_player_HMOVE(1);      
+            TIA_update_player_HMOVE(1);
             break;
         case TIA_WRITE_REG_HMM0:
             tia.write_regs[reg] = value;
@@ -348,26 +346,21 @@ void TIA_write_register(uint8_t reg, uint8_t value)
             TIA_update_ball_HMOVE();
             break;
 
-        case TIA_WRITE_REG_NUSIZ0:
-            tia.write_regs[reg] = value;
-            TIA_update_missile_buffer(0);
-            TIA_update_player_buffer(0);
-            break;
-        case TIA_WRITE_REG_NUSIZ1:
-            tia.write_regs[reg] = value;
-            TIA_update_missile_buffer(1);
-            TIA_update_player_buffer(1);
-            break;
         case TIA_WRITE_REG_HMCLR:
             tia.write_regs[TIA_WRITE_REG_HMM0] = 0;
             tia.write_regs[TIA_WRITE_REG_HMM1] = 0;
             tia.write_regs[TIA_WRITE_REG_HMP0] = 0;
             tia.write_regs[TIA_WRITE_REG_HMP1] = 0;
             tia.write_regs[TIA_WRITE_REG_HMBL] = 0;
-
+            tia.players[0].horizontal_offset = 0;
+            tia.players[1].horizontal_offset = 0;
+            tia.missiles[0].horizontal_offset = 0;
+            tia.missiles[1].horizontal_offset = 0;
+            tia.ball.horizontal_offset = 0;
             break;
+
         case TIA_WRITE_REG_CXCLR:
-            /* Reset all collision latches*/
+            /* Reset all collision latches */
             tia.read_regs[TIA_READ_REG_CXM0P] = 0;
             tia.read_regs[TIA_READ_REG_CXM1P] = 0;
             tia.read_regs[TIA_READ_REG_CXP0FB] = 0;
@@ -377,80 +370,222 @@ void TIA_write_register(uint8_t reg, uint8_t value)
             tia.read_regs[TIA_READ_REG_CXBLPF] = 0;
             tia.read_regs[TIA_READ_REG_CXPPMM] = 0;
             break;
+
+        case TIA_WRITE_REG_AUDC0:
+        case TIA_WRITE_REG_AUDC1:
+        case TIA_WRITE_REG_AUDF0:
+        case TIA_WRITE_REG_AUDF1:
+        case TIA_WRITE_REG_AUDV0:
+        case TIA_WRITE_REG_AUDV1:
+            tia.write_regs[reg] = value;
+            atari_audio_set_reg(reg, value);
+            break;
+
         default:
             tia.write_regs[reg] = value;
+            break;
     }
 }
 
 void TIA_reset_player(uint8_t player)
 {
     tia.players[player].scanline_reset = 1;
-    tia.players[player].position_clock = 0;
-    tia.players[player].horizontal_offset = 0;
 
-    if (tia.colour_clock > TIA_COLOUR_CLOCK_HSYNC) {
-        tia.players[player].position_clock = tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC;
-    }
-
-    TIA_update_player_buffer(player);
+    int pos = (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC;
+    while (pos < 0) pos += 160;
+    tia.players[player].position_clock = pos % 160;
 }
 
-void TIA_apply_HMOVE()
+void TIA_reset_missile(uint8_t missile)
 {
-    tia.players[0].position_clock = (tia.players[0].position_clock - tia.players[0].horizontal_offset) % 160;
-    tia.players[1].position_clock = (tia.players[1].position_clock - tia.players[1].horizontal_offset) % 160;
-    tia.missiles[0].position_clock = (tia.missiles[0].position_clock - tia.missiles[0].horizontal_offset) % 160;
-    tia.missiles[1].position_clock = (tia.missiles[1].position_clock - tia.missiles[1].horizontal_offset) % 160;
-    tia.ball.position_clock = (tia.ball.position_clock - tia.ball.horizontal_offset) % 160;
+    tia.missiles[missile].scanline_reset = 1;
+
+    int pos = (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC;
+    while (pos < 0) pos += 160;
+    tia.missiles[missile].position_clock = pos % 160;
+}
+
+void TIA_reset_ball(void)
+{
+    tia.ball.scanline_reset = 1;
+
+    int pos = (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC;
+    while (pos < 0) pos += 160;
+    tia.ball.position_clock = pos % 160;
+}
+
+void TIA_apply_HMOVE(void)
+{
+    int p0 = (int)tia.players[0].position_clock - tia.players[0].horizontal_offset;
+    while (p0 < 0) p0 += 160;
+    tia.players[0].position_clock = p0 % 160;
+
+    int p1 = (int)tia.players[1].position_clock - tia.players[1].horizontal_offset;
+    while (p1 < 0) p1 += 160;
+    tia.players[1].position_clock = p1 % 160;
+
+    int m0 = (int)tia.missiles[0].position_clock - tia.missiles[0].horizontal_offset;
+    while (m0 < 0) m0 += 160;
+    tia.missiles[0].position_clock = m0 % 160;
+
+    int m1 = (int)tia.missiles[1].position_clock - tia.missiles[1].horizontal_offset;
+    while (m1 < 0) m1 += 160;
+    tia.missiles[1].position_clock = m1 % 160;
+
+    int bl = (int)tia.ball.position_clock - tia.ball.horizontal_offset;
+    while (bl < 0) bl += 160;
+    tia.ball.position_clock = bl % 160;
 }
 
 void TIA_update_player_HMOVE(uint8_t player)
 {
     uint8_t offset = tia.write_regs[player ? TIA_WRITE_REG_HMP1 : TIA_WRITE_REG_HMP0];
-    tia.players[player].horizontal_offset = (offset > 127 ? -16 : 0 ) + (offset >> 4);
+    tia.players[player].horizontal_offset = (offset > 127 ? -16 : 0) + (offset >> 4);
 }
 
 void TIA_update_missile_HMOVE(uint8_t missile)
 {
     uint8_t offset = tia.write_regs[missile ? TIA_WRITE_REG_HMM1 : TIA_WRITE_REG_HMM0];
-    tia.missiles[missile].horizontal_offset = (offset > 127 ? -16 : 0 ) + (offset >> 4);
+    tia.missiles[missile].horizontal_offset = (offset > 127 ? -16 : 0) + (offset >> 4);
 }
 
-void TIA_update_ball_HMOVE()
+void TIA_update_ball_HMOVE(void)
 {
     uint8_t offset = tia.write_regs[TIA_WRITE_REG_HMBL];
-    tia.ball.horizontal_offset = (offset > 127 ? -16 : 0 ) + (offset >> 4);
+    tia.ball.horizontal_offset = (offset > 127 ? -16 : 0) + (offset >> 4);
 }
 
-void TIA_update_player_buffer(uint8_t player)
+/* On-the-fly pixel evaluators */
+static inline uint8_t TIA_get_player_pixel(uint8_t player, int pixel_idx)
 {
-    int position, mirror, pattern, i, pixel_clock, size_mask, draw_count;
-    tia_writable_register_t reflect_reg, graphics_reg, offset_reg, vertical_reg, size_reg;
+    uint8_t grp = tia.players[player].grp;
+    if (!grp) return 0;
 
-    TIA_reset_line_buffer(tia.players[player].line_buffer);
-    TIA_get_player_registers(player, &reflect_reg, &graphics_reg, &offset_reg, &vertical_reg, &size_reg);
+    int pos = tia.players[player].position_clock;
+    int dx = pixel_idx - pos;
+    if (dx < 0) dx += 160;
 
-    position = tia.players[player].position_clock;
-    mirror = (tia.write_regs[reflect_reg] & 0b100) ? 0 : 1;
-    pattern = mirror ? TIA_reverse_byte(tia.write_regs[graphics_reg]) : TIA_reverse_byte(tia.write_regs[graphics_reg]);
+    uint8_t nusiz = tia.write_regs[player ? TIA_WRITE_REG_NUSIZ1 : TIA_WRITE_REG_NUSIZ0] & 0x07;
+    int bit = -1;
 
-    size_mask = tia_player_size_map[(tia.write_regs[size_reg] & 0x7)];
-    draw_count = 10;
-    pixel_clock = 0;
+    switch (nusiz) {
+        case 0: /* One copy */
+            if (dx < 8) bit = dx;
+            break;
+        case 1: /* Two copies - close (spacing 16) */
+            if (dx < 8) bit = dx;
+            else if (dx >= 16 && dx < 24) bit = dx - 16;
+            break;
+        case 2: /* Two copies - medium (spacing 32) */
+            if (dx < 8) bit = dx;
+            else if (dx >= 32 && dx < 40) bit = dx - 32;
+            break;
+        case 3: /* Three copies - close (spacing 16 and 32) */
+            if (dx < 8) bit = dx;
+            else if (dx >= 16 && dx < 24) bit = dx - 16;
+            else if (dx >= 32 && dx < 40) bit = dx - 32;
+            break;
+        case 4: /* Two copies - wide (spacing 64) */
+            if (dx < 8) bit = dx;
+            else if (dx >= 64 && dx < 72) bit = dx - 64;
+            break;
+        case 5: /* Double size (16 pixels) */
+            if (dx < 16) bit = dx >> 1;
+            break;
+        case 6: /* Three copies - medium (spacing 32 and 64) */
+            if (dx < 8) bit = dx;
+            else if (dx >= 32 && dx < 40) bit = dx - 32;
+            else if (dx >= 64 && dx < 72) bit = dx - 64;
+            break;
+        case 7: /* Quad size (32 pixels) */
+            if (dx < 32) bit = dx >> 2;
+            break;
+    }
 
-    for (i=position; i<TIA_COLOUR_CLOCK_VISIBLE; ++i) {
-            if (pixel_clock > 7) {
-                draw_count--;
-                pixel_clock = 0;
-            }
-            if ((draw_count > -1) && (size_mask & (1 << draw_count))) {
-                tia.players[player].line_buffer[i] = (pattern & (1 << pixel_clock) ? 1 : 0);
-            }
-            /* Every 8 clock cycles reset and start testing bits over */
-            pixel_clock++;
+    if (bit < 0) return 0;
+
+    /* REFP: bit 3 (0x08) enables horizontal reflection */
+    uint8_t refp = tia.write_regs[player ? TIA_WRITE_REG_REFP1 : TIA_WRITE_REG_REFP0] & 0x08;
+    if (refp) {
+        return (grp >> bit) & 1;
+    } else {
+        return (grp >> (7 - bit)) & 1;
     }
 }
 
+static inline uint8_t TIA_get_missile_pixel(uint8_t missile, int pixel_idx)
+{
+    /* ENAMx: bit 1 (0x02) enables missile */
+    if (!(tia.write_regs[missile ? TIA_WRITE_REG_ENAM1 : TIA_WRITE_REG_ENAM0] & 0x02)) return 0;
+
+    /* RESMPx: bit 1 (0x02) disables missile / locks to player */
+    if (tia.write_regs[missile ? TIA_WRITE_REG_RESMP1 : TIA_WRITE_REG_RESMP0] & 0x02) return 0;
+
+    int pos = tia.missiles[missile].position_clock;
+    int dx = pixel_idx - pos;
+    if (dx < 0) dx += 160;
+
+    uint8_t nusiz = tia.write_regs[missile ? TIA_WRITE_REG_NUSIZ1 : TIA_WRITE_REG_NUSIZ0];
+    int width = 1 << ((nusiz >> 4) & 0x03); /* 1, 2, 4, or 8 pixels */
+    uint8_t copies = nusiz & 0x07;
+
+    switch (copies) {
+        case 0:
+        case 5:
+        case 7:
+            return (dx < width) ? 1 : 0;
+        case 1:
+            return (dx < width || (dx >= 16 && dx < 16 + width)) ? 1 : 0;
+        case 2:
+            return (dx < width || (dx >= 32 && dx < 32 + width)) ? 1 : 0;
+        case 3:
+            return (dx < width || (dx >= 16 && dx < 16 + width) || (dx >= 32 && dx < 32 + width)) ? 1 : 0;
+        case 4:
+            return (dx < width || (dx >= 64 && dx < 64 + width)) ? 1 : 0;
+        case 6:
+            return (dx < width || (dx >= 32 && dx < 32 + width) || (dx >= 64 && dx < 64 + width)) ? 1 : 0;
+    }
+    return 0;
+}
+
+static inline uint8_t TIA_get_ball_pixel(int pixel_idx)
+{
+    if (!(tia.ball.vertical_delay & 0x02)) return 0;
+
+    int pos = tia.ball.position_clock;
+    int dx = pixel_idx - pos;
+    if (dx < 0) dx += 160;
+
+    int width = 1 << ((tia.write_regs[TIA_WRITE_REG_CTRLPF] >> 4) & 0x03);
+    return (dx < width) ? 1 : 0;
+}
+
+static inline uint8_t TIA_get_playfield_pixel(int pixel_idx)
+{
+    int bit_idx;
+    if (pixel_idx < 80) {
+        bit_idx = pixel_idx >> 2;
+    } else {
+        if (tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0x01) {
+            /* Mirror mode */
+            bit_idx = (159 - pixel_idx) >> 2;
+        } else {
+            /* Repeat mode */
+            bit_idx = (pixel_idx - 80) >> 2;
+        }
+    }
+
+    if (bit_idx < 4) {
+        return (tia.write_regs[TIA_WRITE_REG_PF0] >> (4 + bit_idx)) & 1;
+    } else if (bit_idx < 12) {
+        return (tia.write_regs[TIA_WRITE_REG_PF1] >> (7 - (bit_idx - 4))) & 1;
+    } else {
+        return (tia.write_regs[TIA_WRITE_REG_PF2] >> (bit_idx - 12)) & 1;
+    }
+}
+
+/* Stubs for header compatibility */
+void TIA_update_player_buffer(uint8_t player) { (void)player; }
 void TIA_get_player_registers(uint8_t player, tia_writable_register_t *reflect,
         tia_writable_register_t *graphics, tia_writable_register_t *offset,
         tia_writable_register_t *vertical, tia_writable_register_t *size)
@@ -461,7 +596,6 @@ void TIA_get_player_registers(uint8_t player, tia_writable_register_t *reflect,
     player ? (*vertical = TIA_WRITE_REG_VDELP1) : (*vertical = TIA_WRITE_REG_VDELP0);
     player ? (*size = TIA_WRITE_REG_NUSIZ1)     : (*size = TIA_WRITE_REG_NUSIZ0);
 }
-
 void TIA_get_missile_registers(uint8_t missile, tia_writable_register_t *enable,
         tia_writable_register_t *size, tia_writable_register_t *offset)
 {
@@ -469,118 +603,33 @@ void TIA_get_missile_registers(uint8_t missile, tia_writable_register_t *enable,
     missile ? (*size = TIA_WRITE_REG_NUSIZ1)  : (*size = TIA_WRITE_REG_NUSIZ0);
     missile ? (*offset = TIA_WRITE_REG_HMM1)  : (*offset = TIA_WRITE_REG_HMM0);
 }
+void TIA_update_missile_buffer(uint8_t missile) { (void)missile; }
+void TIA_update_ball_buffer(void) {}
+void TIA_update_playfield(void) {}
 
-void TIA_reset_ball()
+int TIA_test_ball_bit(void)
 {
-    tia.ball.scanline_reset = 1;
-    tia.ball.position_clock = 0;
-    tia.ball.horizontal_offset = 0;
-
-    if (tia.colour_clock > TIA_COLOUR_CLOCK_HSYNC) {
-        tia.ball.position_clock = (tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC) -2;
-    }
-    TIA_update_ball_buffer();
+    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) return 0;
+    return TIA_get_ball_pixel((int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC);
 }
 
-void TIA_reset_missile(uint8_t missile)
+int TIA_test_playfield_bit(void)
 {
-    tia.missiles[missile].scanline_reset = 1;
-    tia.missiles[missile].position_clock = 0;
-    tia.missiles[missile].horizontal_offset = 0;
-    
-    if (tia.colour_clock > TIA_COLOUR_CLOCK_HSYNC) {
-        tia.missiles[missile].position_clock = (tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC) -2;
-    }
-    TIA_update_missile_buffer(missile);
-}
-
-void TIA_update_missile_buffer(uint8_t missile)
-{
-    tia_writable_register_t enable_reg, size_reg, offset_reg;
-
-    TIA_reset_line_buffer(tia.missiles[missile].line_buffer);
-    TIA_get_missile_registers(missile, &enable_reg, &size_reg, &offset_reg);
-
-    if ((tia.write_regs[enable_reg]) ? 1 : 0) {
-        uint32_t position = tia.missiles[missile].position_clock;
-        tia.missiles[missile].width = (1 << (tia.write_regs[size_reg] >> 4));
-
-        for (uint32_t i = position; i < position + tia.missiles[missile].width; i++) {
-            tia.missiles[missile].line_buffer[i] = 1;
-        }
-    }
-}
-
-
-void TIA_update_ball_buffer()
-{
-    TIA_reset_line_buffer(tia.ball.line_buffer);
-
-    if ((tia.write_regs[TIA_WRITE_REG_ENABL]) ? 1 : 0) {
-        uint32_t position = tia.ball.position_clock;
-        tia.ball.width = (1 << (tia.write_regs[TIA_WRITE_REG_CTRLPF] >> 4));
-
-        for (uint32_t i = position; i < position + tia.ball.width; i++) {
-            tia.ball.line_buffer[i] = 1;
-        }
-    }
-}
-
-void TIA_update_playfield()
-{
-    uint32_t pattern = (tia.write_regs[TIA_WRITE_REG_PF0] >> 4)
-                     | (TIA_reverse_byte(tia.write_regs[TIA_WRITE_REG_PF1]) << 4)
-                     | (tia.write_regs[TIA_WRITE_REG_PF2] << 12);
-    
-    uint32_t mirror_enable = (tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0x01) ? 1 : 0;
-
-    for (uint32_t i=0; i<TIA_COLOUR_CLOCK_VISIBLE_HALF; i++) {
-        /* N.B divide by four as each playfield bit covers four TIA clock cycles */
-        uint32_t bitIndex = i >> 2;
-
-        /* Fill in the first half of the screen */
-        tia.playfield.line_buffer[i] = ((pattern & (1 << bitIndex)) ? 1 : 0);
-
-        /* Then the second one*/
-        if (mirror_enable) {
-            tia.playfield.line_buffer[i+TIA_COLOUR_CLOCK_VISIBLE_HALF] = ((pattern & (0x80000 >> bitIndex)) ? 1 : 0);
-        } else {
-            tia.playfield.line_buffer[i+TIA_COLOUR_CLOCK_VISIBLE_HALF] = tia.playfield.line_buffer[i];
-        }
-    }
-}
-int TIA_test_ball_bit()
-{
-    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) {
-        return 0;
-    }
-    return (tia.ball.line_buffer[tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC] ? 1 : 0);
-}
-
-int TIA_test_playfield_bit()
-{
-    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) {
-        return 0;
-    }
-    return (tia.playfield.line_buffer[tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC] ? 1 : 0);
+    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) return 0;
+    return TIA_get_playfield_pixel((int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC);
 }
 
 int TIA_test_missile_bit(uint8_t missile)
 {
-    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) {
-        return 0;
-    }
-    return (tia.missiles[missile].line_buffer[tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC] ? 1 : 0);
+    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) return 0;
+    return TIA_get_missile_pixel(missile, (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC);
 }
 
 int TIA_test_player_bit(uint8_t player)
 {
-    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) {
-        return 0;
-    }
-    return (tia.players[player].line_buffer[tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC] ? 1 : 0);
+    if (tia.colour_clock < TIA_COLOUR_CLOCK_HSYNC) return 0;
+    return TIA_get_player_pixel(player, (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC);
 }
-
 
 uint8_t TIA_reverse_byte(uint8_t byte)
 {
@@ -592,94 +641,78 @@ uint8_t TIA_reverse_byte(uint8_t byte)
 
 void TIA_generate_colour(void)
 {
-    /* Grab the background. If there's an element on the same clock count
-     * we'll overwrite it
-     */
+    int pixel_idx = (int)tia.colour_clock - TIA_COLOUR_CLOCK_HSYNC;
+    if (pixel_idx < 0 || pixel_idx >= TIA_COLOUR_CLOCK_VISIBLE) return;
+
+    /* Check VBLANK: Bit 1 (0x02) blanks video and disables collisions */
+    if (tia.write_regs[TIA_WRITE_REG_VBLANK] & 0x02) {
+        tia_line_buffer[pixel_idx] = 0;
+        return;
+    }
+
+    /* HMOVE blanking: first 8 pixels are blanked if HMOVE was triggered */
+    if (tia.write_regs[TIA_WRITE_REG_HMOVE] && (pixel_idx < 8)) {
+        tia_line_buffer[pixel_idx] = 0;
+        return;
+    }
+
+    uint8_t M0 = TIA_get_missile_pixel(0, pixel_idx);
+    uint8_t M1 = TIA_get_missile_pixel(1, pixel_idx);
+    uint8_t P0 = TIA_get_player_pixel(0, pixel_idx);
+    uint8_t P1 = TIA_get_player_pixel(1, pixel_idx);
+    uint8_t BL = TIA_get_ball_pixel(pixel_idx);
+    uint8_t PF = TIA_get_playfield_pixel(pixel_idx);
+
     uint8_t tia_color = tia.write_regs[TIA_WRITE_REG_COLUBK];
 
-    /* TODO check order of priority established in PFB bits
-     * to establish if playfield need to be rendered over player
-     * objects
-     */
-    uint8_t M0 = TIA_test_missile_bit(0);
-    uint8_t M1 = TIA_test_missile_bit(1);
-    uint8_t P0 = TIA_test_player_bit(0);   
-    uint8_t P1 = TIA_test_player_bit(1);
-    uint8_t BL = TIA_test_ball_bit();
-    uint8_t PF = TIA_test_playfield_bit();
-
-
-    if ((tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0b100) ? 1 : 0) {
-        /* Control register is specifying that priority be remapped to:
-         * Highest: PF, BL
-         * Second:  P0, M0
-         * Third:   P1, M1
-         * Lowest:  BK
-         */
-
+    if (tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0x04) {
+        /* Highest: PF, BL; Second: P0, M0; Third: P1, M1; Lowest: BK */
         if (PF) {
-            // SCORE MODE 
-            if ((tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0b10) ? 1 : 0) {
-                tia_color = tia.write_regs[
-                    ((tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC) < TIA_COLOUR_CLOCK_VISIBLE_HALF) ? TIA_WRITE_REG_COLUP0 : TIA_WRITE_REG_COLUP1];
+            if (tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0x02) {
+                tia_color = (pixel_idx < TIA_COLOUR_CLOCK_VISIBLE_HALF) ?
+                    tia.write_regs[TIA_WRITE_REG_COLUP0] : tia.write_regs[TIA_WRITE_REG_COLUP1];
             } else {
-                tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];    
+                tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];
             }
-        } else 
-        if (BL) {
+        } else if (BL) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];
-        } else
-        if (P0 || M0) {
+        } else if (P0 || M0) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUP0];
-        } else 
-        if (P1 || M1) {
+        } else if (P1 || M1) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUP1];
         }
     } else {
-        /* Default priority control:
-         * Highest: P0, M0
-         * Second:  P1, M1
-         * Third:   PF, BL
-         * Lowest:  BK
-         */
+        /* Highest: P0, M0; Second: P1, M1; Third: PF, BL; Lowest: BK */
         if (P0 || M0) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUP0];
-        } else 
-        if (P1 || M1) {
+        } else if (P1 || M1) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUP1];
-        } else
-        if (PF) {
-            // SCORE MODE 
-            if ((tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0b10) ? 1 : 0) {
-                tia_color = tia.write_regs[
-                    ((tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC) < TIA_COLOUR_CLOCK_VISIBLE_HALF) ? TIA_WRITE_REG_COLUP0 : TIA_WRITE_REG_COLUP1];
+        } else if (PF) {
+            if (tia.write_regs[TIA_WRITE_REG_CTRLPF] & 0x02) {
+                tia_color = (pixel_idx < TIA_COLOUR_CLOCK_VISIBLE_HALF) ?
+                    tia.write_regs[TIA_WRITE_REG_COLUP0] : tia.write_regs[TIA_WRITE_REG_COLUP1];
             } else {
-                tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];    
+                tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];
             }
-        } else 
-        if (BL) {
+        } else if (BL) {
             tia_color = tia.write_regs[TIA_WRITE_REG_COLUPF];
         }
     }
 
-    #if PICO_ON_DEVICE
-    tia_raw_buffer[tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC] = X4(tia_rgb_color_map[tia_color >> 1]);
-    #else
-    tia_line_buffer[tia.colour_clock-TIA_COLOUR_CLOCK_HSYNC] = tia_colour_map[tia_color >> 1];
-    #endif
+    tia_line_buffer[pixel_idx] = tia_color_map_rgb565[tia_color >> 1];
 
-    // collisions detect
-    tia.read_regs[TIA_READ_REG_CXM0P] = ((P0 & P1) << 7) | ((M0 & M0) << 6);
-    tia.read_regs[TIA_READ_REG_CXM1P] = ((M1 & P0) << 7) | ((M1 & P1) << 6);
-    tia.read_regs[TIA_READ_REG_CXP0FB] = ((P0 & PF) << 7) | ((P0 & BL) << 6);
-    tia.read_regs[TIA_READ_REG_CXP1FB] = ((P1 & PF) << 7) | ((P1 & BL) << 6);
-    tia.read_regs[TIA_READ_REG_CXM0FB] = ((M0 & PF) << 7) | ((M0 & BL) << 6);
-    tia.read_regs[TIA_READ_REG_CXM1FB] = ((M1 & PF) << 7) | ((M1 & BL) << 6);
-    tia.read_regs[TIA_READ_REG_CXBLPF] = ((BL & PF) << 7);
-    tia.read_regs[TIA_READ_REG_CXPPMM] = ((P0 & P1) << 7) | ((M0 & M1) << 6);
+    /* Sticky collision latches (active until cleared by CXCLR) */
+    tia.read_regs[TIA_READ_REG_CXM0P]  |= ((M0 & P1) << 7) | ((M0 & P0) << 6);
+    tia.read_regs[TIA_READ_REG_CXM1P]  |= ((M1 & P0) << 7) | ((M1 & P1) << 6);
+    tia.read_regs[TIA_READ_REG_CXP0FB] |= ((P0 & PF) << 7) | ((P0 & BL) << 6);
+    tia.read_regs[TIA_READ_REG_CXP1FB] |= ((P1 & PF) << 7) | ((P1 & BL) << 6);
+    tia.read_regs[TIA_READ_REG_CXM0FB] |= ((M0 & PF) << 7) | ((M0 & BL) << 6);
+    tia.read_regs[TIA_READ_REG_CXM1FB] |= ((M1 & PF) << 7) | ((M1 & BL) << 6);
+    tia.read_regs[TIA_READ_REG_CXBLPF] |= ((BL & PF) << 7);
+    tia.read_regs[TIA_READ_REG_CXPPMM] |= ((P0 & P1) << 7) | ((M0 & M1) << 6);
 }
 
-int TIA_clock_tick()
+int TIA_clock_tick(void)
 {
     /* Reset colour clock and prepare begin next line */
     if (tia.colour_clock >= TIA_COLOUR_CLOCK_TOTAL) {
@@ -689,21 +722,10 @@ int TIA_clock_tick()
         tia.missiles[1].scanline_reset = 0;
         tia.ball.scanline_reset = 0;
         tia.write_regs[TIA_WRITE_REG_HMOVE] = 0;
-        //return 0;
-    }
-    
-    if (tia.colour_clock == TIA_COLOUR_CLOCK_HSYNC) {
-        TIA_update_player_buffer(0);
-        TIA_update_player_buffer(1);
-        TIA_update_missile_buffer(0);
-        TIA_update_missile_buffer(1);
-        TIA_update_ball_buffer();
     }
 
-    if (tia.colour_clock > TIA_COLOUR_CLOCK_HSYNC) {
+    if (tia.colour_clock >= TIA_COLOUR_CLOCK_HSYNC) {
         TIA_generate_colour();
-    } else {
-        /* Horizontal or vertical sync time, no need to generate a colour */
     }
 
     tia.colour_clock++;
@@ -730,12 +752,15 @@ void TIA_reset_line_buffer(uint8_t line_buffer[])
     memset(line_buffer, 0, TIA_COLOUR_CLOCK_VISIBLE);
 }
 
-void TIA_reset_buffer()
+void TIA_reset_buffer(void)
 {
-    memset(tia_raw_buffer, 0, sizeof(tia_raw_buffer));
+    memset(tia_line_buffer, 0, sizeof(tia_line_buffer));
 }
 
-
 void TIA_joy1_state(uint8_t state) {
-    tia.read_regs[TIA_READ_REG_INPT4] = state ? 0b10000000 : 0b00000000;
+    tia.read_regs[TIA_READ_REG_INPT4] = state ? 0x00 : 0x80;
+}
+
+void TIA_joy2_state(uint8_t state) {
+    tia.read_regs[TIA_READ_REG_INPT5] = state ? 0x00 : 0x80;
 }

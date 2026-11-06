@@ -70,5 +70,6 @@ void mos6507_get_current_instruction(uint8_t *instruction);
 void mos6507_get_current_instruction_cycle(uint8_t *instruction_cycle);
 void mos6507_push_stack(uint8_t byte);
 void mos6507_pull_stack(uint8_t *byte);
+mos6507 *mos6507_get_cpu(void);
 
 #endif /* _MOS6507_H */

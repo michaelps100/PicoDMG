@@ -24,56 +24,72 @@
 
 void memmap_map_address(uint16_t *address)
 {
-    /* The 6507 is a variant of the 6502. It shares the 16-bit addressing
-     * system internally, but only connects to 13 external pins so the 
-     * largest address which can be selected is 0x1FFF. However, as the 
-     * processor can still handle full 16-bit addresses a programmer may have
-     * used a greater value with the expectation those bits would be disregarded
-     * and mirroring would take place.
-     */
-    *address = (*address & 0x1FFF);
+    /* The 6507 only has 13 address lines (A0..A12), so largest address is 0x1FFF */
+    *address &= 0x1FFFu;
 }
 
-/* These read/write functions essentially replicate the 
- * chip-select pins on the TIA and RIOT by delegating 
- * memory access requests to their respective locations.
+/* Hardware-accurate Atari 2600 bus decoding:
+ * A12 = 1: Cartridge (0x1000..0x1FFF)
+ * A12 = 0: TIA and RIOT (0x0000..0x0FFF, mirrored every 1KB):
+ *   A7 = 0: TIA (registers at addr & 0x3F for write, addr & 0x0F for read)
+ *   A7 = 1: RIOT (MOS 6532):
+ *     A9 = 0: RIOT RAM (128 bytes: addr & 0x7F)
+ *     A9 = 1: RIOT I/O & Timers (0x0280 | (addr & 0x7F))
  */
 void memmap_write(void)
 {
-    /* Fetch data and address from CPU */
     uint16_t address;
     uint8_t data;
     mos6507_get_data_bus(&data);
     mos6507_get_address_bus(&address);
-    memmap_map_address(&address);
+    address &= 0x1FFFu;
 
-    /* Access particular device */
-    if (IS_TIA(address)) TIA_write_register(address - MEMMAP_TIA_START, data);
-    if (IS_RIOT(address)) {
-        memmap_map_riot_address(&address);
-        mos6532_write(address, data);
-    }
-    if (IS_CART(address)) {
-        /* Cartridges are read-only. Are there hardware peripherals which 
-         * use this space for extending functionality? E.g., SuperCharger?
-         */
+    if (address & 0x1000u) {
+        /* Cartridge space */
+        cartridge_write(address & 0x0FFFu, data);
+    } else {
+        /* Internal console space */
+        if (!(address & 0x0080u)) {
+            /* TIA (A7 == 0) */
+            TIA_write_register((uint8_t)(address & 0x3Fu), data);
+        } else {
+            /* RIOT (A7 == 1) */
+            if (!(address & 0x0200u)) {
+                /* RIOT RAM (A9 == 0, 128 bytes) */
+                mos6532_write(address & 0x007Fu, data);
+            } else {
+                /* RIOT I/O and Timers (A9 == 1) */
+                mos6532_write(0x0280u | (address & 0x007Fu), data);
+            }
+        }
     }
 }
 
 void memmap_read(uint8_t *data)
 {
-    /* Fetch address from CPU */
     uint16_t address;
     mos6507_get_address_bus(&address);
-    memmap_map_address(&address);
+    address &= 0x1FFFu;
 
-    /* Access particular device */
-    if (IS_TIA(address)) TIA_read_register(address - MEMMAP_TIA_START, data);
-    if (IS_RIOT(address)) {
-        memmap_map_riot_address(&address);
-        mos6532_read(address, data);
+    if (address & 0x1000u) {
+        /* Cartridge space */
+        cartridge_read(address & 0x0FFFu, data);
+    } else {
+        /* Internal console space */
+        if (!(address & 0x0080u)) {
+            /* TIA (A7 == 0) */
+            TIA_read_register((uint8_t)(address & 0x0Fu), data);
+        } else {
+            /* RIOT (A7 == 1) */
+            if (!(address & 0x0200u)) {
+                /* RIOT RAM (A9 == 0, 128 bytes) */
+                mos6532_read(address & 0x007Fu, data);
+            } else {
+                /* RIOT I/O and Timers (A9 == 1) */
+                mos6532_read(0x0280u | (address & 0x007Fu), data);
+            }
+        }
     }
-    if (IS_CART(address)) cartridge_read(address - MEMMAP_CART_START, data);
 
     mos6507_set_data_bus(*data);
 }

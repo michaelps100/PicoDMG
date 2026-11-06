@@ -126,10 +126,12 @@ typedef struct {
 
 typedef struct {
     uint8_t scanline_reset;
-    int8_t position_clock;
+    int16_t position_clock;
     int8_t horizontal_offset;
     uint8_t vertical_delay;
     uint8_t pattern;
+    uint8_t grp;
+    uint8_t grp_old;
     uint8_t line_buffer[TIA_COLOUR_CLOCK_VISIBLE];
 } tia_player_t;
 
@@ -159,17 +161,12 @@ extern uint16_t tia_player_size_map[8];
  * the TIA in this application */
 extern atari_tia tia;
 
-/* To allow for easier output to non-raster devices we'll build the image one
- * line at a time into this buffer.
- */
-#if PICO_ON_DEVICE
-extern uint32_t tia_raw_buffer[TIA_COLOUR_CLOCK_VISIBLE];
-#else
-extern tia_pixel_t tia_line_buffer[TIA_COLOUR_CLOCK_VISIBLE];
-#endif
+extern uint16_t tia_line_buffer[TIA_COLOUR_CLOCK_VISIBLE];
+extern uint16_t tia_color_map_rgb565[128];
 
-// Joystic 1
+// Joystick 1 & 2
 void TIA_joy1_state(uint8_t state);
+void TIA_joy2_state(uint8_t state);
 
 /* Interfacing functions */
 void TIA_init(void);
