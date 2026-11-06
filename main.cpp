@@ -4,6 +4,11 @@
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
+#include "hardware/pwm.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "hardware/pll.h"
+
 #include "util/work_meter.h"
 #include "InfoNES.h"
 #include "InfoNES_System.h"
@@ -27,6 +32,14 @@
 #include "InfoNES_FDS.h"
 #include "InfoNES_NSF.h"
 #include "zapper.h"
+#if USE_ILI9341
+#include "ili9341.h"
+#include "crc32.h"
+#include "dmg_menu.h"
+#include "dmg_combo.h"
+#include "dmg_resume.h"
+#include "dmg_boot_intro.h"
+#endif
 #if EMBEDDED_NES_ROM
 extern "C" const unsigned char embedded_nes_rom[];
 extern "C" const unsigned int embedded_nes_rom_len;
@@ -40,7 +53,8 @@ SaveStateTypes quickSaveAction = SaveStateTypes::NONE;
 static uint32_t start_tick_us = 0;
 static uint32_t fps = 0;
 static uint8_t framesbeforeAutoStateIsLoaded = 0;
-#define EMULATOR_CLOCKFREQ_KHZ 252000 //  Overclock frequency in kHz when using Emulator
+#define EMULATOR_CLOCKFREQ_KHZ 252000 // CPU frequency in kHz (252 MHz; SPI decoupled via PLL_USB @ 160 MHz -> 80 MHz)
+
 
 // Note: When using framebuffer, AUDIOBUFFERSIZE must be increased to 1024
 #if PICO_RP2350
@@ -85,7 +99,7 @@ int8_t g_settings_visibility_nes[MOPT_COUNT] = {
     [MOPT_REBOOT_TO_LOADER]        = BOOTLOADER_BUILD,     // Return to emuLoader picker (only when built for the loader)
     [MOPT_SAVE_RESTORE_STATE]      = 0,                    // Save / Restore State
     [MOPT_SCREENMODE]              = 1,                    // Screen Mode
-    [MOPT_SCANLINES]               = 0,                    // Scanlines toggle (superseded by Screen Mode)
+    [MOPT_SCANLINES]               = USE_ILI9341,          // Scanlines toggle
     [MOPT_SCANLINE_TYPE]           = HSTX,                 // Scanline Type (HSTX only)
     [MOPT_FPS_OVERLAY]             = 1,                    // FPS Overlay
     [MOPT_AUDIO_ENABLE]            = 0,                    // Audio Enable
@@ -157,7 +171,30 @@ const WORD __not_in_flash_func(NesPalette)[64] = {
     CC(0x7f94), CC(0x73f4), CC(0x57d7), CC(0x5bf9), CC(0x4ffe), CC(0x0000), CC(0x0000), CC(0x0000)};
 #endif
 #if 1
-#if !HSTX
+#if USE_ILI9341
+// RGB888 to RGB555 (15-bit RGB: bit 15 is 0, keeping it clean for InfoNES backdrop flag 0x8000!)
+#define CC(c) (((c & 0xf8) >> 3) | ((c & 0xf800) >> 6) | ((c & 0xf80000) >> 9))
+const WORD __not_in_flash_func(NesPalette)[64] = {
+    CC(0x626262), CC(0x001C95), CC(0x1904AC), CC(0x42009D),
+    CC(0x61006B), CC(0x6E0025), CC(0x650500), CC(0x491E00),
+    CC(0x223700), CC(0x004900), CC(0x004F00), CC(0x004816),
+    CC(0x00355E), CC(0x000000), CC(0x000000), CC(0x000000),
+
+    CC(0xABABAB), CC(0x0C4EDB), CC(0x3D2EFF), CC(0x7115F3),
+    CC(0x9B0BB9), CC(0xB01262), CC(0xA92704), CC(0x894600),
+    CC(0x576600), CC(0x237F00), CC(0x008900), CC(0x008332),
+    CC(0x006D90), CC(0x000000), CC(0x000000), CC(0x000000),
+
+    CC(0xFFFFFF), CC(0x57A5FF), CC(0x8287FF), CC(0xB46DFF),
+    CC(0xDF60FF), CC(0xF863C6), CC(0xF8746D), CC(0xDE9020),
+    CC(0xB3AE00), CC(0x81C800), CC(0x56D522), CC(0x3DD36F),
+    CC(0x3EC1C8), CC(0x4E4E4E), CC(0x000000), CC(0x000000),
+
+    CC(0xFFFFFF), CC(0xBEE0FF), CC(0xCDD4FF), CC(0xE0CAFF),
+    CC(0xF1C4FF), CC(0xFCC4EF), CC(0xFDCACE), CC(0xF5D4AF),
+    CC(0xE6DF9C), CC(0xD3E99A), CC(0xC2EFA8), CC(0xB7EFC4),
+    CC(0xB6EAE5), CC(0xB8B8B8), CC(0x000000), CC(0x000000)};
+#elif !HSTX
 // RGB565 to RGB444
 #define CC(x) (((x >> 1) & 15) | (((x >> 6) & 15) << 4) | (((x >> 11) & 15) << 8))
 const WORD __not_in_flash_func(NesPalette)[64] = {
@@ -194,10 +231,25 @@ const WORD __not_in_flash_func(NesPalette)[64] = {
     CC(0xB6EAE5), CC(0xB8B8B8), CC(0x000000), CC(0x000000)};
 #endif
 #endif
+/* True when ROM_FILE_ADDR points at a PSRAM buffer this file allocated, so it is
+ * ours to free. It must not be freed otherwise: in the flash path ROM_FILE_ADDR
+ * is an XIP address and Frens::f_free() on one of those corrupts the heap.
+ * Declared here because getCurrentNVRAMAddr() below keys off it. */
+static bool s_rom_in_psram = false;
+
 uint32_t getCurrentNVRAMAddr()
 {
 
     if (!romSelector_.getCurrentROM())
+    {
+        return {};
+    }
+    // The NVRAM slot is carved out of the flash region just below the ROM, so
+    // this arithmetic only means anything for a flash-resident ROM. With a
+    // PSRAM ROM the subtraction would point at unrelated PSRAM contents and be
+    // memcpy'd in as a battery save, so report "no NVRAM here" and let the
+    // caller start from a clean SRAM. Saves live on the SD card regardless.
+    if (s_rom_in_psram)
     {
         return {};
     }
@@ -210,6 +262,13 @@ uint32_t getCurrentNVRAMAddr()
     return ROM_FILE_ADDR - SRAM_SIZE * (slot + 1);
 }
 
+static void ensure_save_directories(void) {
+    f_mkdir("0:/saves");
+    f_mkdir("0:/saves/nes");
+    f_mkdir("/saves");
+    f_mkdir("/saves/nes");
+}
+
 void saveNVRAM()
 {
     char pad[FF_MAX_LFN];
@@ -219,7 +278,8 @@ void saveNVRAM()
 #if PICO_RP2350
     if (IsFDS)
     {
-        snprintf(pad, FF_MAX_LFN, "%s/%s_fds", GAMESAVEDIR, fileName);
+        ensure_save_directories();
+        snprintf(pad, FF_MAX_LFN, "0:/saves/nes/%s_fds", fileName);
         fdsSaveSidecar(pad);
         return;
     }
@@ -229,11 +289,16 @@ void saveNVRAM()
         printf("SRAM not updated.\n");
         return;
     }
-    snprintf(pad, FF_MAX_LFN, "%s/%s.SAV", GAMESAVEDIR, fileName);
+    ensure_save_directories();
+    snprintf(pad, FF_MAX_LFN, "0:/saves/nes/%s.sav", fileName);
     printf("Save SRAM to %s\n", pad);
     FIL fil;
-    FRESULT fr;
-    fr = f_open(&fil, pad, FA_CREATE_ALWAYS | FA_WRITE);
+    FRESULT fr = f_open(&fil, pad, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK)
+    {
+        snprintf(pad, FF_MAX_LFN, "/saves/nes/%s.sav", fileName);
+        fr = f_open(&fil, pad, FA_CREATE_ALWAYS | FA_WRITE);
+    }
     if (fr != FR_OK)
     {
         snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot open save file: %d", fr);
@@ -264,22 +329,28 @@ bool loadNVRAM()
 #if PICO_RP2350
     if (IsFDS)
     {
-        snprintf(pad, FF_MAX_LFN, "%s/%s_fds", GAMESAVEDIR, fileName);
+        snprintf(pad, FF_MAX_LFN, "0:/saves/nes/%s_fds", fileName);
         fdsSetSaveBasePath(pad);
         return fdsLoadSidecar(pad);
     }
 #endif
 
-    snprintf(pad, FF_MAX_LFN, "%s/%s.SAV", GAMESAVEDIR, fileName);
+    snprintf(pad, FF_MAX_LFN, "0:/saves/nes/%s.sav", fileName);
+    FRESULT fr = f_stat(pad, &fno);
+    if (fr != FR_OK) {
+        snprintf(pad, FF_MAX_LFN, "0:/saves/nes/%s.SAV", fileName);
+        fr = f_stat(pad, &fno);
+    }
+    if (fr != FR_OK) {
+        snprintf(pad, FF_MAX_LFN, "%s/%s.SAV", GAMESAVEDIR, fileName);
+        fr = f_stat(pad, &fno);
+    }
 
     FIL fil;
-    FRESULT fr;
-
     size_t bytesRead;
     if (auto addr = getCurrentNVRAMAddr())
     {
         printf("Load SRAM from %s\n", pad);
-        fr = f_stat(pad, &fno);
         if (fr == FR_NO_FILE)
         {
             printf("Save file not found, load SRAM from flash %x\n", addr);
@@ -305,13 +376,13 @@ bool loadNVRAM()
                         snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot read save file: %d %d/%d read", fr, bytesRead, SRAM_SIZE);
                         printf("%s\n", ErrorMessage);
                     }
+                    f_close(&fil);
                 }
                 else
                 {
                     snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot open save file: %d", fr);
                     printf("%s\n", ErrorMessage);
                 }
-                f_close(&fil);
             }
             else
             {
@@ -326,6 +397,747 @@ bool loadNVRAM()
     }
     SRAMwritten = false;
     return ok;
+}
+
+/* =========================================================================
+ * Persistent Configuration (picones.cfg)
+ * ========================================================================= */
+#define PICONES_CONFIG_MAGIC 0x53454E50u /* "PNES" */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t scale_mode;        /* 0 = Fit, 1 = Stretch, 2 = Integer */
+    uint32_t scanlines_enabled; /* 0 = Normal, 1 = Scanlines */
+    uint32_t display_fps;       /* 0 = Off, 1 = On */
+    uint32_t volume_level;      /* 1..5, default 3 */
+    uint32_t brightness_level;  /* 1..5, default 5 */
+    uint32_t turbo_mode;        /* 0 = Normal 1x, 1 = Turbo 2x */
+    uint32_t save_slot;         /* 1..4, default 1 */
+    uint32_t load_slot;         /* 1..4, default 1 */
+    uint32_t interleave;        /* 0 = Progressive, 1 = Interleave */
+    uint32_t crop_sides;        /* 0 = Off, 1 = 8px Mask (L+R), 2 = 8px Fill */
+    uint32_t height_fill;       /* 0 = Native 240p, 1 = Fill Screen */
+    uint32_t filter_mode;       /* 0 = Shimmerless, 1 = Sharp */
+} picones_config_t;
+
+static ili9341_scale_mode_t persistent_scale_mode = SCALE_FIT;
+static bool persistent_scanlines_enabled = false;
+static bool persistent_shimmerless_enabled = true;
+static bool persistent_interleave = true;
+static uint8_t persistent_crop_sides = 1;       /* 0 = Off, 1 = 8px Mask (L+R), 2 = 8px Fill */
+static bool persistent_height_fill = true;
+static bool persistent_display_fps = false;
+static uint8_t persistent_volume_level = 3;     /* 1..5 */
+static uint8_t persistent_brightness_level = 5; /* 1..5 */
+static uint8_t persistent_turbo_mode = 0;       /* 0 = 1x, 1 = 2x */
+static uint8_t persistent_save_slot = 1;        /* 1..4 */
+static uint8_t persistent_load_slot = 1;        /* 1..4 */
+
+static bool s_request_pause_menu = false;
+/* Standby by save state (shared_menu/dmg_power.h). */
+static bool s_request_power_off = false;
+static uint8_t s_power_reason = 0;
+static bool s_resume_load_pending = false;
+static bool s_request_exit_game = false;
+
+static void set_backlight_brightness(uint8_t level) {
+    if (level < 1) level = 1;
+    if (level > 5) level = 5;
+    persistent_brightness_level = level;
+#if USE_ILI9341
+    if (level >= 5) {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_SIO);
+        gpio_set_dir(ILI9341_PIN_BL, GPIO_OUT);
+        gpio_put(ILI9341_PIN_BL, 1);
+    } else {
+        gpio_set_function(ILI9341_PIN_BL, GPIO_FUNC_PWM);
+        uint slice_num = pwm_gpio_to_slice_num(ILI9341_PIN_BL);
+        pwm_config config = pwm_get_default_config();
+        pwm_config_set_clkdiv(&config, 4.0f);
+        pwm_config_set_wrap(&config, 1000);
+        pwm_init(slice_num, &config, true);
+        static const uint16_t duty_table[6] = { 0, 200, 400, 600, 800, 1000 };
+        pwm_set_gpio_level(ILI9341_PIN_BL, duty_table[level]);
+    }
+#endif
+}
+
+static void set_sound_volume_level(uint8_t level) {
+    if (level > 5) level = 5;
+    persistent_volume_level = level;
+}
+
+static void save_picones_config(void) {
+    ensure_save_directories();
+    FIL fil;
+    FRESULT fr = f_open(&fil, "0:/saves/nes/picones.cfg", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        fr = f_open(&fil, "/saves/nes/picones.cfg", FA_WRITE | FA_CREATE_ALWAYS);
+    }
+    if (fr == FR_OK) {
+        picones_config_t cfg;
+        cfg.magic = PICONES_CONFIG_MAGIC;
+        cfg.version = 1;
+        cfg.scale_mode = (uint32_t)persistent_scale_mode;
+        cfg.scanlines_enabled = persistent_scanlines_enabled ? 1u : 0u;
+        cfg.display_fps = persistent_display_fps ? 1u : 0u;
+        cfg.volume_level = (uint32_t)persistent_volume_level;
+        cfg.brightness_level = (uint32_t)persistent_brightness_level;
+        cfg.turbo_mode = (uint32_t)persistent_turbo_mode;
+        cfg.save_slot = (uint32_t)persistent_save_slot;
+        cfg.load_slot = (uint32_t)persistent_load_slot;
+        cfg.interleave = persistent_interleave ? 1u : 0u;
+        cfg.crop_sides = (uint32_t)persistent_crop_sides;
+        cfg.height_fill = persistent_height_fill ? 1u : 0u;
+        cfg.filter_mode = persistent_shimmerless_enabled ? 0u : 1u;
+        UINT bw;
+        f_write(&fil, &cfg, sizeof(cfg), &bw);
+        f_close(&fil);
+    }
+}
+
+static void load_picones_config(void) {
+    FIL fil;
+    FRESULT fr = f_open(&fil, "0:/saves/nes/picones.cfg", FA_READ);
+    if (fr != FR_OK) {
+        fr = f_open(&fil, "/saves/nes/picones.cfg", FA_READ);
+    }
+    if (fr == FR_OK) {
+        picones_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        UINT br;
+        fr = f_read(&fil, &cfg, sizeof(cfg), &br);
+        f_close(&fil);
+        if (fr == FR_OK && br >= sizeof(uint32_t) * 10 && cfg.magic == PICONES_CONFIG_MAGIC) {
+            if (cfg.scale_mode <= (uint32_t)SCALE_INTEGER) {
+                persistent_scale_mode = (ili9341_scale_mode_t)cfg.scale_mode;
+                ili9341_set_scale_mode(persistent_scale_mode);
+            }
+            persistent_scanlines_enabled = (cfg.scanlines_enabled != 0u);
+            ili9341_set_scanlines(persistent_scanlines_enabled);
+            persistent_display_fps = (cfg.display_fps != 0u);
+            settings.flags.displayFrameRate = persistent_display_fps;
+            if (cfg.volume_level <= 5) {
+                persistent_volume_level = (uint8_t)cfg.volume_level;
+                set_sound_volume_level(persistent_volume_level);
+            }
+            if (cfg.brightness_level >= 1 && cfg.brightness_level <= 5) {
+                persistent_brightness_level = (uint8_t)cfg.brightness_level;
+                set_backlight_brightness(persistent_brightness_level);
+            }
+            persistent_turbo_mode = (cfg.turbo_mode != 0u) ? 1 : 0;
+            if (cfg.save_slot >= 1 && cfg.save_slot <= 4) persistent_save_slot = (uint8_t)cfg.save_slot;
+            if (cfg.load_slot >= 1 && cfg.load_slot <= 4) persistent_load_slot = (uint8_t)cfg.load_slot;
+            if (br >= offsetof(picones_config_t, interleave) + sizeof(uint32_t)) {
+                persistent_interleave = (cfg.interleave != 0u);
+                ili9341_set_interleave(persistent_interleave);
+            }
+            if (br >= offsetof(picones_config_t, crop_sides) + sizeof(uint32_t)) {
+                persistent_crop_sides = (uint8_t)cfg.crop_sides;
+                if (persistent_crop_sides > 2) persistent_crop_sides = 1;
+                g_crop_sides = persistent_crop_sides;
+                ili9341_set_crop_sides(persistent_crop_sides);
+            }
+            if (br >= offsetof(picones_config_t, height_fill) + sizeof(uint32_t)) {
+                persistent_height_fill = (cfg.height_fill != 0u);
+                ili9341_set_height_fill(persistent_height_fill);
+            }
+            if (br >= offsetof(picones_config_t, filter_mode) + sizeof(uint32_t)) {
+                persistent_shimmerless_enabled = (cfg.filter_mode == 0u);
+            } else {
+                persistent_shimmerless_enabled = true;
+            }
+            ili9341_set_shimmerless(persistent_shimmerless_enabled);
+            printf("I PicoNES config loaded successfully\n");
+        }
+    }
+}
+
+/* =========================================================================
+ * Clean Light UI via shared_menu
+ * ========================================================================= */
+typedef dmg_action_t ingame_action_e;
+#define INGAME_ACTION_RESUME DMG_ACTION_RESUME
+#define INGAME_ACTION_RESET  DMG_ACTION_RESET
+#define INGAME_ACTION_EXIT   DMG_ACTION_EXIT
+#define init_ui_buttons      dmg_init_ui_buttons
+
+static const char *s_nes_candidate_dirs[] = {
+    "0:/roms/nes",
+    "/roms/nes",
+    "roms/nes",
+    "0:/ROMS/NES",
+    "/ROMS/NES",
+    "ROMS/NES",
+    "0:/roms",
+    "/roms",
+    "roms",
+    "0:/",
+    "/",
+    NULL
+};
+
+static bool is_nes_rom(const char *fname) {
+    if (fname == NULL || fname[0] == '\0' || fname[0] == '.') return false;
+    const char *dot = strrchr(fname, '.');
+    if (dot == NULL) return false;
+    return (strcasecmp(dot, ".nes") == 0 ||
+            strcasecmp(dot, ".fds") == 0 ||
+            strcasecmp(dot, ".nsf") == 0);
+}
+
+static uint32_t last_flashed_rom_size = 0;
+
+/* Loads the ROM into PSRAM instead of programming it into flash.
+ *
+ * The flash path below computes the target as ROM_FILE_ADDR - XIP_BASE, which
+ * is only meaningful when initAll() actually assigned ROM_FILE_ADDR. It does
+ * that on the flash branch only; with a PSRAM present it leaves ROM_FILE_ADDR at
+ * 0 and reports the size limit as psramMemorySize instead. Subtracting XIP_BASE
+ * from 0 wraps to 0xF0000000, which flash_range_erase() rejects -- the load dies
+ * on the first chunk, before the progress bar has moved. That is why the ROM
+ * selector looked fine and the bar never filled.
+ *
+ * Reads in chunks rather than one f_read() of the whole file so the progress
+ * bar reflects real progress, and so a short read stops the loop instead of
+ * leaving the tail of the buffer uninitialised.
+ */
+static bool nes_load_rom_to_psram(const struct dmg_emulator_desc *desc,
+                                  FIL *fil, uint32_t rom_file_size,
+                                  const char *display_name) {
+    if (rom_file_size == 0) {
+        printf("[E] Refusing to load a zero-byte ROM into PSRAM\n");
+        return false;
+    }
+
+    // f_malloc() panics on failure, so the size has to be checked up front
+    // rather than discovered by the allocator. The margin covers the menu's
+    // own scratch allocations plus lwmem bookkeeping.
+    const uint32_t margin = 512u * 1024u;
+    const uint32_t avail = (uint32_t)Frens::GetAvailableMemory();
+    if (avail > margin && rom_file_size > (avail - margin)) {
+        printf("[E] ROM needs %u bytes, only %u usable in PSRAM\n",
+               (unsigned)rom_file_size, (unsigned)(avail - margin));
+        return false;
+    }
+
+    // Release the previous game before allocating, otherwise switching between
+    // ROMs leaks the whole of each one and eventually starves the allocator.
+    if (s_rom_in_psram && ROM_FILE_ADDR != 0) {
+        printf("[I] Freeing previous PSRAM ROM at 0x%08x\n",
+               (unsigned)ROM_FILE_ADDR);
+        Frens::f_free((void *)ROM_FILE_ADDR);
+        ROM_FILE_ADDR = 0;
+        s_rom_in_psram = false;
+    }
+
+    uint8_t *buf = (uint8_t *)Frens::f_malloc(rom_file_size);
+    if (!buf) {
+        printf("[E] PSRAM allocation of %u bytes failed\n", (unsigned)rom_file_size);
+        return false;
+    }
+
+    // Published before the read: the loader and the emulator both key off
+    // ROM_FILE_ADDR, and a failed load has to be able to recognise it.
+    ROM_FILE_ADDR = (uintptr_t)buf;
+    s_rom_in_psram = true;
+
+    dmg_draw_loading_screen(desc, "CARREGANDO NES ROM", display_name, rom_file_size);
+    Frens::blinkLed(true);
+
+    const uint32_t PSRAM_READ_CHUNK = 16u * 1024u;
+    uint32_t bytes_loaded = 0;
+    bool ok = true;
+    f_lseek(fil, 0);
+
+    while (bytes_loaded < rom_file_size) {
+        uint32_t want = rom_file_size - bytes_loaded;
+        if (want > PSRAM_READ_CHUNK) want = PSRAM_READ_CHUNK;
+        UINT br = 0;
+        FRESULT fr = f_read(fil, buf + bytes_loaded, want, &br);
+        if (fr != FR_OK || br == 0) {
+            printf("[E] f_read failed at %u/%u: %d\n",
+                   (unsigned)bytes_loaded, (unsigned)rom_file_size, (int)fr);
+            ok = false;
+            break;
+        }
+        bytes_loaded += br;
+        dmg_update_loading_progress(desc, bytes_loaded, rom_file_size);
+    }
+
+    Frens::blinkLed(false);
+
+    if (!ok) {
+        Frens::f_free(buf);
+        ROM_FILE_ADDR = 0;
+        s_rom_in_psram = false;
+        return false;
+    }
+
+    const int crcOffset = 16;
+    uint32_t final_crc = 0;
+    if (bytes_loaded > (uint32_t)crcOffset) {
+        final_crc = update_crc32(0, buf + crcOffset, bytes_loaded - crcOffset);
+    }
+    Frens::setCrcOfLoadedRom(final_crc);
+    printf("[I] ROM in PSRAM at 0x%08x: %u bytes, CRC: 0x%08X\n",
+           (unsigned)ROM_FILE_ADDR, (unsigned)bytes_loaded,
+           (unsigned)Frens::getCrcOfLoadedRom());
+    return true;
+}
+
+static bool nes_on_load_rom(const struct dmg_emulator_desc *desc, const char *filename) {
+    char full_path[256];
+    const char *curr_dir = dmg_get_current_rom_dir();
+    if (strchr(filename, '/') != NULL || curr_dir == NULL || curr_dir[0] == '\0') {
+        snprintf(full_path, sizeof(full_path), "%s", filename);
+    } else {
+        size_t dlen = strlen(curr_dir);
+        if (dlen > 0 && curr_dir[dlen - 1] == '/') {
+            snprintf(full_path, sizeof(full_path), "%s%s", curr_dir, filename);
+        } else {
+            snprintf(full_path, sizeof(full_path), "%s/%s", curr_dir, filename);
+        }
+    }
+
+    printf("[I] ROM loading starts: %s\n", full_path);
+
+    ili9341_blitter_stop();
+
+    FIL fil;
+    FRESULT fr = f_open(&fil, full_path, FA_READ);
+    if (fr != FR_OK) {
+        printf("E f_open(%s) error: %d\n", full_path, fr);
+        return false;
+    }
+
+    uint32_t rom_file_size = (uint32_t)f_size(&fil);
+
+    // A PSRAM board never programs the ROM into flash: flash_range_erase() and
+    // flash_range_program() are destructive and slow, and the flash window on
+    // this console is also where the loader image lives. Route to PSRAM before
+    // touching flash_offset, which is meaningless without an XIP base.
+    if (Frens::isPsramEnabled()) {
+        bool ok = nes_load_rom_to_psram(desc, &fil, rom_file_size, filename);
+        f_close(&fil);
+        if (ok && !dmg_boot_intro_active()) {
+            ili9341_fill_screen(0x0000);
+            ili9341_flush(true);
+        }
+        return ok;
+    }
+
+    const uint8_t *flash_rom = (const uint8_t *)ROM_FILE_ADDR;
+    uint32_t flash_offset = (uint32_t)(ROM_FILE_ADDR - XIP_BASE);
+
+    /* Is this ROM already in flash? With the size known from this session a
+     * first-sector check is enough. After a reboot the size is unknown (0) --
+     * the normal case on a standby resume -- so the whole file is compared,
+     * which stops at the first differing sector for another ROM and saves a
+     * full erase/program (and a flash lockout of the intro) for the same one. */
+    bool already_flashed = false;
+    if (rom_file_size > 0 &&
+        (last_flashed_rom_size == rom_file_size || last_flashed_rom_size == 0)) {
+        const bool full = (last_flashed_rom_size == 0);
+        static uint8_t chk[FLASH_SECTOR_SIZE];
+        uint32_t off = 0;
+        already_flashed = true;
+        while (off < rom_file_size) {
+            UINT cbr = 0;
+            fr = f_read(&fil, chk, sizeof(chk), &cbr);
+            if (fr != FR_OK || cbr == 0 || memcmp(chk, flash_rom + off, cbr) != 0) {
+                already_flashed = false;
+                break;
+            }
+            off += cbr;
+            if (!full) break;
+            watchdog_update();
+        }
+        f_lseek(&fil, 0);
+        if (already_flashed) last_flashed_rom_size = rom_file_size;
+    }
+
+    if (already_flashed) {
+        printf("[I] ROM already in flash, skipping write\n");
+    } else {
+        printf("[I] ROM changed or not flashed, programming flash...\n");
+        dmg_draw_loading_screen(desc, "CARREGANDO NES ROM", filename, rom_file_size);
+        Frens::blinkLed(true);
+        #define FLASH_CHUNK_SIZE (16u * 1024u)
+        static uint8_t block_buf[FLASH_CHUNK_SIZE];
+        uint32_t bytes_loaded = 0;
+        uint32_t cur_flash_offset = flash_offset;
+        UINT br;
+
+        while (bytes_loaded < rom_file_size) {
+            memset(block_buf, 0xFF, FLASH_CHUNK_SIZE);
+            fr = f_read(&fil, block_buf, FLASH_CHUNK_SIZE, &br);
+            if (fr != FR_OK || br == 0) {
+                break;
+            }
+
+            const uint32_t erase_len = (br + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
+            const uint32_t prog_len = (br + FLASH_PAGE_SIZE - 1u) & ~(FLASH_PAGE_SIZE - 1u);
+            /* The resume intro runs from XIP on core 1: park it in RAM. */
+            dmg_boot_intro_flash_begin();
+            Frens::flashEraseSafe(cur_flash_offset, erase_len);
+            Frens::flashProgramSafe(cur_flash_offset, block_buf, prog_len);
+            dmg_boot_intro_flash_end();
+
+            bytes_loaded += br;
+            cur_flash_offset += erase_len;
+
+            dmg_update_loading_progress(desc, bytes_loaded, rom_file_size);
+        }
+        last_flashed_rom_size = rom_file_size;
+        Frens::blinkLed(false);
+    }
+    f_close(&fil);
+
+    uint32_t final_crc = 0;
+    int crcOffset = 16;
+    if (rom_file_size > (uint32_t)crcOffset) {
+        final_crc = update_crc32(0, flash_rom + crcOffset, rom_file_size - crcOffset);
+    }
+    Frens::setCrcOfLoadedRom(final_crc);
+    printf("[I] ROM ready in flash: %u bytes, CRC: 0x%08X\n", (unsigned)rom_file_size, (unsigned)Frens::getCrcOfLoadedRom());
+
+    ili9341_fill_screen(0x0000);
+    ili9341_flush(true);
+    return true;
+}
+
+static void draw_image_row(uint8_t idx, bool selected) {
+    if (idx >= 5) return;
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
+    uint16_t y = (uint16_t)(DMG_UI_INGAME_LIST_START_Y + (uint16_t)idx * DMG_UI_ITEM_HEIGHT);
+    uint16_t bg = selected ? DMG_RGB555_SEL_COLOR : DMG_RGB555_BG_COLOR;
+
+    ili9341_fill_rect(wx, y, ww, DMG_UI_ITEM_HEIGHT, bg);
+
+    char buf[44];
+    buf[0] = '\0';
+
+    if (idx == 0) {
+        const char *scale_names[] = { "< Fit >", "< Stretch >", "< Integer >" };
+        snprintf(buf, sizeof(buf), "Scale:        %s", scale_names[persistent_scale_mode]);
+    } else if (idx == 1) {
+        snprintf(buf, sizeof(buf), "Effect:       %s", persistent_scanlines_enabled ? "< Scanlines >" : "< Normal >");
+    } else if (idx == 2) {
+        snprintf(buf, sizeof(buf), "Filter:       %s", persistent_shimmerless_enabled ? "< Shimmerless >" : "< Sharp >");
+    } else if (idx == 3) {
+        snprintf(buf, sizeof(buf), "Display:      %s", persistent_interleave ? "< Interleave >" : "< Progressive >");
+    } else if (idx == 4) {
+        const char *crop_names[] = { "< Off >", "< 8px (Mask) >", "< 8px (Fill) >" };
+        snprintf(buf, sizeof(buf), "Crop Sides:   %s", crop_names[persistent_crop_sides % 3]);
+    } else if (idx == 5) {
+        snprintf(buf, sizeof(buf), "Height:       %s", persistent_height_fill ? "< Fill Screen >" : "< Native 240p >");
+    }
+
+    ili9341_text(buf, (uint16_t)(wx + 12u), (uint16_t)(y + 7u), selected ? DMG_RGB555_TEXT_SEL_COLOR : DMG_RGB555_TEXT_COLOR, bg);
+    ili9341_flush_rows(y, y + DMG_UI_ITEM_HEIGHT - 1);
+}
+
+static void nes_image_submenu(const dmg_emulator_desc_t *desc, const char *game_name) {
+    uint8_t cursor = 0; /* 0..5 */
+    bool prev_up = true, prev_down = true, prev_left = true, prev_right = true;
+    bool prev_a = true, prev_b = true;
+    uint16_t wx = dmg_get_window_x();
+    uint16_t ww = dmg_get_window_w();
+
+    dmg_wait_for_all_buttons_released();
+
+    if (dmg_is_gb_mode()) {
+        ili9341_fill_screen(0x0000);
+        ili9341_fill_rect(wx, 0, ww, 240, DMG_RGB555_BG_COLOR);
+    } else {
+        ili9341_fill_screen(DMG_RGB555_BG_COLOR);
+    }
+    dmg_draw_top_bar(desc, desc->app_title, "Image Settings");
+    dmg_draw_game_bar(desc, game_name);
+    dmg_draw_bottom_bar(desc, "L/R / A: Adjust", "B: Back");
+
+    for (uint8_t i = 0; i < 6; i++) {
+        draw_image_row(i, i == cursor);
+    }
+    for (uint8_t i = 6; i < 8; i++) {
+        uint16_t y = (uint16_t)(DMG_UI_INGAME_LIST_START_Y + (uint16_t)i * DMG_UI_ITEM_HEIGHT);
+        ili9341_fill_rect(wx, y, ww, DMG_UI_ITEM_HEIGHT, DMG_RGB555_BG_COLOR);
+    }
+    ili9341_flush(true);
+
+    while (true) {
+        bool btn_up, btn_down, btn_left, btn_right, btn_a, btn_b, btn_select, btn_start;
+        dmg_read_ui_buttons(&btn_up, &btn_down, &btn_left, &btn_right, &btn_a, &btn_b, &btn_select, &btn_start);
+
+        bool pushed_up    = btn_up && !prev_up;
+        bool pushed_down  = btn_down && !prev_down;
+        bool pushed_left  = btn_left && !prev_left;
+        bool pushed_right = btn_right && !prev_right;
+        bool pushed_a     = btn_a && !prev_a;
+        bool pushed_b     = btn_b && !prev_b;
+
+        prev_up    = btn_up;
+        prev_down  = btn_down;
+        prev_left  = btn_left;
+        prev_right = btn_right;
+        prev_a     = btn_a;
+        prev_b     = btn_b;
+
+        if (pushed_up) {
+            uint8_t prev = cursor;
+            cursor = (cursor == 0) ? 5 : (cursor - 1);
+            draw_image_row(prev, false);
+            draw_image_row(cursor, true);
+        } else if (pushed_down) {
+            uint8_t prev = cursor;
+            cursor = (cursor == 5) ? 0 : (cursor + 1);
+            draw_image_row(prev, false);
+            draw_image_row(cursor, true);
+        }
+
+        if (pushed_left || pushed_right || pushed_a) {
+            if (cursor == 0) {
+                if (pushed_right || pushed_a) {
+                    persistent_scale_mode = (ili9341_scale_mode_t)((persistent_scale_mode + 1) % 3);
+                } else {
+                    persistent_scale_mode = (ili9341_scale_mode_t)((persistent_scale_mode == 0) ? 2 : (persistent_scale_mode - 1));
+                }
+                ili9341_set_scale_mode(persistent_scale_mode);
+                save_picones_config();
+                draw_image_row(0, true);
+            } else if (cursor == 1) {
+                persistent_scanlines_enabled = !persistent_scanlines_enabled;
+                ili9341_set_scanlines(persistent_scanlines_enabled);
+                save_picones_config();
+                draw_image_row(1, true);
+            } else if (cursor == 2) {
+                persistent_shimmerless_enabled = !persistent_shimmerless_enabled;
+                ili9341_set_shimmerless(persistent_shimmerless_enabled);
+                save_picones_config();
+                draw_image_row(2, true);
+            } else if (cursor == 3) {
+                persistent_interleave = !persistent_interleave;
+                ili9341_set_interleave(persistent_interleave);
+                save_picones_config();
+                draw_image_row(3, true);
+            } else if (cursor == 4) {
+                if (pushed_right || pushed_a) {
+                    persistent_crop_sides = (persistent_crop_sides + 1) % 3;
+                } else {
+                    persistent_crop_sides = (persistent_crop_sides == 0) ? 2 : (persistent_crop_sides - 1);
+                }
+                g_crop_sides = persistent_crop_sides;
+                ili9341_set_crop_sides(persistent_crop_sides);
+                save_picones_config();
+                draw_image_row(4, true);
+            } else if (cursor == 5) {
+                persistent_height_fill = !persistent_height_fill;
+                ili9341_set_height_fill(persistent_height_fill);
+                save_picones_config();
+                draw_image_row(5, true);
+            }
+        }
+
+        if (pushed_b) {
+            dmg_wait_for_all_buttons_released();
+            return;
+        }
+
+        tight_loop_contents();
+        sleep_ms(20);
+    }
+}
+
+static bool nes_save_state(const char *game_name, uint8_t slot) {
+    char state_path[DMG_STATE_PATH_MAX];
+    dmg_build_state_path("0:/saves/nes", game_name, slot, state_path, sizeof(state_path));
+    ensure_save_directories();
+    return (Emulator_SaveState(state_path) == 0);
+}
+
+static bool nes_load_state(const char *game_name, uint8_t slot) {
+    char state_path[DMG_STATE_PATH_MAX];
+    dmg_build_state_path("0:/saves/nes", game_name, slot, state_path, sizeof(state_path));
+    int res = Emulator_LoadState(state_path);
+    if (res != 0 && slot == 1) {
+        char legacy_path[DMG_STATE_PATH_MAX];
+        char base[64];
+        const char *slash = strrchr(game_name, '/');
+        const char *src = slash ? (slash + 1) : game_name;
+        strncpy(base, src, sizeof(base) - 1);
+        base[sizeof(base) - 1] = '\0';
+        char *dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
+        snprintf(legacy_path, sizeof(legacy_path), "0:/saves/nes/%s.ss", base);
+        res = Emulator_LoadState(legacy_path);
+        if (res != 0) {
+            snprintf(legacy_path, sizeof(legacy_path), "/saves/%s.ss", base);
+            res = Emulator_LoadState(legacy_path);
+        }
+    }
+    return (res == 0);
+}
+
+/* Slot probe for the shared menu's Load State row.
+ *
+ * The generic lookup covers <saves_dir>/<game>_<slot>.ss, which is the numbered
+ * file. Slot 1 additionally falls back to the unnumbered <game>.ss, exactly as
+ * nes_load_state() does, so that fallback is repeated here: without it the row
+ * would grey out slot 1 for a card whose only state predates the numbering. */
+static bool nes_state_exists(const char *game_name, uint8_t slot) {
+    if (slot < 1 || slot > 4) return false;
+
+    char state_path[DMG_STATE_PATH_MAX];
+    dmg_build_state_path("0:/saves/nes", game_name, slot, state_path, sizeof(state_path));
+    if (dmg_state_file_present(state_path)) return true;
+
+    if (slot == 1) {
+        char base[64];
+        dmg_sanitize_basename(game_name, base, sizeof(base));
+
+        char legacy_path[DMG_STATE_PATH_MAX];
+        snprintf(legacy_path, sizeof(legacy_path), "0:/saves/nes/%s.ss", base);
+        if (dmg_state_file_present(legacy_path)) return true;
+
+        snprintf(legacy_path, sizeof(legacy_path), "/saves/%s.ss", base);
+        if (dmg_state_file_present(legacy_path)) return true;
+    }
+    return false;
+}
+
+static void nes_apply_scale(dmg_scale_mode_t mode) {
+    persistent_scale_mode = (ili9341_scale_mode_t)mode;
+    ili9341_set_scale_mode(persistent_scale_mode);
+}
+
+static void nes_apply_effect(bool scanlines) {
+    persistent_scanlines_enabled = scanlines;
+    ili9341_set_scanlines(persistent_scanlines_enabled);
+}
+
+static void nes_apply_interleave(bool interleave) {
+    persistent_interleave = interleave;
+    ili9341_set_interleave(persistent_interleave);
+}
+
+static void nes_apply_speed(bool turbo) {
+    persistent_turbo_mode = turbo ? 1 : 0;
+}
+
+static void nes_apply_volume(uint8_t vol) {
+    set_sound_volume_level(vol);
+}
+
+static void nes_apply_brightness(uint8_t br) {
+    set_backlight_brightness(br);
+}
+
+static void nes_apply_filter(bool shimmerless) {
+    persistent_shimmerless_enabled = shimmerless;
+    ili9341_set_shimmerless(persistent_shimmerless_enabled);
+}
+
+/* FPS overlay hooks, defined after the descriptor that stores them. */
+#if USE_ILI9341
+static bool nes_get_fps(void);
+static void nes_apply_fps(bool on);
+#endif
+
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+static int nes_audio_free(void) { return EXT_AUDIO_GET_FREE(); }
+static void nes_audio_push(int16_t l, int16_t r) { EXT_AUDIO_ENQUEUE_SAMPLE(l, r); }
+static void nes_audio_restore(void) {
+    /* After the resume intro: ring empty, DMA idle, emulator's rate. */
+    audio_i2s_flush();
+    audio_i2s_update_pio_frequency(44100);
+}
+#endif
+
+static const dmg_emulator_desc_t s_nes_desc = {
+    .app_title            = "PicoNES",
+    .default_rom_dir      = "0:/roms/nes",
+    .candidate_dirs       = s_nes_candidate_dirs,
+    .config_path          = "0:/saves/nes/picones.cfg",
+    .config_fallback      = "/saves/nes/picones.cfg",
+    .saves_dir            = "0:/saves/nes",
+    .config_magic         = PICONES_CONFIG_MAGIC,
+    .is_rgb555            = true,
+    .display = {
+        .fill_rect        = ili9341_fill_rect,
+        .draw_text        = ili9341_text,
+        .flush_rows       = ili9341_flush_rows,
+        .fill_screen      = ili9341_fill_screen,
+        .flush            = ili9341_flush,
+        .stop_blitter     = ili9341_blitter_stop,
+        .start_blitter    = ili9341_blitter_start,
+#if USE_ILI9341
+        .write_rect_565   = ili9341_write_rect_565
+#endif
+    },
+    .is_rom_file          = is_nes_rom,
+    .on_load_rom          = nes_on_load_rom,
+    .save_state           = nes_save_state,
+    .load_state           = nes_load_state,
+    .apply_scale          = nes_apply_scale,
+    .apply_effect         = nes_apply_effect,
+    .apply_interleave     = nes_apply_interleave,
+    .apply_speed          = nes_apply_speed,
+    .apply_volume         = nes_apply_volume,
+    .apply_brightness     = nes_apply_brightness,
+    .apply_filter         = nes_apply_filter,
+    .reset_game           = NULL,
+    .exit_game            = saveNVRAM,
+    .custom_submenu_title = "Image >",
+    .custom_submenu       = nes_image_submenu,
+    /* save_picones_config(), not dmg_config_save(): the PicoNES config is a
+     * private struct with fields (crop_sides, height_fill) that dmg_config_t
+     * has no room for, so the shared writer would silently drop them. */
+    .save_config          = save_picones_config,
+#if USE_ILI9341
+    /* The FPS overlay is drawn by the ILI9341 driver, which only exists on the
+     * console build. On the HDMI/desktop build these stay NULL, which the combo
+     * layer treats as "no overlay to toggle" rather than an error. */
+    .get_fps              = nes_get_fps,
+    .apply_fps            = nes_apply_fps,
+#endif
+    /* Designated last because that is where it sits in the struct, and this file
+     * is C++. It applies to both builds: the state file is on the SD either way,
+     * so the Load State row greys the same slots. */
+    .state_exists         = nes_state_exists,
+#if USE_ILI9341 && EXT_AUDIO_IS_ENABLED
+    /* Resume intro chime, pushed from core 1 into the I2S ring. */
+    .audio_free           = nes_audio_free,
+    .audio_push           = nes_audio_push,
+    .audio_restore        = nes_audio_restore
+#endif
+};
+
+#if USE_ILI9341
+static bool nes_get_fps(void) {
+    return persistent_display_fps;
+}
+
+static void nes_apply_fps(bool on) {
+    /* No driver call here: on the ILI9341 path the overlay is drawn by the
+     * InfoNES display hook reading settings.flags.displayFrameRate, which is
+     * what the START+A handler did before the combo layer existed. Calling an
+     * ili9341_set_fps_overlay() would be wrong, since that driver has no such
+     * entry point in this build -- the string is formatted per frame where the
+     * overlay is composited (see the fpsString block in the draw path). */
+    persistent_display_fps = on;
+    settings.flags.displayFrameRate = persistent_display_fps;
+}
+#endif
+
+static void rom_file_selector(char *selectedRom) {
+    dmg_rom_selector(&s_nes_desc, selectedRom, 256);
+}
+
+static dmg_action_t ingame_menu(const char *game_name) {
+    return dmg_ingame_menu(&s_nes_desc, game_name);
 }
 
 static DWORD prevButtons[2]{};
@@ -426,6 +1238,78 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
         }
 #endif
 
+#if USE_ILI9341
+        if (i == 0)
+        {
+            static bool picodmg_buttons_inited = false;
+            if (!picodmg_buttons_inited)
+            {
+                for (int pin = 2; pin <= 9; pin++)
+                {
+                    gpio_init(pin);
+                    gpio_set_dir(pin, GPIO_IN);
+                    gpio_pull_up(pin);
+                }
+                picodmg_buttons_inited = true;
+            }
+            if (!gpio_get(2)) v |= UP;
+            if (!gpio_get(3)) v |= DOWN;
+            if (!gpio_get(4)) v |= LEFT;
+            if (!gpio_get(5)) v |= RIGHT;
+            if (!gpio_get(6)) v |= A;
+            if (!gpio_get(7)) v |= B;
+            if (!gpio_get(8)) v |= SELECT;
+            if (!gpio_get(9)) v |= START;
+        }
+#endif
+
+        // BOOTSEL is entered only from pico-bootLoader (SELECT+START+UP held at
+        // power-on), not from inside a game.
+
+        // Combos (player 1 only): SELECT+START leaves the game after a ~1 s
+        // hold, START+B opens the pause menu, START+A toggles the FPS overlay,
+        // SELECT+A toggles 1x/2x, SELECT+UP/DOWN is the volume. Read from the
+        // merged `v` rather than only from GPIO, so a USB or Wii pad gets the
+        // same shortcuts as the console buttons.
+        dmg_combo_events_t nes_combo;
+        if (i == 0)
+        {
+            dmg_pad_t pad_in;
+            pad_in.up     = (v & UP) != 0;
+            pad_in.down   = (v & DOWN) != 0;
+            pad_in.left   = (v & LEFT) != 0;
+            pad_in.right  = (v & RIGHT) != 0;
+            pad_in.a      = (v & A) != 0;
+            pad_in.b      = (v & B) != 0;
+            pad_in.select = (v & SELECT) != 0;
+            pad_in.start  = (v & START) != 0;
+
+            dmg_combo_frame(&pad_in, &s_nes_desc, &nes_combo);
+
+            // Write the masked pad back: a combo that consumed a button must
+            // not reach the emulated NES as a stray press.
+            v = 0;
+            if (pad_in.up)     v |= UP;
+            if (pad_in.down)   v |= DOWN;
+            if (pad_in.left)   v |= LEFT;
+            if (pad_in.right)  v |= RIGHT;
+            if (pad_in.a)      v |= A;
+            if (pad_in.b)      v |= B;
+            if (pad_in.select) v |= SELECT;
+            if (pad_in.start)  v |= START;
+
+            if (nes_combo.request_exit_game) s_request_exit_game  = true;
+            if (nes_combo.request_pause_menu) s_request_pause_menu = true;
+            if (nes_combo.request_power_off) {
+                s_request_power_off = true;
+                s_power_reason = nes_combo.power_reason;
+            }
+            if (nes_combo.speed_toggled) {
+                printf("[I] Combo SELECT+A: speed = %s\n",
+                       persistent_turbo_mode ? "2x" : "1x");
+            }
+        }
+
         int rv = v;
         rapidFireMask[i] = (settings.flags.rapidFireOnA ? A : 0) |
                            (settings.flags.rapidFireOnB ? B : 0);
@@ -437,35 +1321,13 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
 
         dst = rv;
 
-        // Reboot to BOOTSEL mode for flashing (player 1 only)
-        if (i == 0 && (v & (SELECT | START | UP | A)) == (SELECT | START | UP | A)) {
-             reset_usb_boot(0, 0);
-        }
-
         auto p1 = v;
 
         auto pushed = v & ~prevButtons[i];
 
         if (p1 & START)
         {
-            if (pushed & A) // Toggle frame rate
-            {
-                settings.flags.displayFrameRate = !settings.flags.displayFrameRate;
-                // FrensSettings::savesettings();
-            } else if (pushed & B)
-            {
-#if PICO_RP2350
-               if (Frens::isPsramEnabled() && !SoundRecorder::isRecording()) {
-                     SoundRecorder::startRecording();
-               } 
-#endif
-            } else if (pushed & UP) {
-                loadSaveStateMenu = true;
-                quickSaveAction = SaveStateTypes::LOAD;
-            } else if (pushed & DOWN) {
-                loadSaveStateMenu = true;
-                quickSaveAction = SaveStateTypes::SAVE;
-            } else if (pushed & LEFT) {
+            if (pushed & LEFT) {
 #if HW_CONFIG == 8
                settings.fruitjamVolumeLevel = std::max(-63, settings.fruitjamVolumeLevel - 1);
                EXT_AUDIO_SETVOLUME(settings.fruitjamVolumeLevel);
@@ -477,18 +1339,9 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
 #endif
             }
         }
-        // if (p1 & UP) {
-        //     if (pushed & SELECT) {
-        //         loadSaveStateMenu = true;
-        //         quickSaveAction = SaveStateTypes::LOAD;
-        //     }
-        //     if (pushed & START) {
-        //         loadSaveStateMenu = true;
-        //         quickSaveAction = SaveStateTypes::SAVE;
-        //     }
-        // }
         if (p1 & SELECT && !IsNSF)
         {
+#if !USE_ILI9341
             if (pushed & START)
             {
                 // saveNVRAM();
@@ -496,24 +1349,12 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                 FrensSettings::savesettings();
                 showSettings = true;
             }
-            if (pushed & A)
-            {            
-               rapidFireMask[i] ^= io::GamePadState::Button::A;
-               //g_dvi_audio_gain_q8 = g_dvi_audio_gain_q8 == DVI_AUDIO_GAIN_Q8 ? 256 : DVI_AUDIO_GAIN_Q8;
-            }
+#endif
             if (pushed & B)
             {
-                
-                rapidFireMask[i] ^= io::GamePadState::Button::B;
-               
+               rapidFireMask[i] ^= io::GamePadState::Button::B;
             }
-            if (pushed & UP)
-            {
-                scaleMode8_7_ = Frens::screenMode(-1);
-            } else if (pushed & DOWN)
-            {
-                scaleMode8_7_ = Frens::screenMode(+1);
-            } else if (pushed & LEFT)
+            if (pushed & LEFT)
             {
                 // Toggle audio output, ignore if HSTX is enabled, because HSTX must use external audio
 #if EXT_AUDIO_IS_ENABLED && !HSTX
@@ -788,6 +1629,8 @@ int __not_in_flash_func(InfoNES_GetSoundBufferSize)()
         return 0;
     // Each DI packet carries 4 audio samples; use shift for fast multiply.
     return free_packets << 2;
+#elif USE_ILI9341
+    return 1024;
 #else
     // Non-HSTX path: return available ring buffer capacity directly.
     return dvi_->getAudioRingBuffer().getFullWritableSize();
@@ -835,6 +1678,12 @@ static inline void recordSampleToSoundRecorder(int l, int r)
 #endif
 }
 
+#if USE_ILI9341
+#if EXT_AUDIO_IS_ENABLED
+static uint32_t s_audio_batch[1024];
+static int s_audio_batch_len = 0;
+#endif
+
 void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wave2, BYTE *wave3, BYTE *wave4, BYTE *wave5, BYTE *wave6)
 {
     // DC blocker state. Larger shift = slower response / more low-frequency
@@ -843,7 +1692,52 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
     static int32_t dc_r = 0;
     constexpr int DC_FILTER_SHIFT = 10;
 
-#if !HSTX
+#if EXT_AUDIO_IS_ENABLED
+    for (int i = 0; i < samples; ++i)
+    {
+        int w1 = wave1[i];
+        int w2 = wave2[i];
+        int w3 = wave3[i];
+        int w4 = wave4[i];
+        int w5 = wave5[i];
+        int w6 = wave6 ? wave6[i] : 0;
+
+        int raw_l = w1 * 6 + w2 * 3 + w3 * 5 + w4 * 51 + w5 * 80 + w6 * 18;
+        int raw_r = w1 * 6 + w2 * 3 + w3 * 5 + w4 * 51 + w5 * 80 + w6 * 18;
+
+        dc_l += (raw_l - dc_l) >> DC_FILTER_SHIFT;
+        dc_r += (raw_r - dc_r) >> DC_FILTER_SHIFT;
+
+        int out_l = (raw_l - dc_l) * 2;
+        int out_r = (raw_r - dc_r) * 2;
+        if (persistent_volume_level < 5)
+        {
+            out_l = (out_l * (int)persistent_volume_level) / 5;
+            out_r = (out_r * (int)persistent_volume_level) / 5;
+        }
+#if PICO_RP2350
+        recordSampleToSoundRecorder(out_l, out_r);
+#endif
+        if (s_audio_batch_len < 1024)
+        {
+            s_audio_batch[s_audio_batch_len++] = ((uint32_t)(uint16_t)(int16_t)out_l << 16) | (uint16_t)(int16_t)out_r;
+        }
+#if ENABLE_VU_METER
+        if (settings.flags.enableVUMeter)
+        {
+            addSampleToVUMeter(out_l);
+        }
+#endif
+    }
+
+    if (s_audio_batch_len >= 512)
+    {
+        EXT_AUDIO_ENQUEUE_SAMPLES(s_audio_batch, s_audio_batch_len);
+        s_audio_batch_len = 0;
+    }
+#endif
+    return;
+#elif !HSTX
 #if EXT_AUDIO_IS_ENABLED
     if (settings.flags.useExtAudio)
     {
@@ -961,7 +1855,12 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
         }
     #endif
 
-    #if EXT_AUDIO_IS_ENABLED
+    #if USE_ILI9341
+        #if EXT_AUDIO_IS_ENABLED
+            EXT_AUDIO_ENQUEUE_SAMPLE((int16_t)out_l, (int16_t)out_r);
+        #endif
+            continue;
+    #elif EXT_AUDIO_IS_ENABLED
         if (settings.flags.useExtAudio || audioJackConnected)
         {
             EXT_AUDIO_ENQUEUE_SAMPLE((int16_t)out_l, (int16_t)out_r);
@@ -989,6 +1888,27 @@ extern WORD PC;
 //         when no framebuffer is available — see fallback at the call site.
 static void paceFrame(bool init)
 {
+    if (persistent_turbo_mode)
+    {
+        static absolute_time_t next_turbo_time;
+        static bool turbo_inited = false;
+        if (init || !turbo_inited)
+        {
+            next_turbo_time = make_timeout_time_us(8333);
+            turbo_inited = true;
+        }
+        if (time_reached(next_turbo_time))
+        {
+            next_turbo_time = make_timeout_time_us(8333);
+        }
+        else
+        {
+            sleep_until(next_turbo_time);
+            next_turbo_time = delayed_by_us(next_turbo_time, 8333);
+        }
+        return;
+    }
+
     if (!InfoNES_IsPal())
     {
         Frens::PaceFrames60fps(init);
@@ -1021,20 +1941,72 @@ static void paceFrame(bool init)
 
 int InfoNES_LoadFrame()
 {
-//      if (pendingLoadState) {         // perform at frame start
-//         pendingLoadState = false;
-//         printf("Loading state...\n");
-//         if (Emulator_LoadState("/slot0.state") == 0) {
-//             printf("State loaded.\n");
-// #if FRAMEBUFFERISPOSSIBLE
-//             if (Frens::isFrameBufferUsed()) {
-//                 memset(Frens::framebuffer, 0, sizeof(Frens::framebuffer));
-//             }
-// #endif
-//         } else {
-//             printf("State load failed.\n");
-//         }
-//     }
+#if USE_ILI9341
+    /* Waking from standby: the game was started fresh, now put it back where
+     * it was. Done at the first frame boundary, the same place the pause menu
+     * loads a state from, with the blitter parked like it does. */
+    if (s_resume_load_pending)
+    {
+        s_resume_load_pending = false;
+        ili9341_blitter_stop();
+        const bool ok = nes_load_state(romName, DMG_RESUME_SLOT);
+        printf("[resume] state %s\n", ok ? "restored" : "missing, starting fresh");
+        dmg_resume_consume();
+        ili9341_blitter_start();
+        ili9341_set_scanlines(persistent_scanlines_enabled);
+        paceFrame(true);
+    }
+
+    /* Power switch OFF (or battery cutoff): save at this frame boundary and
+     * sleep. Never returns -- the wake reboots into the code above. */
+    if (s_request_power_off)
+    {
+        s_request_power_off = false;
+        ili9341_blitter_stop();
+        dmg_power_off_with_resume(&s_nes_desc, (dmg_power_reason_t)s_power_reason);
+    }
+#endif
+
+    if (s_request_pause_menu)
+    {
+        s_request_pause_menu = false;
+        ili9341_blitter_stop();
+        ingame_action_e action = ingame_menu(romName);
+        if (action == INGAME_ACTION_RESET)
+        {
+            resetGame = true;
+            return -1;
+        }
+        else if (action == INGAME_ACTION_EXIT)
+        {
+            saveNVRAM();
+            return -1;
+        }
+        else
+        {
+            ili9341_blitter_start();
+            ili9341_set_scanlines(persistent_scanlines_enabled);
+            paceFrame(true);
+        }
+    }
+
+    if (s_request_exit_game)
+    {
+        s_request_exit_game = false;
+        saveNVRAM();
+        return -1;
+    }
+
+#if USE_ILI9341
+#if EXT_AUDIO_IS_ENABLED
+    if (s_audio_batch_len > 0)
+    {
+        EXT_AUDIO_ENQUEUE_SAMPLES(s_audio_batch, s_audio_batch_len);
+        s_audio_batch_len = 0;
+    }
+#endif
+    ili9341_submit_frame();
+#endif
     paceFrame(false);
     //Frens::waitForVSync();
     Frens::pollHeadPhoneJack();
@@ -1052,7 +2024,9 @@ int InfoNES_LoadFrame()
     nespad_read_start();
 #endif
     auto count =
-#if !HSTX
+#if USE_ILI9341
+        0;
+#elif !HSTX
         dvi_->getFrameCounter();
 #else
         hstx_getframecounter();
@@ -1137,14 +2111,18 @@ int InfoNES_LoadFrame()
 
 namespace
 {
-#if !HSTX
+#if USE_ILI9341
+    WORD *currentLineBuffer_{nullptr};
+    WORD *currentLineBuf{nullptr};
+    static WORD s_nes_workline[320];
+#elif !HSTX
     dvi::DVI::LineBuffer *currentLineBuffer_{};
     WORD *currentLineBuf{nullptr};
 #else
     WORD *currentLineBuffer_{nullptr};
 #endif
 }
-#if !HSTX
+#if !HSTX && !USE_ILI9341
 void __not_in_flash_func(drawWorkMeterUnit)(int timing,
                                             [[maybe_unused]] int span,
                                             uint32_t tag)
@@ -1314,7 +2292,11 @@ static void nsfRenderLine(WORD *buf, int line)
 
 void __not_in_flash_func(InfoNES_PreDrawLine)(int line)
 {
-#if !HSTX
+#if USE_ILI9341
+    (void)line;
+    currentLineBuf = s_nes_workline;
+    InfoNES_SetLineBuffer(currentLineBuf, 256);
+#elif !HSTX
 
     WORD *buff;
 // b.size --> 640
@@ -1350,7 +2332,7 @@ void __not_in_flash_func(InfoNES_PreDrawLine)(int line)
 
 void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
 {
-#if !HSTX
+#if !HSTX && !USE_ILI9341
 #if !defined(NDEBUG)
     util::WorkMeterMark(0xffff);
     drawWorkMeter(line);
@@ -1361,7 +2343,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     if (IsNSF)
     {
         WORD *buf =
-#if !HSTX
+#if USE_ILI9341
+            currentLineBuf;
+#elif !HSTX
             currentLineBuf == nullptr ? currentLineBuffer_->data() : currentLineBuf;
 #else
             currentLineBuffer_;
@@ -1394,7 +2378,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
         }
 #endif
         WORD *fpsBuffer =
-#if !HSTX
+#if USE_ILI9341
+            currentLineBuf + 40;
+#elif !HSTX
             currentLineBuf == nullptr ? currentLineBuffer_->data() + 40 : currentLineBuf + 40;
 #else
             currentLineBuffer_ + 40;
@@ -1432,7 +2418,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     if (line >= 16 && line < 24)
     {
         WORD *zapBuffer =
-#if !HSTX
+#if USE_ILI9341
+            currentLineBuf + 32;
+#elif !HSTX
             currentLineBuf == nullptr ? currentLineBuffer_->data() + 32 : currentLineBuf + 32;
 #else
             currentLineBuffer_ + 32;
@@ -1460,7 +2448,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     // single flat white frame, so the only thing the gun can see is the flash.
     {
         WORD *mbuf =
-#if !HSTX
+#if USE_ILI9341
+            currentLineBuf;
+#elif !HSTX
             currentLineBuf == nullptr ? currentLineBuffer_->data() : currentLineBuf;
 #else
             currentLineBuffer_;
@@ -1472,7 +2462,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     }
 #endif
 
-#if !HSTX
+#if USE_ILI9341
+    ili9341_stream_nes_line(line, currentLineBuf);
+#elif !HSTX
 #if FRAMEBUFFERISPOSSIBLE
     if (!Frens::isFrameBufferUsed())
     {
@@ -1522,7 +2514,7 @@ int InfoNES_Menu()
 
 int main()
 {
-    char selectedRom[FF_MAX_LFN];
+    char selectedRom[FF_MAX_LFN + 1];
 
     romName = selectedRom;
     ErrorMessage[0] = selectedRom[0] = 0;
@@ -1540,6 +2532,17 @@ int main()
     }
 #endif
     Frens::setClocksAndStartStdio(CPUFreqKHz, voltage);
+#if USE_ILI9341
+    /* Decouple SPI peripheral clock from CPU clock (252 MHz):
+     * Route clk_peri to PLL_USB at 160 MHz (VCO 960 MHz, postdiv 6*1 = 6)
+     * so divisor 2 gives an exact 80 MHz SPI clock for ILI9341/ST7789. */
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+    pll_init(pll_usb, 1, 960 * MHZ, 6, 1);
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                    160 * MHZ, 160 * MHZ);
+#endif
+    init_ui_buttons();
 
     printf("==========================================================================================\n");
     printf("Pico-InfoNES+ %s\n", SWVERSION);
@@ -1574,6 +2577,47 @@ int main()
     //     - Top and bottom margins are reset to zero
     isFatalError = !Frens::initAll(selectedRom, CPUFreqKHz, 4, 4, AUDIOBUFFERSIZE, false, true);
 
+#if USE_ILI9341
+    dmg_init_boot_mode();
+    load_picones_config();
+    set_backlight_brightness(persistent_brightness_level);
+    set_sound_volume_level(persistent_volume_level);
+    ili9341_set_scale_mode(persistent_scale_mode);
+    ili9341_set_scanlines(persistent_scanlines_enabled);
+    ili9341_set_interleave(persistent_interleave);
+    g_crop_sides = persistent_crop_sides;
+    ili9341_set_crop_sides(persistent_crop_sides);
+    ili9341_set_height_fill(persistent_height_fill);
+    settings.flags.displayFrameRate = persistent_display_fps;
+    selectedRom[0] = 0;
+
+    /* Standby by save state: the power switch saves and sleeps instead of
+     * idling awake, and a wake reboots back here. */
+    dmg_power_enable_resume(&s_nes_desc);
+    {
+        dmg_resume_record_t rec;
+        const dmg_resume_kind_t rk = dmg_resume_check(&s_nes_desc, &rec);
+        if (rk == DMG_RESUME_GAME) {
+            /* The bootloader skipped its intro; play it here while the ROM
+             * loads on this core. The state goes in at the first frame. */
+            dmg_boot_intro_start(&s_nes_desc);
+            if (nes_on_load_rom(&s_nes_desc, rec.rom_file)) {
+                snprintf(selectedRom, sizeof(selectedRom), "%s", rec.rom_file);
+                s_resume_load_pending = true;
+                dmg_power_arm_menu_loaded(1000);
+            } else {
+                printf("[resume] ROM %s did not load: ROM selector\n", rec.rom_file);
+                dmg_resume_consume();
+            }
+        } else if (rk == DMG_RESUME_MENU) {
+            dmg_resume_consume();
+            /* Woke in the ROM selector: nothing to load, so the bootloader's
+             * intro just plays out before the list is drawn. */
+            if (dmg_boot_intro_start(&s_nes_desc)) dmg_boot_intro_finish();
+        }
+    }
+#endif
+
     scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
     initzapper();       // Claims GPIO27/28 as pulled-up inputs (custom PCB only)
     zapperMeasureInit(); // Display-lag measurement, compiled out by default
@@ -1598,6 +2642,10 @@ int main()
     g_available_screen_modes = g_available_screen_modes_nes;
     while (true)
     {
+#if USE_ILI9341
+        /* No-op unless a resume intro is playing: wait for it, free core 1. */
+        dmg_boot_intro_finish();
+#endif
 #if EMBEDDED_NES_ROM
         ROM_FILE_ADDR = (uintptr_t)embedded_nes_rom;
         strcpy(selectedRom, "Embedded");
@@ -1607,6 +2655,10 @@ int main()
 #else
         if (strlen(selectedRom) == 0)
         {
+#if USE_ILI9341
+            rom_file_selector(selectedRom);
+            printf("Playing selected ROM from Clean Light menu: %s\n", selectedRom);
+#else
 #if PICO_RP2350
             const char *romExtensions = ".nes .fds .nsf";
 #else
@@ -1614,7 +2666,7 @@ int main()
 #endif
             menu("Pico-InfoNES+", ErrorMessage, isFatalError, showSplash, romExtensions, selectedRom); // With no psram this never returns, but reboots upon selecting a game
             printf("Playing selected ROM from menu: %s\n", selectedRom);
-          
+#endif
         }
         // Lagrange Point
         //  0x743387FF = Lagrange Point (Japan) (Rev A)
@@ -1684,7 +2736,9 @@ int main()
                 romSelector_.initRaw(ROM_FILE_ADDR);
             }
             else if (!romSelector_.init(ROM_FILE_ADDR) ) {
+                printf("[E] Not a NES ROM file at 0x%08x\n", (unsigned)ROM_FILE_ADDR);
                 strcpy(ErrorMessage, "Not a NES ROM file.");
+                selectedRom[0] = 0;
                 break;
             }
 
@@ -1713,16 +2767,32 @@ int main()
             // first launch (showSplash is true); resets keep the link up.
             // This also benefits RP2040/RP2350: .nsf files don't clip sound at the start, roms that 
             // start with sound also don't clip sound.
+#if !USE_ILI9341
             if (showSplash && !Frens::isPsramEnabled())
             {
                 showSplash = false;
                 printf("Feeding blank frames for display sync...\n");
                 menuPumpBlankFrames(180);
             }
+#endif
             paceFrame(true); // reset pacing to avoid burst of frames if resetGame is true
+#if USE_ILI9341
+            ili9341_blitter_start();
+            ili9341_set_scanlines(settings.flags.scanlineOn);
+#endif
+            /* Drop any half-finished SELECT+START hold or closed edge latch
+             * left over from the previous run. Without this, the hold counter
+             * survives a soft reset and a reset game could exit on the first
+             * frame if both buttons happened to still be down. */
+            dmg_combo_reset();
+            dmg_power_set_game(selectedRom, romName);
             InfoNES_Main(region);
+#if USE_ILI9341
+            ili9341_blitter_stop();
+#endif
 
         } while (resetGame);
+        dmg_power_set_game(NULL, NULL);
 #if !EMBEDDED_NES_ROM
         selectedRom[0] = 0;
 #endif

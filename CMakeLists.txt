@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-set(projectname piconesPlus)
+set(projectname PicoNES)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -43,13 +43,41 @@ message("* Current build type is : ${CMAKE_BUILD_TYPE}")
 # ---------------------------------------------------------------------------
 # Hardware / board selection (project-specific)
 # ---------------------------------------------------------------------------
-if(NOT HW_CONFIG)
+if(NOT DEFINED USE_ILI9341)
+    set(USE_ILI9341 0 CACHE STRING "Use ILI9341 SPI TFT display instead of DVI/HSTX")
+endif()
+
+if(USE_ILI9341 AND NOT HW_CONFIG)
+    set(HW_CONFIG 15 CACHE STRING "Select the hardware configuration for your board")
+elseif(NOT HW_CONFIG)
     set(HW_CONFIG 8 CACHE STRING "Select the hardware configuration for your board")
 endif()
 
 if(NOT USE_HSTX)
     set(USE_HSTX 1 CACHE STRING "Use HSTX for display output when possible")
 endif()
+
+# ---------------------------------------------------------------------------
+# Fallback panel when /boot.txt is absent or has no ST7789= key.
+#
+# The panel itself is a runtime choice read by shared_menu/dmg_panel.c, not a
+# build choice, so this only decides what a card with no /boot.txt gets.
+# Defaults to 0 (ILI9341) so every existing build keeps its current display; a
+# build that can only be an ST7789 -- such as the HW_CONFIG 16 console build --
+# overrides it with -DDEFAULT_PANEL_ST7789=1.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED DEFAULT_PANEL_ST7789)
+    set(DEFAULT_PANEL_ST7789 0 CACHE STRING
+        "Fallback panel when /boot.txt is absent: 0=ILI9341 1=ST7789")
+endif()
+if(HW_CONFIG EQUAL 16 AND NOT DEFAULT_PANEL_ST7789)
+    # The Core2350B console is an ST7789, so a card with a missing or
+    # ST7789-less /boot.txt would otherwise come up on the wrong driver and
+    # show nothing at all. Matches the bootloader's default for this board.
+    set(DEFAULT_PANEL_ST7789 1 CACHE STRING
+        "Fallback panel when /boot.txt is absent: 0=ILI9341 1=ST7789" FORCE)
+endif()
+message("* Fallback display panel (no ST7789= in /boot.txt): ${DEFAULT_PANEL_ST7789}")
 
 include("pico_shared/BoardConfigs.cmake")
 
@@ -288,6 +316,15 @@ target_compile_definitions(${projectname} PRIVATE
     ENABLEDVI=1
     DOUBLEFRAMEBUFFER=0
     NES_OVERCLOCK_FIX=1
+    USE_ILI9341=${USE_ILI9341}
+    ILI9341_PIN_CS=${ILI9341_PIN_CS}
+    ILI9341_PIN_SCK=${ILI9341_PIN_SCK}
+    ILI9341_PIN_MOSI=${ILI9341_PIN_MOSI}
+    ILI9341_PIN_DC=${ILI9341_PIN_DC}
+    ILI9341_PIN_RST=${ILI9341_PIN_RST}
+    ILI9341_PIN_BL=${ILI9341_PIN_BL}
+    ILI9341_SPI_INST=${ILI9341_SPI_INST}
+    DMG_DEFAULT_PANEL_ST7789=${DEFAULT_PANEL_ST7789}
     #HSTX_DEBUG=1
 )
 
@@ -390,6 +427,9 @@ target_link_libraries(${projectname} PRIVATE
     hardware_interp
     hardware_timer
     hardware_clocks
+    hardware_xosc
+    hardware_adc
+    hardware_rosc
     hardware_pwm
     hardware_flash
     dvi
@@ -405,9 +445,21 @@ if(PICO_BOARD STREQUAL "pico_w" OR PICO_BOARD STREQUAL "pico2_w")
     target_link_libraries(${projectname} PRIVATE pico_cyw43_arch_none)
 endif()
 
+target_sources(${projectname} PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_menu.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_panel.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_combo.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_power.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_battery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_resume.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_boot_intro.c
+)
+
 target_include_directories(${projectname} PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu
     pico_lib
     pico_shared
+    pico_shared/drivers/ili9341
     infones
     tusb_xinput
     .

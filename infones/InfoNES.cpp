@@ -197,6 +197,7 @@ BYTE PPU_MidFrameAddrWrite;
 
 /* Up and Down Clipping Flag ( 0: non-clip, 1: clip ) */
 BYTE PPU_UpDown_Clip;
+BYTE g_crop_sides = 1;
 
 /* Frame IRQ ( 0: Disabled, 1: Enabled )*/
 BYTE FrameIRQ_Enable;
@@ -983,7 +984,11 @@ int __not_in_flash_func(InfoNES_HSync)()
   if (FrameCnt == 0 &&
       PPU_ScanTable[PPU_Scanline] == SCAN_ON_SCREEN)
   {
+#if USE_ILI9341
+    if (PPU_Scanline >= 0 && PPU_Scanline < 240)
+#else
     if (PPU_Scanline >= 4 && PPU_Scanline < 240 - 4)
+#endif
     {
       InfoNES_PreDrawLine(PPU_Scanline);
       /* NSF mode has no PPU work — InfoNES_PostDrawLine paints the
@@ -1070,7 +1075,7 @@ int __not_in_flash_func(InfoNES_HSync)()
     if (FrameCnt == 0)
     {
       // Transfer the contents of work frame on the screen
-      InfoNES_LoadFrame();
+      if (InfoNES_LoadFrame() < 0) return -1;
 
 #if 0
         // Switching of the double buffer
@@ -1589,12 +1594,15 @@ void __not_in_flash_func(InfoNES_DrawLine)()
     /*-------------------------------------------------------------------*/
     /*  Backgroud Clipping                                               */
     /*-------------------------------------------------------------------*/
-    if (!(PPU_R1 & R1_CLIP_BG))
+    if (g_crop_sides == 1)
     {
-      WORD *pPointTop;
-
-      // pPointTop = &WorkFrame[PPU_Scanline * NES_DISP_WIDTH];
-      pPointTop = WorkLine;
+      WORD *pPointTop = WorkLine;
+      InfoNES_MemorySet(pPointTop, 0, 8 << 1);
+      InfoNES_MemorySet(&pPointTop[248], 0, 8 << 1);
+    }
+    else if (g_crop_sides == 0 && !(PPU_R1 & R1_CLIP_BG))
+    {
+      WORD *pPointTop = WorkLine;
       InfoNES_MemorySet(pPointTop, 0, 8 << 1);
     }
 
@@ -1863,12 +1871,15 @@ void __not_in_flash_func(InfoNES_DrawLine)()
     /*-------------------------------------------------------------------*/
     /*  Sprite Clipping                                                  */
     /*-------------------------------------------------------------------*/
-    if (!(PPU_R1 & R1_CLIP_SP))
+    if (g_crop_sides == 1)
     {
-      WORD *pPointTop;
-
-      // pPointTop = &WorkFrame[PPU_Scanline * NES_DISP_WIDTH];
-      pPointTop = WorkLine;
+      WORD *pPointTop = WorkLine;
+      InfoNES_MemorySet(pPointTop, 0, 8 << 1);
+      InfoNES_MemorySet(&pPointTop[248], 0, 8 << 1);
+    }
+    else if (g_crop_sides == 0 && !(PPU_R1 & R1_CLIP_SP))
+    {
+      WORD *pPointTop = WorkLine;
       InfoNES_MemorySet(pPointTop, 0, 8 << 1);
     }
 

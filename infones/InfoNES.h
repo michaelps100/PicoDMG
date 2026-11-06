@@ -116,6 +116,7 @@ extern BYTE PPU_MidFrameAddrWrite;
 
 extern BYTE PPU_Latch_Flag;
 extern BYTE PPU_UpDown_Clip;
+extern BYTE g_crop_sides; /* 0 = Off, 1 = 8px Mask (L+R), 2 = 8px Fill */
 
 #define R0_NMI_VB 0x80
 #define R0_NMI_SP 0x40
