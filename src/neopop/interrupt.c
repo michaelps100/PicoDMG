@@ -1,4 +1,5 @@
 #pragma GCC optimize("Ofast")
+#pragma GCC section text=".time_critical"
 //---------------------------------------------------------------------------
 // NEOPOP : Emulator as in Dreamland
 //
@@ -91,6 +92,10 @@
 #include "Z80_interface.h"
 #include "dma.h"
 
+extern void ili9341_stream_ngp_line(int line, const _u16 *ngp_line_160);
+extern BOOL ili9341_is_active_ngp_line(int line);
+extern void ili9341_stream_ngp_frame_end(void);
+
 //=============================================================================
 
 _u32 timer_hint;
@@ -98,14 +103,18 @@ _u32 timer_clock0, timer_clock1, timer_clock2, timer_clock3;
 _u8 timer[4];	//Up-counters
 
 BOOL gfx_hack = FALSE;
+_u8 system_frameskip_key = 1;
 
 //=============================================================================
 
 static BOOL h_int = FALSE, timer0, timer2;
 
+#include "pico.h"
+#include "ngp_prof.h"
+
 //=============================================================================
 
-void interrupt(_u8 index)
+void __not_in_flash_func(interrupt)(_u8 index)
 {
 	push32(pc);
 	push16(sr);
@@ -125,7 +134,7 @@ void interrupt(_u8 index)
 
 //=============================================================================
 
-static __inline void gfx_hint(void)
+static inline __attribute__((always_inline)) void gfx_hint(void)
 {
 	//H_Int / Delayed settings
 	if ((ram[0x8009] < SCREEN_HEIGHT-1 || ram[0x8009] == 198))
@@ -138,23 +147,38 @@ static __inline void gfx_hint(void)
 	}
 }
 
-static __inline void gfx_draw(void)
+
+static inline __attribute__((always_inline)) void gfx_draw(void)
 {
 	if (frameskip_count == 0)
 	{
 		//Draw the scanline
 		if (ram[0x8009] < SCREEN_HEIGHT)
 		{
+
+			if (!ili9341_is_active_ngp_line(ram[0x8009]))
+				return;
+
+#if NGP_PROFILE
+			const _u32 prof_t0 = time_us_32();
+#endif
 			if (ram[0x6F95] == 0x10)	gfx_draw_scanline_colour();
 			else						gfx_draw_scanline_mono();
+#if NGP_PROFILE
+			ngp_prof_gfx_us += time_us_32() - prof_t0;
+#endif
+			ili9341_stream_ngp_line(ram[0x8009], cfb_scanline);
+#if NGP_PROFILE
+			ngp_prof_gfx++;
+			ngp_prof_lines++;
+#endif
 		}
 	}
 }
 
-void updateTimers(_u8 cputicks)
+void __not_in_flash_func(updateTimers_slow)(_u8 cputicks)
 {
-	//increment H-INT timer
-	timer_hint += cputicks;
+	// timer_hint jÃ¡ foi incrementado no fast-path inline updateTimers()
 
 	//=======================
 
@@ -192,6 +216,7 @@ void updateTimers(_u8 cputicks)
 			frameskip_count = (frameskip_count + 1) % system_frameskip_key;
 
 			ram[0x8010] = 0x40;	//Character Over / Vblank Status
+			ili9341_stream_ngp_frame_end();
 			system_VBL();	//Update the screen
 
 			//Vertical Interrupt? (Confirmed IRQ Level)
@@ -211,15 +236,23 @@ void updateTimers(_u8 cputicks)
 		{
 			ram[0x8009] = 0;
 			ram[0x8010] = 0;	//Character Over / Vblank Status
+			extern bool s_sprites_cached_this_frame;
+			extern bool s_sprites_cached_this_frame_mono;
+			s_sprites_cached_this_frame = false;
+			s_sprites_cached_this_frame_mono = false;
 		}
 	}
 
 	//=======================
 
-	//Tick the Clock Generator
-	timer_clock0 += cputicks;
-	timer_clock1 += cputicks;
-	
+	//Quick rejection: if none of timers 0..3 are enabled (TRUN), return immediately
+	if ((ram[0x20] & 0x0F) == 0)
+		return;
+
+	/* The four clock generators are accumulated by the inline fast path in
+	 * interrupt.h, which also decides whether this function is worth calling
+	 * at all. Do not accumulate again here. */
+
 	timer0 = FALSE;	//Clear the timer0 tick, for timer1 chain mode.
 
 	//=======================
@@ -331,9 +364,7 @@ void updateTimers(_u8 cputicks)
 
 	//=======================
 
-	//Tick the Clock Generator
-	timer_clock2 += cputicks;
-	timer_clock3 += cputicks;
+	/* timer_clock2/3 are accumulated by the inline fast path in interrupt.h. */
 
 	timer2 = FALSE;	//Clear the timer2 tick, for timer3 chain mode.
 
@@ -348,7 +379,7 @@ void updateTimers(_u8 cputicks)
 		case 0:	// -
 				break;
 
-		case 1:	if (timer_clock2 >= 56/*TIMER_T1_RATE*/)	//HACK - Fixes DAC
+		case 1:	if (timer_clock2 >= (TIMER_T1_RATE / 2))
 				{
 					timer[2]++;
 					timer_clock2 = 0;

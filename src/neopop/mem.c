@@ -182,7 +182,7 @@ static inline void* translate_address_read(_u32 address)
 
 	//BIOS Access?
 	if ((address & 0xFF0000) == 0xFF0000)
-		return bios + (address & 0xFFFF); // BIOS ROM
+		return (_u8*)(bios + (address & 0xFFFF)); // BIOS ROM
 
 	// ===================================
 
@@ -300,8 +300,8 @@ void post_write(_u32 address)
 		if (address == 0xA0)	Write_SoundChipNoise(ram[0xA0]);
 	}
 
-	//DAC Write
-	if (address == 0xA2)	dac_write();
+	//DAC Write (0xA2 Left, 0xA3 Right)
+	if (address == 0xA2 || address == 0xA3)	dac_write();
 
 	//Clear counters?
 	if (address == 0x20)
@@ -321,7 +321,7 @@ void post_write(_u32 address)
 
 //=============================================================================
 
-__always_inline _u8 loadB(_u32 address)
+__always_inline _u8 mem_slow_loadB(_u32 address)
 {
 	_u8* ptr = translate_address_read(address);
 	if (ptr == NULL)
@@ -330,7 +330,7 @@ __always_inline _u8 loadB(_u32 address)
 		return *ptr;
 }
 
-__always_inline _u16 loadW(_u32 address)
+__always_inline _u16 mem_slow_loadW(_u32 address)
 {
 	_u8* ptr = translate_address_read(address);
 
@@ -341,7 +341,7 @@ __always_inline _u16 loadW(_u32 address)
     }
 }
 
-__always_inline _u32 loadL(_u32 address)
+__always_inline _u32 mem_slow_loadL(_u32 address)
 {
 
 	_u8* ptr = translate_address_read(address);
@@ -354,7 +354,7 @@ __always_inline _u32 loadL(_u32 address)
 
 //=============================================================================
 
-__always_inline void storeB(_u32 address, _u8 data)
+__always_inline void mem_slow_storeB(_u32 address, _u8 data)
 {
 	_u8* ptr = translate_address_write(address);
 
@@ -366,7 +366,7 @@ __always_inline void storeB(_u32 address, _u8 data)
 	}
 }
 
-__always_inline void storeW(_u32 address, _u16 data)
+__always_inline void mem_slow_storeW(_u32 address, _u16 data)
 {
 	_u8* ptr = translate_address_write(address);
 
@@ -380,7 +380,7 @@ __always_inline void storeW(_u32 address, _u16 data)
 	}
 }
 
-__always_inline void storeL(_u32 address, _u32 data)
+__always_inline void mem_slow_storeL(_u32 address, _u32 data)
 {
 	_u8* ptr = translate_address_write(address);
 

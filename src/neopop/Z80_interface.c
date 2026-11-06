@@ -1,4 +1,5 @@
 #pragma GCC optimize("Ofast")
+#pragma GCC section text=".time_critical"
 //---------------------------------------------------------------------------
 // NEOPOP : Emulator as in Dreamland
 //
@@ -56,43 +57,8 @@ Z80 Z80_regs;
 
 //=============================================================================
 
-_u8 RdZ80(_u16 address)
+void WrZ80_slow(word address, byte value)
 {
-	if (address <= 0xFFF)
-		return ram[0x7000 + address];
-
-	if (address == 0x8000)
-	{
-#ifdef NEOPOP_DEBUG
-		if (filter_sound)
-			system_debug_message("z80 <- TLCS900h: Read ... %02X", ram[0xBC]);
-#endif
-		return ram[0xBC];
-	}
-
-	return 0;
-}
-
-//=============================================================================
-
-void WrZ80(_u16 address, _u8 value)
-{
-	if (address <= 0x0FFF)
-	{
-		ram[0x7000 + address] = value;
-		return;
-	}
-
-	if (address == 0x8000)
-	{
-#ifdef NEOPOP_DEBUG
-		if (filter_sound)
-			system_debug_message("z80 -> TLCS900h: Write ... %02X", value);
-#endif
-		ram[0xBC] = value;
-		return;
-	}
-
 	if (address == 0x4001)	{	Write_SoundChipTone(value);	return; }
 	if (address == 0x4000)	{	Write_SoundChipNoise(value); return; }
 

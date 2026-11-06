@@ -52,5 +52,12 @@ void flash_write(_u32 start_address, _u16 length);
 //Stores the flash data
 void flash_commit(void);
 
+//Flash RAM overlay functions for writable cartridge save blocks
+void flash_overlay_reset(void);
+void* flash_overlay_get_write_ptr(_u32 address);
+void* flash_overlay_get_read_ptr(_u32 address);
+BOOL flash_is_dirty(void);
+void flash_clear_dirty(void);
+
 //=============================================================================
 #endif

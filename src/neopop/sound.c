@@ -1,3 +1,5 @@
+#pragma GCC optimize("Ofast")
+#pragma GCC section text=".time_critical"
 //---------------------------------------------------------------------------
 // NEOPOP : Emulator as in Dreamland
 //
@@ -76,6 +78,8 @@
  *                                                                      *
  ************************************************************************/
 
+#include <stdint.h>
+#include <stdbool.h>
 #include "neopop.h"
 #include "mem.h"
 #include "sound.h"
@@ -88,7 +92,7 @@ SoundChip toneChip;
 SoundChip noiseChip;
 
 //==== DAC
-#define DAC_BUFFERSIZE		16 * 1024
+#define DAC_BUFFERSIZE		4096
 
 int dacBufferRead, dacBufferWrite, dacBufferCount;
 _u8 dacBufferL[DAC_BUFFERSIZE];
@@ -117,32 +121,18 @@ static _u32 UpdateStep;	//Number of steps during one sample.
 
 //=============================================================================
 
-static _u16 sample_chip_tone(void)
+static inline int16_t sample_chip_tone(void)
 {
 	int i;
-
-	int vol[4];
-	unsigned int out;
-	int left;
-
-	/* vol[] keeps track of how long each square wave stays */
-	/* in the 1 position during the sample period. */
-	vol[0] = vol[1] = vol[2] = vol[3] = 0;
+	int vol[3] = {0, 0, 0};
+	int out = 0;
 
 	for (i = 0; i < 3; i++)
 	{
 		if (toneChip.Output[i]) vol[i] += toneChip.Count[i];
 		toneChip.Count[i] -= STEP;
 
-		/* Period[i] is the half period of the square wave. Here, in each */
-		/* loop I add Period[i] twice, so that at the end of the loop the */
-		/* square wave is in the same status (0 or 1) it was at the start. */
-		/* vol[i] is also incremented by Period[i], since the wave has been 1 */
-		/* exactly half of the time, regardless of the initial position. */
-		/* If we exit the loop in the middle, Output[i] has to be inverted */
-		/* and vol[i] incremented only if the exit status of the square */
-		/* wave is 1. */
-
+		/* Period[i] is the half period of the square wave. */
 		while (toneChip.Count[i] <= 0)
 		{
 			toneChip.Count[i] += toneChip.Period[i];
@@ -156,84 +146,34 @@ static _u16 sample_chip_tone(void)
 			vol[i] += toneChip.Period[i];
 		}
 		if (toneChip.Output[i]) vol[i] -= toneChip.Count[i];
+
+		if (toneChip.Volume[i] > 0)
+		{
+			int centered = (vol[i] << 1) - STEP;
+			out += (int)(((int64_t)centered * toneChip.Volume[i]) >> 16);
+		}
 	}
 
-	left = STEP;
-	do
-	{
-		int nextevent;
+	if (out > 32767) out = 32767;
+	else if (out < -32768) out = -32768;
 
-		if (toneChip.Count[3] < left) nextevent = toneChip.Count[3];
-		else nextevent = left;
-
-		if (toneChip.Output[3]) vol[3] += toneChip.Count[3];
-		toneChip.Count[3] -= nextevent;
-		if (toneChip.Count[3] <= 0)
-		{
-			if (toneChip.RNG & 1) toneChip.RNG ^= toneChip.NoiseFB;
-			toneChip.RNG >>= 1;
-			toneChip.Output[3] = toneChip.RNG & 1;
-			toneChip.Count[3] += toneChip.Period[3];
-			if (toneChip.Output[3]) vol[3] += toneChip.Period[3];
-		}
-		if (toneChip.Output[3]) vol[3] -= toneChip.Count[3];
-
-		left -= nextevent;
-	} while (left > 0);
-
-
-	out = vol[0] * toneChip.Volume[0] + vol[1] * toneChip.Volume[1] +
-		vol[2] * toneChip.Volume[2];
-
-	if (out > MAX_OUTPUT * STEP) out = MAX_OUTPUT * STEP;
-
-	return out / STEP;
+	return (int16_t)out;
 }
 
 //=============================================================================
 
-static _u16 sample_chip_noise(void)
+static inline int16_t sample_chip_noise(void)
 {
-	int i;
-
-	int vol[4];
-	unsigned int out;
-	int left;
-
-	/* vol[] keeps track of how long each square wave stays */
-	/* in the 1 position during the sample period. */
-	vol[0] = vol[1] = vol[2] = vol[3] = 0;
-
-	for (i = 0; i < 3; i++)
+	if (noiseChip.Volume[3] == 0)
 	{
-		if (noiseChip.Output[i]) vol[i] += noiseChip.Count[i];
-		noiseChip.Count[i] -= STEP;
-
-		/* Period[i] is the half period of the square wave. Here, in each */
-		/* loop I add Period[i] twice, so that at the end of the loop the */
-		/* square wave is in the same status (0 or 1) it was at the start. */
-		/* vol[i] is also incremented by Period[i], since the wave has been 1 */
-		/* exactly half of the time, regardless of the initial position. */
-		/* If we exit the loop in the middle, Output[i] has to be inverted */
-		/* and vol[i] incremented only if the exit status of the square */
-		/* wave is 1. */
-
-		while (noiseChip.Count[i] <= 0)
-		{
-			noiseChip.Count[i] += noiseChip.Period[i];
-			if (noiseChip.Count[i] > 0)
-			{
-				noiseChip.Output[i] ^= 1;
-				if (noiseChip.Output[i]) vol[i] += noiseChip.Period[i];
-				break;
-			}
-			noiseChip.Count[i] += noiseChip.Period[i];
-			vol[i] += noiseChip.Period[i];
-		}
-		if (noiseChip.Output[i]) vol[i] -= noiseChip.Count[i];
+		noiseChip.Count[3] -= STEP;
+		while (noiseChip.Count[3] <= 0 && noiseChip.Period[3] > 0)
+			noiseChip.Count[3] += noiseChip.Period[3];
+		return 0;
 	}
 
-	left = STEP;
+	int vol3 = 0;
+	int left = STEP;
 	do
 	{
 		int nextevent;
@@ -241,7 +181,7 @@ static _u16 sample_chip_noise(void)
 		if (noiseChip.Count[3] < left) nextevent = noiseChip.Count[3];
 		else nextevent = left;
 
-		if (noiseChip.Output[3]) vol[3] += noiseChip.Count[3];
+		if (noiseChip.Output[3]) vol3 += noiseChip.Count[3];
 		noiseChip.Count[3] -= nextevent;
 		if (noiseChip.Count[3] <= 0)
 		{
@@ -249,34 +189,38 @@ static _u16 sample_chip_noise(void)
 			noiseChip.RNG >>= 1;
 			noiseChip.Output[3] = noiseChip.RNG & 1;
 			noiseChip.Count[3] += noiseChip.Period[3];
-			if (noiseChip.Output[3]) vol[3] += noiseChip.Period[3];
+			if (noiseChip.Output[3]) vol3 += noiseChip.Period[3];
 		}
-		if (noiseChip.Output[3]) vol[3] -= noiseChip.Count[3];
+		if (noiseChip.Output[3]) vol3 -= noiseChip.Count[3];
 
 		left -= nextevent;
 	} while (left > 0);
 
+	int centered = (vol3 << 1) - STEP;
+	int out = (int)(((int64_t)centered * noiseChip.Volume[3]) >> 16);
 
-	out = vol[3] * noiseChip.Volume[3];
+	if (out > 32767) out = 32767;
+	else if (out < -32768) out = -32768;
 
-	if (out > MAX_OUTPUT * STEP) out = MAX_OUTPUT * STEP;
-
-	return out / STEP;
+	return (int16_t)out;
 }
 
 //=============================================================================
 
 void sound_update(_u16* chip_buffer, int length_bytes)
 {
+	int16_t *buf = (int16_t *)chip_buffer;
 	while (length_bytes > 0)
 	{
-		//Mix a mono track out of: (Tone + Noise) >> 1
-		//Write it to the sound buffer
-		*(chip_buffer++) = (sample_chip_tone() + sample_chip_noise()) >> 1;
+		int32_t mix = (int32_t)sample_chip_tone() + (int32_t)sample_chip_noise();
+		if (mix > 32767) mix = 32767;
+		else if (mix < -32768) mix = -32768;
+		*(buf++) = (int16_t)mix;
 
 		length_bytes -= 2;	// 2 bytes = 16 bits
 	}
 }
+
 
 //=============================================================================
 
@@ -397,18 +341,33 @@ void dac_write(void)
 {
 	if (mute) return;	// Ignore	
 
-	//Write to buffer
-	dacBufferL[dacBufferWrite] = ram[0xA2];
-	dacBufferWrite++;
-	if (dacBufferWrite == DAC_BUFFERSIZE)
-		dacBufferWrite = 0;
+	_u8 dval = ram[0xA2];
+	if ((dval == 0x80 || dval == 0) && (ram[0xA3] != 0 && ram[0xA3] != 0x80))
+		dval = ram[0xA3];
 
-	//Overflow?
-	dacBufferCount++;
-	if (dacBufferCount == DAC_BUFFERSIZE)
+	/* Pretend that conv=5.5 (44100/8000) conversion factor to match 44.1 kHz output.
+	 * Alternating 5 and 6 yields exactly 5.5x (8000 Hz * 5.5 = 44000 Hz). */
+	static int conv = 5;
+	conv = (conv == 5) ? 6 : 5;
+
+	for (int i = 0; i < conv; i++)
 	{
-		system_message("dac_write: DAC buffer overflow\nPlease report this to the author.");
-		dacBufferCount = 0;
+		dacBufferL[dacBufferWrite] = dval;
+		dacBufferWrite++;
+		if (dacBufferWrite == DAC_BUFFERSIZE)
+			dacBufferWrite = 0;
+
+		if (dacBufferCount < DAC_BUFFERSIZE)
+		{
+			dacBufferCount++;
+		}
+		else
+		{
+			/* Ring buffer full: advance read pointer to discard oldest sample */
+			dacBufferRead++;
+			if (dacBufferRead == DAC_BUFFERSIZE)
+				dacBufferRead = 0;
+		}
 	}
 }
 	
@@ -416,21 +375,20 @@ void dac_update(_u8* dac_buffer, int length_bytes)
 {
 	while (length_bytes > 0)
 	{
-		//Copy then clear DAC data
-		*(dac_buffer++) = dacBufferL[dacBufferRead];
-		dacBufferL[dacBufferRead] = 0x80;
-			
-		length_bytes --;	// 1 byte = 8 bits
-
 		if (dacBufferCount > 0)
 		{
-			dacBufferCount --;
+			*(dac_buffer++) = dacBufferL[dacBufferRead];
+			dacBufferCount--;
 
-			//Advance the DAC read
 			dacBufferRead++;
 			if (dacBufferRead == DAC_BUFFERSIZE)
 				dacBufferRead = 0;
 		}
+		else
+		{
+			*(dac_buffer++) = 0x80;
+		}
+		length_bytes--;
 	}
 }
 

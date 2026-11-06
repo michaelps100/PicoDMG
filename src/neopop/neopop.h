@@ -307,8 +307,8 @@ RomHeader;
 #define SCREEN_WIDTH	160
 #define SCREEN_HEIGHT	152
 
-	//16-bit Frame buffer: Format X4B4G4R4
-	extern _u16 cfb[256*256];
+	//16-bit Scanline buffer: Format X4B4G4R4
+	extern _u16 cfb[SCREEN_WIDTH];
 
 	extern COLOURMODE system_colour;
 
@@ -409,6 +409,13 @@ RomHeader;
 	This is state data. */
 
 	BOOL system_io_state_write(char* filename, _u8* buffer, _u32 bufferLength);
+
+	BOOL system_io_state_stream_open_write(char* filename);
+	BOOL system_io_state_stream_open_read(char* filename);
+	BOOL system_io_state_stream_seek(_u32 offset);
+	BOOL system_io_state_stream_write(const _u8* buffer, _u32 bufferLength);
+	BOOL system_io_state_stream_read(_u8* buffer, _u32 bufferLength);
+	void system_io_state_stream_close(void);
 
 
 //-----------------------------------------------------------------------------

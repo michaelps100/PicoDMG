@@ -1,4 +1,5 @@
 #pragma GCC optimize("Ofast")
+#pragma GCC section text=".time_critical"
 //---------------------------------------------------------------------------
 // NEOPOP : Emulator as in Dreamland
 //

@@ -4,296 +4,329 @@
 // Copyright (c) 2001-2002 by neopop_uk
 //---------------------------------------------------------------------------
 
-//---------------------------------------------------------------------------
-//	This program is free software; you can redistribute it and/or modify
-//	it under the terms of the GNU General Public License as published by
-//	the Free Software Foundation; either version 2 of the License, or
-//	(at your option) any later version. See also the license.txt file for
-//	additional informations.
-//---------------------------------------------------------------------------
-
-/*
-//---------------------------------------------------------------------------
-//=========================================================================
-
-	gfx_scanline_mono.c
-
-//=========================================================================
-//---------------------------------------------------------------------------
-
-  History of changes:
-  ===================
-
-20 JUL 2002 - neopop_uk
-=======================================
-- Cleaned and tidied up for the source release
-
-22 JUL 2002 - neopop_uk
-=======================================
-- Removed delayed settings retrieval, this is now done by 'interrupt.c'
-- Removed hack for scanline 0!
-- Fixed palettes
-- Inverted all colours (1's complement) to make correct LCD emulation
-
-24 JUL 2002 - neopop_uk
-=======================================
-- Added Negative/Positive colour switching
-
-25 JUL 2002 - neopop_uk
-=======================================
-- Fixed a stupid bug in the dimensions of the
-	right side of the hardware window.
-
-06 AUG 2002 - neopop_uk
-=======================================
-- Switched to 16-bit [0BGR] rendering, should be much faster.
-
-15 AUG 2002 - neopop_uk
-=======================================
-- Changed parameter 4 of drawPattern from bool to _u16, for performance
-	and compatiblity reasons.
-- Changed parameter 3 of Plot (pal_hi) from bool to _u16, and in turn
-	parameter 6 of drawPattern - again for performance and compatiblity.
-
-16 AUG 2002 - neopop_uk
-=======================================
-- Optimised things a little by removing some extraneous pointer work
-
-//---------------------------------------------------------------------------
-*/
-
+#pragma GCC optimize("Ofast")
+#include "pico.h"
 #include "neopop.h"
 #include "mem.h"
 #include "gfx.h"
+#include <stdint.h>
 
 //=============================================================================
 
-static void Plot(_u8 x, _u8* palette_ptr, _u16 pal_hi, _u8 index, _u8 depth)
-{
-	_u8 data8;
+// Precalculated 12-bit 0BGR palettes for mono intensities 0..7
+// Intensity formula: val = (c << 1) | (c << 5) | (c << 9)
+static const _u16 s_mono_lut_pos[8] = {
+	(_u16)~0x0000,
+	(_u16)~0x0222,
+	(_u16)~0x0444,
+	(_u16)~0x0666,
+	(_u16)~0x0888,
+	(_u16)~0x0AAA,
+	(_u16)~0x0CCC,
+	(_u16)~0x0EEE
+};
 
+static const _u16 s_mono_lut_neg[8] = {
+	0x0000,
+	0x0222,
+	0x0444,
+	0x0666,
+	0x0888,
+	0x0AAA,
+	0x0CCC,
+	0x0EEE
+};
+
+static inline __attribute__((always_inline)) void Plot(_u8 x, const _u8* pal_base, _u8 index, const _u16* mono_lut, _u8 depth)
+{
 	//Clip
-	if (index == 0 || x < winx || x >= (winw + winx) || x >= SCREEN_WIDTH)
+	if (__builtin_expect(x < winx || x >= (winw + winx) || x >= SCREEN_WIDTH, 0))
 		return;
 
 	//Depth check, <= to stop later sprites overwriting pixels!
 	if (depth <= zbuffer[x]) return;
 	zbuffer[x] = depth;
 
-	//Get the colour of the pixel
-	if (pal_hi)
-		data8 = palette_ptr[4 + index];
-	else
-		data8 = palette_ptr[0 + index];
-
-	r = (data8 & 7) << 1;
-	g = (data8 & 7) << 5;
-	b = (data8 & 7) << 9;
-
-	if (negative)
-		cfb_scanline[x] = (r | g | b);
-	else
-		cfb_scanline[x] = ~(r | g | b);
+	cfb_scanline[x] = mono_lut[pal_base[index] & 7];
 }
 
-static void drawPattern(_u8 screenx, _u16 tile, _u8 tiley, _u16 mirror,
-				 _u8* palette_ptr, _u16 pal, _u8 depth)
+static inline __attribute__((always_inline)) void Plot_fast(_u8 x, const _u8* pal_base, _u8 index, const _u16* mono_lut, _u8 depth)
 {
-	//Get the data for th e "tiley'th" line of "tile".
-	_u16 data = *(_u16*)(ram + 0xA000 + (tile * 16) + (tiley * 2));
+	if (depth <= zbuffer[x]) return;
+	zbuffer[x] = depth;
 
-	//Horizontal Flip
-	if (mirror)
-	{
-		Plot(screenx + 7, palette_ptr, pal, (data & 0xC000) >> 0xE, depth);
-		Plot(screenx + 6, palette_ptr, pal, (data & 0x3000) >> 0xC, depth);
-		Plot(screenx + 5, palette_ptr, pal, (data & 0x0C00) >> 0xA, depth);
-		Plot(screenx + 4, palette_ptr, pal, (data & 0x0300) >> 0x8, depth);
-		Plot(screenx + 3, palette_ptr, pal, (data & 0x00C0) >> 0x6, depth);
-		Plot(screenx + 2, palette_ptr, pal, (data & 0x0030) >> 0x4, depth);
-		Plot(screenx + 1, palette_ptr, pal, (data & 0x000C) >> 0x2, depth);
-		Plot(screenx + 0, palette_ptr, pal, (data & 0x0003) >> 0x0, depth);
-	}
-	else
-	//Normal
-	{
-		Plot(screenx + 0, palette_ptr, pal, (data & 0xC000) >> 0xE, depth);
-		Plot(screenx + 1, palette_ptr, pal, (data & 0x3000) >> 0xC, depth);
-		Plot(screenx + 2, palette_ptr, pal, (data & 0x0C00) >> 0xA, depth);
-		Plot(screenx + 3, palette_ptr, pal, (data & 0x0300) >> 0x8, depth);
-		Plot(screenx + 4, palette_ptr, pal, (data & 0x00C0) >> 0x6, depth);
-		Plot(screenx + 5, palette_ptr, pal, (data & 0x0030) >> 0x4, depth);
-		Plot(screenx + 6, palette_ptr, pal, (data & 0x000C) >> 0x2, depth);
-		Plot(screenx + 7, palette_ptr, pal, (data & 0x0003) >> 0x0, depth);
-	}
+	cfb_scanline[x] = mono_lut[pal_base[index] & 7];
 }
 
-static void gfx_draw_scroll1(_u8 depth)
+static inline __attribute__((always_inline)) void drawPattern_with_data(_u8 screenx, _u16 data, _u16 mirror,
+				 const _u8* pal_base, const _u16* mono_lut, _u8 depth)
 {
-	_u8 tx, row, line;
-	_u16 data16;
+	//Quick rejection: tile is completely off-screen to the right
+	if (screenx >= SCREEN_WIDTH && screenx <= 248)
+		return;
 
-	line = scanline + scroll1y;
-	row = line & 7;	//Which row?
+	_u8 max_vis = min1((_u8)(winw + winx), SCREEN_WIDTH);
 
-	//Draw Foreground scroll plane (Scroll 1)
-#pragma GCC unroll 32
-	for (tx = 0; tx < 32; tx++)
+	//Fast path: completely inside screen and window bounds
+	if (__builtin_expect(screenx >= winx && (screenx + 8) <= max_vis, 1))
 	{
-		data16 = *(_u16*)(ram + 0x9000 + ((tx + ((line >> 3) << 5)) << 1));
-		
-		//Draw the line of the tile
-		drawPattern((tx << 3) - scroll1x, data16 & 0x01FF, 
-			(data16 & 0x4000) ? 7 - row : row, data16 & 0x8000, ram + 0x8108,
-			data16 & 0x2000, depth);
-	}
-}
-
-static void gfx_draw_scroll2(_u8 depth)
-{
-	_u8 tx, row, line;
-	_u16 data16;
-
-	line = scanline + scroll2y;
-	row = line & 7;	//Which row?
-
-	//Draw Background scroll plane (Scroll 2)
-#pragma GCC unroll 32
-	for (tx = 0; tx < 32; tx++)
-	{
-		data16 = *(_u16*)(ram + 0x9800 + ((tx + ((line >> 3) << 5)) << 1));
-		
-		//Draw the line of the tile
-		drawPattern((tx << 3) - scroll2x, data16 & 0x01FF, 
-			(data16 & 0x4000) ? 7 - row : row, data16 & 0x8000, ram + 0x8110,
-			data16 & 0x2000, depth);
-	}
-}
-
-void gfx_draw_scanline_mono(void)
-{
-	_s16 lastSpriteX;
-	_s16 lastSpriteY;
-	int spr, x;
-	_u16 data16;
-
-	//Get the current scanline
-	scanline = ram[0x8009];
-	cfb_scanline = cfb + (scanline * SCREEN_WIDTH);	//Calculate fast offset
-
-	memset(cfb_scanline, 0, SCREEN_WIDTH * sizeof(_u16));
-	memset(zbuffer, 0, SCREEN_WIDTH);
-
-	//Window colour
-	r = (_u16)oowc << 1;
-	g = (_u16)oowc << 5;
-	b = (_u16)oowc << 9;
-	
-	if (negative)
-		data16 = (r | g | b);
-	else
-		data16 = ~(r | g | b);
-
-	//Top
-	if (scanline < winy)
-	{
-		for (x = 0; x < SCREEN_WIDTH; x++)
-			cfb_scanline[x] = data16;
-	}
-	else
-	{
-		//Middle
-		if (scanline < winy + winh)
+		if (mirror)
 		{
-			for (x = 0; x < min1(winx, SCREEN_WIDTH); x++)
-				cfb_scanline[x] = data16;
-			for (x = min1(winx + winw, SCREEN_WIDTH); x < SCREEN_WIDTH; x++)
-				cfb_scanline[x] = data16;
-		}
-		else	//Bottom
-		{
-			for (x = 0; x < SCREEN_WIDTH; x++)
-				cfb_scanline[x] = data16;
-		}
-	}
-
-	//Ignore above and below the window's top and bottom
-	if (scanline >= winy && scanline < winy + winh)
-	{
-		//Background colour Enabled?
-		if ((bgc & 0xC0) == 0x80)
-		{
-			r = (_u16)(bgc & 7) << 1;
-			g = (_u16)(bgc & 7) << 5;
-			b = (_u16)(bgc & 7) << 9;
-			data16 = ~(r | g | b);
-		}
-		else data16 = 0x0FFF;
-
-		if (negative) data16 = ~data16;
-		
-		//Draw background!
-		for (x = winx; x < min1(winx + winw, SCREEN_WIDTH); x++)	
-			cfb_scanline[x] = data16;
-
-		//Swap Front/Back scroll planes?
-		if (planeSwap)
-		{
-			gfx_draw_scroll1(ZDEPTH_BACKGROUND_SCROLL);		//Swap
-			gfx_draw_scroll2(ZDEPTH_FOREGROUND_SCROLL);
+			_u8 p;
+			p = (_u8)((data >> 14) & 3); if (p) Plot_fast(screenx + 7, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 12) & 3); if (p) Plot_fast(screenx + 6, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 10) & 3); if (p) Plot_fast(screenx + 5, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 8) & 3);  if (p) Plot_fast(screenx + 4, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 6) & 3);  if (p) Plot_fast(screenx + 3, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 4) & 3);  if (p) Plot_fast(screenx + 2, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 2) & 3);  if (p) Plot_fast(screenx + 1, pal_base, p, mono_lut, depth);
+			p = (_u8)(data & 3);         if (p) Plot_fast(screenx + 0, pal_base, p, mono_lut, depth);
 		}
 		else
 		{
-			gfx_draw_scroll2(ZDEPTH_BACKGROUND_SCROLL);		//Normal
-			gfx_draw_scroll1(ZDEPTH_FOREGROUND_SCROLL);
+			_u8 p;
+			p = (_u8)((data >> 14) & 3); if (p) Plot_fast(screenx + 0, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 12) & 3); if (p) Plot_fast(screenx + 1, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 10) & 3); if (p) Plot_fast(screenx + 2, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 8) & 3);  if (p) Plot_fast(screenx + 3, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 6) & 3);  if (p) Plot_fast(screenx + 4, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 4) & 3);  if (p) Plot_fast(screenx + 5, pal_base, p, mono_lut, depth);
+			p = (_u8)((data >> 2) & 3);  if (p) Plot_fast(screenx + 6, pal_base, p, mono_lut, depth);
+			p = (_u8)(data & 3);         if (p) Plot_fast(screenx + 7, pal_base, p, mono_lut, depth);
 		}
-
-		//Draw Sprites
-		//Last sprite position, (defaults to top-left, sure?)
-		lastSpriteX = 0;
-		lastSpriteY = 0;
-		for (spr = 0; spr < 64; spr++)
-		{
-			_u8 priority, row;
-			_u8 sx = ram[0x8800 + (spr * 4) + 2];	//X position
-			_u8 sy = ram[0x8800 + (spr * 4) + 3];	//Y position
-			_s16 x = sx;
-			_s16 y = sy;
-			
-			data16 = *(_u16*)(ram + 0x8800 + (spr * 4));
-			priority = (data16 & 0x1800) >> 11;
-
-			if (data16 & 0x0400) x = lastSpriteX + sx;	//Horizontal chain?
-			if (data16 & 0x0200) y = lastSpriteY + sy;	//Vertical chain?
-
-			//Store the position for chaining
-			lastSpriteX = x;
-			lastSpriteY = y;
-			
-			//Visible?
-			if (priority == 0)	continue;
-
-			//Scroll the sprite
-			x += scrollsprx;
-			y += scrollspry;
-
-			//Off-screen?
-			if (x > 248 && x < 256)	x = x - 256; else x &= 0xFF;
-			if (y > 248 && y < 256)	y = y - 256; else y &= 0xFF;
-
-			//In range?
-			if (scanline >= y && scanline <= y + 7)
-			{
-				row = (scanline - y) & 7;	//Which row?
-				drawPattern((_u8)x, data16 & 0x01FF, 
-					(data16 & 0x4000) ? 7 - row : row, data16 & 0x8000,
-					ram + 0x8100, data16 & 0x2000, priority << 1); 
-			}
-		}
-
+		return;
 	}
 
-	//==========
+	//Boundary path (clipping needed)
+	if (mirror)
+	{
+		_u8 p;
+		p = (_u8)((data >> 14) & 3); if (p) Plot(screenx + 7, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 12) & 3); if (p) Plot(screenx + 6, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 10) & 3); if (p) Plot(screenx + 5, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 8) & 3);  if (p) Plot(screenx + 4, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 6) & 3);  if (p) Plot(screenx + 3, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 4) & 3);  if (p) Plot(screenx + 2, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 2) & 3);  if (p) Plot(screenx + 1, pal_base, p, mono_lut, depth);
+		p = (_u8)(data & 3);         if (p) Plot(screenx + 0, pal_base, p, mono_lut, depth);
+	}
+	else
+	{
+		_u8 p;
+		p = (_u8)((data >> 14) & 3); if (p) Plot(screenx + 0, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 12) & 3); if (p) Plot(screenx + 1, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 10) & 3); if (p) Plot(screenx + 2, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 8) & 3);  if (p) Plot(screenx + 3, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 6) & 3);  if (p) Plot(screenx + 4, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 4) & 3);  if (p) Plot(screenx + 5, pal_base, p, mono_lut, depth);
+		p = (_u8)((data >> 2) & 3);  if (p) Plot(screenx + 6, pal_base, p, mono_lut, depth);
+		p = (_u8)(data & 3);         if (p) Plot(screenx + 7, pal_base, p, mono_lut, depth);
+	}
 }
 
-//=============================================================================
+static void gfx_draw_scroll1(const _u16* mono_lut, _u8 depth)
+{
+	_u8 i, row, line;
+	_u16 data16;
+
+	line = scanline + scroll1y;
+	row = line & 7;
+	_u32 row_offset = ((line >> 3) & 0x1F) << 5;
+
+	_u8 start_tx = (scroll1x >> 3) & 0x1F;
+	for (i = 0; i < 21; i++)
+	{
+		_u8 tx = (start_tx + i) & 0x1F;
+		data16 = *(_u16*)(ram + 0x9000 + ((tx + row_offset) << 1));
+		_u16 tile = data16 & 0x01FF;
+		if (!tile) continue; // Tile 0 is transparent!
+
+		_u8 tiley = (data16 & 0x4000) ? (7 - row) : row;
+		_u16 data = *(_u16*)(ram + 0xA000 + (tile * 16) + (tiley * 2));
+		if (!data) continue; // Tile row is transparent, quick bypass!
+
+		const _u8* pal_base = (data16 & 0x2000) ? (ram + 0x810C) : (ram + 0x8108);
+		drawPattern_with_data(
+			(_u8)((tx << 3) - scroll1x),
+			data,
+			data16 & 0x8000,
+			pal_base,
+			mono_lut,
+			depth);
+	}
+}
+
+static void gfx_draw_scroll2(const _u16* mono_lut, _u8 depth)
+{
+	_u8 i, row, line;
+	_u16 data16;
+
+	line = scanline + scroll2y;
+	row = line & 7;
+	_u32 row_offset = ((line >> 3) & 0x1F) << 5;
+
+	_u8 start_tx = (scroll2x >> 3) & 0x1F;
+	for (i = 0; i < 21; i++)
+	{
+		_u8 tx = (start_tx + i) & 0x1F;
+		data16 = *(_u16*)(ram + 0x9800 + ((tx + row_offset) << 1));
+		_u16 tile = data16 & 0x01FF;
+		if (!tile) continue; // Tile 0 is transparent!
+
+		_u8 tiley = (data16 & 0x4000) ? (7 - row) : row;
+		_u16 data = *(_u16*)(ram + 0xA000 + (tile * 16) + (tiley * 2));
+		if (!data) continue; // Tile row is transparent, quick bypass!
+
+		const _u8* pal_base = (data16 & 0x2000) ? (ram + 0x8114) : (ram + 0x8110);
+		drawPattern_with_data(
+			(_u8)((tx << 3) - scroll2x),
+			data,
+			data16 & 0x8000,
+			pal_base,
+			mono_lut,
+			depth);
+	}
+}
+
+/* Cached Active Sprite List for Mono */
+typedef struct {
+    _s16 x;
+    _s16 y;
+    _u16 data16;
+    _u8 pal;
+    _u8 priority_x2;
+} CachedSpriteMono;
+
+static CachedSpriteMono s_active_sprites_mono[64];
+static int s_active_sprite_count_mono = 0;
+bool s_sprites_cached_this_frame_mono = false;
+
+static void gfx_cache_sprites_mono(void)
+{
+    _s16 lastSpriteX = 0;
+    _s16 lastSpriteY = 0;
+    s_active_sprite_count_mono = 0;
+
+    for (int spr = 0; spr < 64; spr++)
+    {
+        _u32 spr_raw = *(_u32*)(ram + 0x8800 + (spr << 2));
+        _u16 data16 = (_u16)(spr_raw & 0xFFFF);
+        _u8 sx = (_u8)(spr_raw >> 16);
+        _u8 sy = (_u8)(spr_raw >> 24);
+        _s16 x = sx;
+        _s16 y = sy;
+
+        _u8 priority = (data16 & 0x1800) >> 11;
+
+        if (data16 & 0x0400) x = lastSpriteX + sx;
+        if (data16 & 0x0200) y = lastSpriteY + sy;
+
+        lastSpriteX = x;
+        lastSpriteY = y;
+
+        if (priority == 0) continue;
+
+        x += scrollsprx;
+        y += scrollspry;
+
+        if (x > 248 && x < 256) x = x - 256; else x &= 0xFF;
+        if (y > 248 && y < 256) y = y - 256; else y &= 0xFF;
+
+        if (y >= SCREEN_HEIGHT && y < 248) continue;
+        if (x >= SCREEN_WIDTH && x < 248) continue;
+
+        CachedSpriteMono *cs = &s_active_sprites_mono[s_active_sprite_count_mono++];
+        cs->x = x;
+        cs->y = y;
+        cs->data16 = data16;
+        cs->pal = (data16 & 0x2000) ? 1 : 0;
+        cs->priority_x2 = priority << 1;
+    }
+}
+
+void __not_in_flash_func(gfx_draw_scanline_mono)(void)
+{
+	scanline = ram[0x8009];
+	cfb_scanline = cfb;
+
+	if (!s_sprites_cached_this_frame_mono)
+	{
+		gfx_cache_sprites_mono();
+		s_sprites_cached_this_frame_mono = true;
+	}
+
+	const _u16* mono_lut = negative ? s_mono_lut_neg : s_mono_lut_pos;
+
+	// Fast 32-bit clear of zbuffer (40 uint32 words = 160 bytes)
+	uint32_t *z32 = (uint32_t *)zbuffer;
+	for (int i = 0; i < 40; i++) z32[i] = 0;
+
+	// Window colour (out of window color)
+	_u16 oow_c = mono_lut[oowc & 7];
+
+	// Background colour
+	_u16 bg_c;
+	if (scanline >= winy && scanline < winy + winh)
+	{
+		if ((bgc & 0xC0) == 0x80)
+			bg_c = mono_lut[bgc & 7];
+		else
+			bg_c = negative ? 0x0000 : 0x0FFF;
+	}
+	else
+	{
+		bg_c = oow_c;
+	}
+
+	// Fast 32-bit background fill (80 uint32 words = 160 pixels)
+	uint32_t bg32 = (uint32_t)bg_c | ((uint32_t)bg_c << 16);
+	uint32_t *cfb32 = (uint32_t *)cfb_scanline;
+	for (int i = 0; i < 80; i++) cfb32[i] = bg32;
+
+	// Non-standard window margins (rare)
+	if (__builtin_expect(winx > 0 || (winx + winw) < SCREEN_WIDTH, 0))
+	{
+		for (int x = 0; x < min1(winx, SCREEN_WIDTH); x++) cfb_scanline[x] = oow_c;
+		for (int x = min1((_u8)(winx + winw), SCREEN_WIDTH); x < SCREEN_WIDTH; x++) cfb_scanline[x] = oow_c;
+	}
+
+	// Draw inside the active window
+	if (scanline >= winy && scanline < winy + winh)
+	{
+		//Swap Front/Back scroll planes?
+		if (planeSwap)
+		{
+			gfx_draw_scroll1(mono_lut, ZDEPTH_BACKGROUND_SCROLL);
+			gfx_draw_scroll2(mono_lut, ZDEPTH_FOREGROUND_SCROLL);
+		}
+		else
+		{
+			gfx_draw_scroll2(mono_lut, ZDEPTH_BACKGROUND_SCROLL);
+			gfx_draw_scroll1(mono_lut, ZDEPTH_FOREGROUND_SCROLL);
+		}
+
+		// Draw Active Sprites
+		for (int i = 0; i < s_active_sprite_count_mono; i++)
+		{
+			_s16 y = s_active_sprites_mono[i].y;
+			if (scanline >= y && scanline <= y + 7)
+			{
+				_u8 row = (scanline - y) & 7;
+				_u16 sdata = s_active_sprites_mono[i].data16;
+				_u16 tile = sdata & 0x01FF;
+				_u8 tiley = (sdata & 0x4000) ? (7 - row) : row;
+				_u16 data = *(_u16*)(ram + 0xA000 + (tile * 16) + (tiley * 2));
+				if (!data) continue;
+
+				const _u8* pal_base = s_active_sprites_mono[i].pal ? (ram + 0x8104) : (ram + 0x8100);
+				drawPattern_with_data(
+					(_u8)s_active_sprites_mono[i].x,
+					data,
+					sdata & 0x8000,
+					pal_base,
+					mono_lut,
+					s_active_sprites_mono[i].priority_x2);
+			}
+		}
+	}
+}

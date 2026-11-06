@@ -68,6 +68,38 @@ can exist - should a new one be required.
 
 typedef struct
 {
+	//TLCS-900h Registers
+	_u32 pc;
+	_u16 sr;
+	_u8 f_dash;
+	_u32 gprBank[4][4], gpr[4];
+	
+	BOOL eepromStatusEnable;
+
+	//Z80 Registers
+	Z80 Z80_regs;
+
+	//Timers
+	_u32 timer_hint;
+	_u8 timer[4];	//Up-counters
+	_u32 timer_clock0, timer_clock1, timer_clock2, timer_clock3;
+
+	//Sound Chips
+	SoundChip toneChip;
+	SoundChip noiseChip;
+
+	//DMA
+	_u32 dmaS[4], dmaD[4];
+	_u16 dmaC[4];
+	_u8 dmaM[4];
+
+	//Rom Description
+	RomHeader header;
+}
+NEOPOPSTATE_REGS;
+
+typedef struct
+{
 	//Save State Id
 	_u16 valid_state_id;		// = 0x0050
 

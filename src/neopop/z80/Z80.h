@@ -101,40 +101,67 @@ typedef struct
 /** starting execution with RunZ80(). It sets registers to  **/
 /** their initial values.                                   **/
 /*************************************************************/
-void ResetZ80(register Z80 *R);
+void ResetZ80(Z80 *R);
 
 /** ExecZ80() ************************************************/
 /** This function will execute a single Z80 opcode. It will **/
 /** then return next PC, and current register values in R.  **/
 /*************************************************************/
-word ExecZ80(register Z80 *R);
+int ExecZ80(Z80 *R);
+int ExecZ80_batch(Z80 *R, int cycles);
 
 /** IntZ80() *************************************************/
 /** This function will generate interrupt of given vector.  **/
 /*************************************************************/
-void IntZ80(register Z80 *R,register word Vector);
+void IntZ80(Z80 *R, word Vector);
 
 /** RunZ80() *************************************************/
 /** This function will run Z80 code until an LoopZ80() call **/
 /** returns INT_QUIT. It will return the PC at which        **/
 /** emulation stopped, and current register values in R.    **/
 /*************************************************************/
-word RunZ80(register Z80 *R);
+word RunZ80(Z80 *R);
 
 /** RdZ80()/WrZ80() ******************************************/
 /** These functions are called when access to RAM occurs.   **/
-/** They allow to control memory access.                    **/
-/************************************ TO BE WRITTEN BY USER **/
-void WrZ80(register word Addr,register byte Value);
-byte RdZ80(register word Addr);
+extern unsigned char ram[];
+void WrZ80_slow(word Addr, byte Value);
+
+static inline __attribute__((always_inline)) byte RdZ80(word Addr)
+{
+	if (__builtin_expect(Addr <= 0x0FFF, 1))
+		return ram[0x7000 + Addr];
+
+	if (Addr == 0x8000)
+		return ram[0xBC];
+
+	return 0;
+}
+
+static inline __attribute__((always_inline)) void WrZ80(word Addr, byte Value)
+{
+	if (__builtin_expect(Addr <= 0x0FFF, 1))
+	{
+		ram[0x7000 + Addr] = Value;
+		return;
+	}
+
+	if (Addr == 0x8000)
+	{
+		ram[0xBC] = Value;
+		return;
+	}
+
+	WrZ80_slow(Addr, Value);
+}
 
 /** InZ80()/OutZ80() *****************************************/
 /** Z80 emulation calls these functions to read/write from  **/
 /** I/O ports. There can be 65536 I/O ports, but only first **/
 /** 256 are usually used                                    **/
 /************************************ TO BE WRITTEN BY USER **/
-void OutZ80(register word Port,register byte Value);
-byte InZ80(register word Port);
+void OutZ80(word Port, byte Value);
+byte InZ80(word Port);
 
 /** PatchZ80() ***********************************************/
 /** Z80 emulation calls this function when it encounters a  **/
@@ -143,7 +170,7 @@ byte InZ80(register word Port);
 /** such as disk and tape access. Replace it with an empty  **/
 /** macro for no patching.                                  **/
 /************************************ TO BE WRITTEN BY USER **/
-void PatchZ80(register Z80 *R);
+void PatchZ80(Z80 *R);
 
 /** DebugZ80() ***********************************************/
 /** This function should exist if DEBUG is #defined. When   **/
@@ -152,7 +179,7 @@ void PatchZ80(register Z80 *R);
 /** if DebugZ80() returns 0.                                **/
 /*************************************************************/
 #ifdef DEBUG
-byte DebugZ80(register Z80 *R);
+byte DebugZ80(Z80 *R);
 #endif
 
 /** LoopZ80() ************************************************/
@@ -162,6 +189,6 @@ byte DebugZ80(register Z80 *R);
 /** (0x0038, 0x0066, etc.) or INT_NONE for no interrupt.    **/
 /** Return INT_QUIT to exit the emulation loop.             **/
 /************************************ TO BE WRITTEN BY USER **/
-word LoopZ80(register Z80 *R);
+word LoopZ80(Z80 *R);
 
 #endif /* Z80_H */

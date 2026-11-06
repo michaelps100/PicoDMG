@@ -1,3 +1,5 @@
+#pragma GCC optimize("Ofast")
+#pragma GCC section text=".time_critical"
 /** Z80: portable Z80 emulator *******************************/
 /**                                                         **/
 /**                           Z80.c                         **/
@@ -15,6 +17,7 @@
 #include "Z80.h"
 #include "Tables.h"
 #include <stdio.h>
+#include "pico.h"
 
 /** INLINE ***************************************************/
 /** Different compilers inline C functions differently.     **/
@@ -472,28 +475,48 @@ void ResetZ80(Z80 *R)
   R->IRequest = INT_NONE;
 }
 
+/** ExecZ80_batch() ******************************************/
+/** This function executes Z80 opcodes until cycles are      **/
+/** consumed or CPU halts. Returns remaining cycles debt.    **/
+/*************************************************************/
+int __not_in_flash_func(ExecZ80_batch)(Z80 *R, int cycles)
+{
+  while (cycles > 0)
+  {
+    if (__builtin_expect((R->IFF & IFF_HALT) != 0, 0)) return 0;
+
+    register byte I;
+    register pair J;
+
+    I = RdZ80(R->PC.W++);
+    int cyc = Cycles[I];
+    if (cyc == 0) cyc = 8;
+    switch(I)
+    {
+#include "Codes.h"
+      case PFX_CB: CodesCB(R);break;
+      case PFX_ED: CodesED(R);break;
+      case PFX_FD: CodesFD(R);break;
+      case PFX_DD: CodesDD(R);break;
+    }
+
+    cycles -= cyc;
+    if (__builtin_expect((R->IFF & IFF_HALT) != 0, 0)) return 0;
+  }
+
+  return cycles;
+}
+
 /** ExecZ80() ************************************************/
 /** This function will execute a single Z80 opcode. It will **/
 /** then return next PC, and current register values in R.  **/
 /*************************************************************/
-word ExecZ80(Z80 *R)
+int __not_in_flash_func(ExecZ80)(Z80 *R)
 {
-  register byte I;
-  register pair J;
-
-  I=RdZ80(R->PC.W++);
-  R->ICount-=Cycles[I];
-  switch(I)
-  {
-#include "Codes.h"
-    case PFX_CB: CodesCB(R);break;
-    case PFX_ED: CodesED(R);break;
-    case PFX_FD: CodesFD(R);break;
-    case PFX_DD: CodesDD(R);break;
-  }
-
-  /* We are done */
-  return(R->PC.W);
+  if (__builtin_expect((R->IFF & IFF_HALT) != 0, 0)) return 4;
+  int left = ExecZ80_batch(R, 1);
+  int executed = 1 - left;
+  return (executed > 0) ? executed : 4;
 }
 
 /** IntZ80() *************************************************/
@@ -560,6 +583,7 @@ void IntZ80(Z80 *R,word Vector)
   }
 }
 
+#if 0
 /** RunZ80() *************************************************/
 /** This function will run Z80 code until an LoopZ80() call **/
 /** returns INT_QUIT. It will return the PC at which        **/
@@ -625,3 +649,5 @@ word RunZ80(Z80 *R)
   /* Execution stopped */
   return(R->PC.W);
 }
+#endif
+
