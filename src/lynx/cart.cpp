@@ -198,23 +198,43 @@ CCart::CCart(UBYTE *gamedata, ULONG2 gamesize)
       // memset(mCartBank0A, DEFAULT_CART_CONTENTS, mMaskBank0+1);
       // memset(mCartBank1A, DEFAULT_CART_CONTENTS, mMaskBank1+1);
 
-      mCartBank0A = gamedata+(bank0size+bank1size);
-      //memcpy(mCartBank0A, gamedata+(bank0size+bank1size), __min(cartsize, bank0size));
-      cartsize = __max(0, cartsize - bank0size);
+      // The A banks are only in range if the cart actually has room for them.
+      // `cartsize` is what is left after bank0 and bank1, and it was never
+      // consulted here: the pointers were set unconditionally.
+      //
+      // That was survivable while the cart lived in the Flash XIP window,
+      // where stores are silently dropped. Now that the cart is loaded into
+      // PSRAM (Core2350B) the same code is a genuine out-of-bounds write into
+      // the PSRAM heap, corrupting lwmem's own block metadata. A game that
+      // declares Audin but ships a small cart -- or whose banks are sized so
+      // that bank0+bank1 already consume the whole image -- walks straight off
+      // the end of the allocation.
+      //
+      // Leaving the A banks NULL is what the 6502 read path already treats as
+      // "no Audin": Poke0/Poke1 become no-ops and Peek0A/Peek1A return 0xFF
+      // (see Peek0A at line 369). That is strictly better than corrupting the
+      // allocator, and it is what a real Lynx with absent EEPROM does.
+      if (cartsize > 0) {
+         mCartBank0A = gamedata+(bank0size+bank1size);
+         //memcpy(mCartBank0A, gamedata+(bank0size+bank1size), __min(cartsize, bank0size));
+         cartsize = __max(0, cartsize - bank0size);
 
-      mCartBank1A = gamedata+(bank0size+bank1size+bank0size);
-      //memcpy(mCartBank1A, gamedata+(bank0size+bank1size+bank0size), __min(cartsize, bank1size));
-      cartsize = __max(0, cartsize - bank1size);
+         if (cartsize > 0) {
+            mCartBank1A = gamedata+(bank0size+bank1size+bank0size);
+            //memcpy(mCartBank1A, gamedata+(bank0size+bank1size+bank0size), __min(cartsize, bank1size));
+            cartsize = __max(0, cartsize - bank1size);
+         }
+      }
    }
 }
 
 CCart::~CCart()
 {
    TRACE_CART0("~CCart()");
-   if (mCartBank0) delete[] mCartBank0;
-   if (mCartBank1) delete[] mCartBank1;
-   if (mCartBank0A) delete[] mCartBank0A;
-   if (mCartBank1A) delete[] mCartBank1A;
+   mCartBank0 = NULL;
+   mCartBank1 = NULL;
+   mCartBank0A = NULL;
+   mCartBank1A = NULL;
 }
 
 void CCart::Reset(void)
@@ -280,7 +300,7 @@ bool CCart::ContextLoad(LSS_FILE *fp)
    return 1;
 }
 
-void CCart::CartAddressStrobe(bool strobe)
+void __time_critical_func(CCart::CartAddressStrobe)(bool strobe)
 {
    static int last_strobe=0;
 
@@ -303,7 +323,7 @@ void CCart::CartAddressStrobe(bool strobe)
    TRACE_CART2("CartAddressStrobe(strobe=%d) mShifter=$%06x",strobe,mShifter);
 }
 
-void CCart::CartAddressData(bool data)
+void __time_critical_func(CCart::CartAddressData)(bool data)
 {
    TRACE_CART1("CartAddressData($%02x)",data);
    mAddrData=data;
@@ -325,17 +345,17 @@ inline UBYTE CCart::Peek(ULONG2 addr)
    }
 }
 
-void CCart::Poke0(UBYTE data)
+void __time_critical_func(CCart::Poke0)(UBYTE data)
 {
    CART_INC_COUNTER();
 }
 
-void CCart::Poke0A(UBYTE data)
+void __time_critical_func(CCart::Poke0A)(UBYTE data)
 {
 	CART_INC_COUNTER();
 }
 
-void CCart::Poke1(UBYTE data)
+void __time_critical_func(CCart::Poke1)(UBYTE data)
 {
    if(mWriteEnableBank1) {
       ULONG2 address= (mShifter << mShiftCount1) + (mCounter & mCountMask1);
@@ -344,7 +364,7 @@ void CCart::Poke1(UBYTE data)
    CART_INC_COUNTER();
 }
 
-void CCart::Poke1A(UBYTE data)
+void __time_critical_func(CCart::Poke1A)(UBYTE data)
 {
 	if(mWriteEnableBank1 && mCartBank1A) {
        ULONG2 address= (mShifter << mShiftCount1) + (mCounter & mCountMask1);
@@ -353,7 +373,7 @@ void CCart::Poke1A(UBYTE data)
 	CART_INC_COUNTER();
 }
 
-UBYTE CCart::Peek0(void)
+UBYTE __time_critical_func(CCart::Peek0)(void)
 {
    ULONG2 address= (mShifter << mShiftCount0) + (mCounter & mCountMask0);
    UBYTE data=mCartBank0[address&mMaskBank0];
@@ -363,7 +383,7 @@ UBYTE CCart::Peek0(void)
    return data;
 }
 
-UBYTE CCart::Peek0A(void)
+UBYTE __time_critical_func(CCart::Peek0A)(void)
 {
 	ULONG2 address= (mShifter << mShiftCount0) + (mCounter & mCountMask0);
 	UBYTE data=mCartBank0A?mCartBank0A[address&mMaskBank0]:0xFF;
@@ -373,7 +393,7 @@ UBYTE CCart::Peek0A(void)
 	return data;
 }
 
-UBYTE CCart::Peek1(void)
+UBYTE __time_critical_func(CCart::Peek1)(void)
 {
    ULONG2 address= (mShifter << mShiftCount1) + (mCounter & mCountMask1);
    UBYTE data=mCartBank1[address&mMaskBank1];
@@ -383,7 +403,7 @@ UBYTE CCart::Peek1(void)
    return data;
 }
 
-UBYTE CCart::Peek1A(void)
+UBYTE __time_critical_func(CCart::Peek1A)(void)
 {
 	ULONG2 address= (mShifter << mShiftCount1) + (mCounter & mCountMask1);
 	UBYTE data=mCartBank1A?mCartBank1A[address&mMaskBank1]:0xFF;

@@ -1,7 +1,6 @@
-#include "sdcard.h"
-
 #include "pico.h"
 #include "pico/stdlib.h"
+#include "sdcard.h"
 #include "hardware/clocks.h"
 #ifndef SDCARD_PIO
 #include "hardware/spi.h"
@@ -51,7 +50,7 @@
 #define CT_BLOCK       0x08            /* Block addressing */
 
 #define CLK_SLOW	(100 * KHZ)
-#define CLK_FAST	(30 * MHZ)
+#define CLK_FAST	(20 * MHZ)
 
 static volatile
 DSTATUS Stat = STA_NOINIT;	/* Physical drive status */

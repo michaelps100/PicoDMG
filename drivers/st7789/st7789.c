@@ -36,6 +36,16 @@
 
 #define CHECK_BIT(var, pos) (((var)>>(pos)) & 1)
 
+static inline uint16_t grid_darken(uint16_t color) {
+    uint16_t r = (color >> 11) & 0x1F;
+    uint16_t g = (color >> 5) & 0x3F;
+    uint16_t b = color & 0x1F;
+    r = (uint16_t)((r * 22u) / 25u);
+    g = (uint16_t)((g * 22u) / 25u);
+    b = (uint16_t)((b * 22u) / 25u);
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 static uint sm = 0;
 static PIO pio = pio0;
 static uint st7789_chan;
@@ -43,6 +53,8 @@ static uint st7789_chan;
 uint16_t __scratch_y(
 
 "tft_palette") palette[256];
+
+static bool st7789_grid_effect = false;
 
 uint8_t *text_buffer = NULL;
 static uint8_t *graphics_buffer = NULL;
@@ -226,11 +238,7 @@ void st7789_dma_pixels(const uint16_t *pixels, const uint num_pixels) {
     dma_channel_hw_addr(st7789_chan)->ctrl_trig = ctrl | DMA_CH0_CTRL_TRIG_INCR_READ_BITS;
 }
 
-void __inline __scratch_y(
-
-"refresh_lcd")
-
-refresh_lcd() {
+void __inline refresh_lcd() {
     switch (graphics_mode) {
         case TEXTMODE_DEFAULT:
             lcd_set_window(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -263,8 +271,12 @@ refresh_lcd() {
             start_pixels();
             for (int y = 0; y < graphics_buffer_height * 2; y++)
                 for (int x = 0; x < graphics_buffer_width; x++) {
-                    st7789_lcd_put_pixel(pio, sm, palette[graphics_buffer[x + (y / 2) * graphics_buffer_width]]);
-                    st7789_lcd_put_pixel(pio, sm, palette[graphics_buffer[x + (y / 2) * graphics_buffer_width]]);
+                    uint16_t pixel = palette[graphics_buffer[x + (y / 2) * graphics_buffer_width]];
+                    if (st7789_grid_effect && ((x & 1) || (y & 1))) {
+                        pixel = grid_darken(pixel);
+                    }
+                    st7789_lcd_put_pixel(pio, sm, pixel);
+                    st7789_lcd_put_pixel(pio, sm, pixel);
                 }
 
 
@@ -278,5 +290,9 @@ refresh_lcd() {
 
 void graphics_set_palette(const uint8_t i, const uint32_t color) {
     palette[i] = (uint16_t) color;
+}
+
+void st7789_set_grid_effect(const bool enable) {
+    st7789_grid_effect = enable;
 }
 

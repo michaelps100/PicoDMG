@@ -204,7 +204,7 @@ class CSystem : public CSystemBase
       //
       // CPU
       //
-      inline void  Poke_CPU(ULONG2 addr, UBYTE data) {
+      inline void  __time_critical_func(Poke_CPU)(ULONG2 addr, UBYTE data) {
          if (addr < 0xFC00) {             // 0000-FBFF Always RAM
             // mRamPointer[addr] = data;
             // return;
@@ -236,7 +236,7 @@ class CSystem : public CSystemBase
 
          mRamPointer[addr] = data;
       };
-      inline UBYTE Peek_CPU(ULONG2 addr) {
+      inline UBYTE __time_critical_func(Peek_CPU)(ULONG2 addr) {
          if (addr < 0xFC00) {             // 0000-FBFF Always RAM
             // return mRamPointer[addr];
          }
@@ -262,8 +262,8 @@ class CSystem : public CSystemBase
 
          return mRamPointer[addr];
       };
-      inline void  PokeW_CPU(ULONG2 addr, UWORD data) { Poke_CPU(addr, data & 0xff); Poke_CPU(addr + 1, data >> 8); };
-      inline UWORD PeekW_CPU(ULONG2 addr) { return ((Peek_CPU(addr)) + (Peek_CPU(addr + 1) << 8)); };
+      inline void  __time_critical_func(PokeW_CPU)(ULONG2 addr, UWORD data) { Poke_CPU(addr, data & 0xff); Poke_CPU(addr + 1, data >> 8); };
+      inline UWORD __time_critical_func(PeekW_CPU)(ULONG2 addr) { return ((Peek_CPU(addr)) + (Peek_CPU(addr + 1) << 8)); };
 
       // Mikey system interfacing
 

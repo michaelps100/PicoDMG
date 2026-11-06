@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pico/time.h>
 #include "system.h"
 #include "mikie.h"
 #include "lynxdef.h"
@@ -1033,7 +1034,7 @@ inline ULONG2 CMikie::DisplayRenderLine(void)
 
 // Peek/Poke memory handlers
 
-void CMikie::Poke(ULONG2 addr, UBYTE data)
+void __time_critical_func(CMikie::Poke)(ULONG2 addr, UBYTE data)
 {
    switch(addr&0xff) {
       case (TIM0BKUP&0xff):
@@ -1770,7 +1771,7 @@ void CMikie::Poke(ULONG2 addr, UBYTE data)
 
 
 
-UBYTE CMikie::Peek(ULONG2 addr)
+UBYTE __time_critical_func(CMikie::Peek)(ULONG2 addr)
 {
    ULONG2 retval=0;
 
@@ -3039,7 +3040,7 @@ inline void __time_critical_func(CMikie::Update)(void)
    gSystemCycleCount+=mikie_work_done;
 }
 
-inline void CMikie::UpdateCalcSound(void)
+inline void __time_critical_func(CMikie::UpdateCalcSound)(void)
 {
    SLONG divide = 0;
    SLONG decval = 0;

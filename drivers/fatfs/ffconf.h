@@ -56,7 +56,10 @@
 /* This option switches f_forward() function. (0:Disable or 1:Enable) */
 
 
-#define FF_USE_STRFUNC	0
+/* Enabled for shared_menu/dmg_panel.c, which parses /boot.txt with f_gets().
+ * f_putc/f_puts/f_printf come along with it but the linker garbage-collects
+ * them, so the only real cost is f_gets. */
+#define FF_USE_STRFUNC	1
 #define FF_PRINT_LLI	0
 #define FF_PRINT_FLOAT	0
 #define FF_STRF_ENCODE	3

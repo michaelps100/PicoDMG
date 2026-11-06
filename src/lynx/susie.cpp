@@ -342,7 +342,7 @@ bool CSusie::ContextLoad(LSS_FILE *fp)
    return 1;
 }
 
-ULONG2 CSusie::PaintSprites(void)
+ULONG2 __time_critical_func(CSusie::PaintSprites)(void)
 {
    int	sprcount=0;
    int data=0;
@@ -1042,7 +1042,7 @@ ULONG2 CSusie::PaintSprites(void)
    return mCycles;
 }
 
-void CSusie::Poke(ULONG2 addr, UBYTE data)
+void __time_critical_func(CSusie::Poke)(ULONG2 addr, UBYTE data)
 {
    switch(addr&0xff) {
       case (TMPADRL&0xff):
@@ -1521,7 +1521,7 @@ void CSusie::Poke(ULONG2 addr, UBYTE data)
    }
 }
 
-UBYTE CSusie::Peek(ULONG2 addr)
+UBYTE __time_critical_func(CSusie::Peek)(ULONG2 addr)
 {
    UBYTE	retval=0;
    switch(addr&0xff) {

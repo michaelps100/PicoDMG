@@ -59,3 +59,4 @@ inline static void graphics_set_flashmode(bool flash_line, bool flash_frame) {
     // dummy
 }
 void refresh_lcd();
+void st7789_set_grid_effect(bool enable);

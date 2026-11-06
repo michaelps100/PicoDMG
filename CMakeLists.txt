@@ -4,9 +4,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.1.1)
-set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.1.1)
+set(sdkVersion 2.3.1)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -22,6 +22,7 @@ include(pico_sdk_import.cmake)
 
 project(lynx C CXX ASM)
 
+option(BUILD_FOR_BOOTLOADER "Link application for pico-bootLoader at 0x10080000" OFF)
 option(I2S "Enable I2S sound" OFF)
 option(I2S_CS4334 "Enable I2S CS4334 sound" OFF)
 option(VGA "Enable VGA" OFF)
@@ -31,13 +32,13 @@ option(HDMI "Enable HDMI display" OFF)
 option(TV "Enable TV composite output" OFF)
 option(SOFTTV "Enable TV soft composite output" OFF)
 if( ${PICO_PLATFORM} MATCHES "rp2350" )
-option(m1p2launcher "Enable m1p2-launcher support" OFF)
+	option(m1p2launcher "Enable m1p2-launcher support" OFF)
 endif()
 
 #set(m1p2launcher ON)
 set(I2S ON)
-#set(TFT ON)
-#set(ILI9341 ON)
+set(TFT ON)
+set(ILI9341 ON)
 #set(HDMI ON)
 #set(TV ON)
 #set(SOFTTV ON)
@@ -48,7 +49,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -funroll-loops -ffast-math -feliminate-unused-debug-types -ffunction-sections -fdata-sections -Ofast")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -funroll-loops -fno-rtti -ffast-math -feliminate-unused-debug-types -ffunction-sections -fdata-sections -Ofast")
 
-set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/${CMAKE_BUILD_TYPE}")
+# Each board gets its own output directory. Both builds used to land in
+# bin/Release/, so whichever configured last overwrote the other's ELF/map --
+# a ninja failure or a stale artifact then silently belonged to the wrong
+# target, exactly the bug that made an HW16 build look like an HW15 one in
+# PicoGBC (see PicoDMG-Temp/AGENTS.md 24.6).
+if(PICO_BOARD STREQUAL "core2350b")
+	set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/core2350b/${CMAKE_BUILD_TYPE}")
+else()
+	set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin/${PICO_BOARD}/${CMAKE_BUILD_TYPE}")
+endif()
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
@@ -56,19 +66,23 @@ pico_sdk_init()
 
 add_subdirectory(drivers/audio)
 
+# QMI PSRAM (Core2350B, 8 MB on GPIO 47). The legacy PIO-SPI driver in
+# drivers/psram targets a different kind of module and is deliberately NOT
+# built -- see boards/core2350b.h.
+set(LWMEM_OPTS_FILE ${CMAKE_CURRENT_LIST_DIR}/drivers/lwmem_opts_ppp.h)
+add_subdirectory(drivers/lwmem)
+add_subdirectory(drivers/pico_psram)
+
 add_subdirectory(drivers/ps2kbd)
 add_subdirectory(drivers/nespad)
 add_subdirectory(drivers/fatfs)
 add_subdirectory(drivers/sdcard)
-add_subdirectory(drivers/psram)
 
 add_subdirectory(drivers/vga-nextgen)
-add_subdirectory(drivers/st7789)
+add_subdirectory(drivers/ili9341)
 add_subdirectory(drivers/hdmi)
 add_subdirectory(drivers/tv)
 add_subdirectory(drivers/tv-software)
-
-add_subdirectory(drivers/graphics)
 
 # INCLUDE FILES THAT SHOULD BE COMPILED:
 file(GLOB_RECURSE SRC "src/*.cpp" "src/*.c")
@@ -79,7 +93,13 @@ foreach (SRC_FILE IN LISTS SRC)
 endforeach ()
 message(STATUS "")
 
-add_executable(${PROJECT_NAME} ${SRC})
+add_executable(${PROJECT_NAME} ${SRC} ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_menu.c
+                            ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_panel.c
+${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_combo.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_power.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_battery.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_resume.c
+    ${CMAKE_CURRENT_LIST_DIR}/../shared_menu/dmg_boot_intro.c)
 
 if( ${PICO_PLATFORM} MATCHES "rp2040" )
 	pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
@@ -101,18 +121,14 @@ else()
 	endif()
 endif()
 
-if ( ${PICO_BOARD} MATCHES "murmulator2")
-pico_set_program_name(lynx "Atari Lynx emulator by xrip for MURMULATOR 2.0 board")
-else()
-pico_set_program_name(lynx "Atari Lynx emulator by xrip for MURMULATOR 1.x board")
-endif()
+pico_set_program_name(lynx "PicoLNX")
 pico_set_program_version(lynx "2.1.3")
 
 #include_directories()
-include_directories(${PROJECT_NAME} PRIVATE src src/oswan)
+include_directories(src src/oswan ../shared_menu)
 
 IF(TFT)
-	target_link_libraries(${PROJECT_NAME} PRIVATE st7789)
+	target_link_libraries(${PROJECT_NAME} PRIVATE ili9341)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE TFT)
 	SET(BUILD_NAME "${BUILD_NAME}-TFT")
 	IF(ILI9341)
@@ -150,17 +166,17 @@ ELSE()
 	SET(BUILD_NAME "${BUILD_NAME}-I2S-TDA1387")
 ENDIF()
 
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BUILD_NAME}")
+	set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "PicoLNX")
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-		graphics
 		audio
 
 		nespad
 		sdcard
 		ps2kbd
 		fatfs
-		psram
+		lwmem
+		pico_psram
 
 		pico_runtime
         pico_stdlib
@@ -171,6 +187,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         hardware_interp
         hardware_timer
         hardware_clocks
+    hardware_xosc
+    hardware_adc
+    hardware_rosc
         hardware_pwm
         hardware_flash
 
@@ -179,9 +198,30 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 target_link_options(${PROJECT_NAME} PRIVATE -Xlinker --print-memory-usage --data-sections --function-sections)
+
+# Fallback display panel when the SD card has no /boot.txt. The real choice is
+# made at runtime by shared_menu/dmg_panel.c (ST7789= / MADCTL= keys). Only a
+# build that is ST7789-only needs to force 1, i.e. the Core2350B console build;
+# 0 keeps the existing ILI9341 default for every other board. A card without
+# /boot.txt is the only case this covers -- with a /boot.txt present but no
+# ST7789= key, dmg_panel falls back to this value, so the console build must
+# set it to 1.
+if(NOT DEFINED DEFAULT_PANEL_ST7789)
+	set(DEFAULT_PANEL_ST7789 0 CACHE STRING
+		"Fallback panel when /boot.txt is absent (0 = ILI9341, 1 = ST7789)")
+endif()
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+	DMG_DEFAULT_PANEL_ST7789=${DEFAULT_PANEL_ST7789})
+message(STATUS "Fallback display panel (no ST7789= in /boot.txt): ${DEFAULT_PANEL_ST7789}")
 #add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 #		COMMAND arm-none-eabi-size --format=berkeley "../bin/Debug/${BUILD_NAME}.elf")
 
 pico_enable_stdio_uart(${PROJECT_NAME} 0)
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
+
+if(BUILD_FOR_BOOTLOADER)
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/BootPartition.cmake")
+    frens_offset_for_bootloader(${PROJECT_NAME})
+endif()
+
 pico_add_extra_outputs(${PROJECT_NAME})

@@ -88,10 +88,7 @@ class CRam : public CLynxBase
 
       ~CRam()
       {
-         if (mHomebrewData) {
-            delete[] mHomebrewData;
-            mHomebrewData=NULL;
-         }
+         mHomebrewData = NULL;
       }
 
       void Reset(void)
