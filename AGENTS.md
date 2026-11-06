@@ -214,7 +214,7 @@ Cada quadro da transição recompunha e reenviava a tela inteira (153 KB, ~25 ms
 ### Comportamento (`showBootIntro`, `main.cpp`)
 - Tela preta → 250 ms → logo surge do preto (fade-in de 350 ms) e desce em velocidade constante até o centro da área visível em 1150 ms → o som toca ao pousar → logo parado 1300 ms (e até o som terminar) → busca de emuladores com o logo ainda na tela → lista.
 - Qualquer botão pula. A espera pela soltura acontece **depois** da checagem do calibrador, para SELECT segurado ao ligar continuar abrindo o calibrador; SELECT+START+UP segue indo para o BOOTSEL.
-- **Só ao iniciar o console** (energizar ou acordar do standby, que reinicia sem marca). Ao voltar de um emulador (`returnRequested`, `scratch[7] = LOADER_RETURN_MAGIC`) a abertura é pulada e a tela fica preta durante a busca.
+- **Só ao iniciar o console** (energizar ou acordar do standby do próprio bootloader, que reinicia sem marca). **Acordar do standby de um emulador** (`scratch[5]` com `0x5E5A6Axx`, §45 do `AGENTS.md` raiz) pula a abertura e o init do display e salta direto para o app, que toca a mesma abertura no Core 1 enquanto recarrega o jogo e o savestate. Ao voltar de um emulador (`returnRequested`, `scratch[7] = LOADER_RETURN_MAGIC`) a abertura é pulada e a tela fica preta durante a busca.
 
 ### Assets (`src/boot_anim_assets.h`, gerado — não editar à mão)
 - Logo 150×39 em RGB565, alfa já misturado sobre preto (tamanho nativo, sem escala).

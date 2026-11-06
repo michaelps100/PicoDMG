@@ -2031,8 +2031,20 @@ int main()
     if (returnRequested) {
         LOG("Return-to-loader requested by app; skipping resume jump.");
     }
-    if (!returnRequested && watchdog_enable_caused_reboot() && app_launch_present()) {
-        LOG("Resume path: watchdog_enable=true and app image valid");
+    // Wake from an emulator's standby-by-save-state (shared_menu/dmg_resume.h):
+    // the emulator left scratch[5] marked before DORMANT and reboots on wake.
+    // Jump straight back without the intro or any display init -- the emulator
+    // plays the same intro itself while it reloads the game and its state, so
+    // playing it here would only add ~2.7 s and a panel re-init in between.
+    const uint32_t resumeMark = watchdog_hw->scratch[5];
+    const bool standbyResume = !returnRequested &&
+                               (resumeMark & 0xFFFFFF00u) == 0x5E5A6A00u;
+    if (standbyResume) {
+        LOG("Standby resume mark 0x%08X", (unsigned)resumeMark);
+    }
+    if (!returnRequested && (watchdog_enable_caused_reboot() || standbyResume) && app_launch_present()) {
+        LOG("Resume path: %s and app image valid",
+            standbyResume ? "standby wake" : "watchdog_enable=true");
         LOG("Jumping to app reset vector at 0x%08X (no return on success)",
             (unsigned)((const uint32_t *)APP_BASE_ADDR)[1]);
         stdio_flush();
@@ -2042,6 +2054,9 @@ int main()
     } else {
         LOG("No resume: showing emulator picker.");
     }
+    // Not used: drop it, so the next emulator launched from the picker does
+    // not mistake this boot for a wake from its own standby.
+    watchdog_hw->scratch[5] = 0;
 
     // --- FULL INIT (display/SD/USB/input via the shared framework) ----------
     LOG("Initializing shared framework (display/SD/USB/audio)...");
