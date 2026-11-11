@@ -68,18 +68,66 @@ testada.
 
 ## 2. Lista de peças
 
-| Peça | Observação |
-| :--- | :--- |
-| Waveshare RP2350 Plus 16 MB **ou** Waveshare Core2350B | ver seção 1 |
-| Display TFT SPI 320x240, **ILI9341** ou **ST7789** | ligado por SPI, sem toque |
-| Módulo microSD (SPI) | cartão FAT32 |
-| Amplificador I2S **MAX98357A** + alto-falante 8 Ω | áudio mono |
-| 8 botões táteis | D-pad, A, B, SELECT, START |
-| Chave deslizante **SPDT** (opcional) | liga/desliga com retomada do jogo |
-| Módulo **TP4056 com proteção** (DW01) + célula Li-ion 1S (opcional) | alimentação por bateria |
-| 2 resistores 100 kΩ 1 % + capacitor 100 nF (opcional) | leitura da bateria (HW16) |
-| 2 resistores 10 kΩ a 100 kΩ, iguais (opcional) | detecção do carregador (HW16) |
-| Motor de vibração + transistor 2N2222 + resistor de base (opcional) | rumble de cartucho (PicoGBC) |
+Peças usadas na montagem de referência (**HW16**, Waveshare Core2350B em carcaça de Game
+Boy DMG). Os custos são em reais, na época da compra, e contam só a fração do pacote usada
+em um console (ex.: 1 transistor de um pacote de 100). Os preços mudam; os links são
+referências, não as únicas lojas possíveis.
+
+> **HW15:** troque a placa pela Waveshare RP2350 Plus 16 MB e, se quiser, o display por um
+> ILI9341 320x240 SPI. Bateria e detecção do carregador só existem na HW16 (seção 1).
+
+### Base
+
+| Foto | Peça | Qtd | Custo (R$) | Link |
+| :---: | :--- | :---: | ---: | :--- |
+| <img src="docs/images/parts/core2350b.jpg" width="80"> | Waveshare **Core2350B** (16 MB flash, 8 MB PSRAM) | 1 | 75,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3trXfVz) |
+| <img src="docs/images/parts/microsd.jpg" width="80"> | Módulo microSD SPI (conector dessoldado do módulo) | 1 | 8,00 | [AliExpress](https://s.click.aliexpress.com/e/_c2RFLYjV) |
+| <img src="docs/images/parts/carcaca.jpg" width="80"> | Carcaça completa de Game Boy DMG (botões e borrachas) | 1 | 57,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3BhMIHD) |
+| <img src="docs/images/parts/pcb_botoes.jpg" width="80"> | PCB de botões para Game Boy | 1 | 20,00 | [AliExpress](https://pt.aliexpress.com/item/1005013330054567.html) |
+| <img src="docs/images/parts/chave_ss12f44.jpg" width="80"> | Chave liga/desliga SPDT **SS-12F44** | 1 | 1,00 | [AliExpress](https://s.click.aliexpress.com/e/_c45qh875) |
+| <img src="docs/images/parts/fios_silicone.jpg" width="80"> | Fios de silicone 28/30 AWG | 1 | 30,00 | [AliExpress](https://s.click.aliexpress.com/e/_c42nnaaF) |
+
+### Display
+
+| Foto | Peça | Qtd | Custo (R$) | Link |
+| :---: | :--- | :---: | ---: | :--- |
+| <img src="docs/images/parts/display_st7789.jpg" width="80"> | Display **ST7789V** 320x240 SPI, tela nua (sem placa), FPC 10 pinos | 1 | 28,00 | [AliExpress](https://pt.aliexpress.com/item/1005006335458121.html) |
+| <img src="docs/images/parts/adaptador_fpc.jpg" width="80"> | Adaptador FFC/FPC 0,5 mm 10 pinos | 1 | 13,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3Txa0Lz) |
+| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** (controle do brilho do backlight) | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3qzqEQ7) |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W (base do BC337 do backlight) | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
+
+### Alimentação
+
+| Foto | Peça | Qtd | Custo (R$) | Link |
+| :---: | :--- | :---: | ---: | :--- |
+| <img src="docs/images/parts/usbc.jpg" width="80"> | Conector USB-C fêmea DIP 4 pinos | 1 | 2,00 | [AliExpress](https://s.click.aliexpress.com/e/_c31HaZll) |
+| <img src="docs/images/parts/tp4056.jpg" width="80"> | Carregador **TP4056** com proteção (DW01) | 1 | 7,00 | [AliExpress](https://s.click.aliexpress.com/e/_c4rRAGrH) |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 100 kΩ 1/4 W (divisor da bateria + detecção do carregador) | 4 | 0,48 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
+| <img src="docs/images/parts/bateria_103450.jpg" width="80"> | Bateria Li-ion **103450** 3,7 V (2 ou 3 fios) | 1 | 40,00 | [AliExpress](https://s.click.aliexpress.com/e/_c4q03Fjt) · [Mercado Livre](https://meli.la/1UC4TuF) · [Mercado Livre](https://meli.la/1vGwxQq) |
+| <img src="docs/images/parts/jst20.jpg" width="80"> | Kit de conectores JST 2,0 mm (reto) | 1 | 21,00 | [AliExpress](https://s.click.aliexpress.com/e/_c453kUDt) |
+
+### Áudio
+
+| Foto | Peça | Qtd | Custo (R$) | Link |
+| :---: | :--- | :---: | ---: | :--- |
+| <img src="docs/images/parts/max98357.jpg" width="80"> | Amplificador I2S **MAX98357A** | 1 | 6,00 | [AliExpress](https://s.click.aliexpress.com/e/_c4nw1VMb) |
+| <img src="docs/images/parts/p2_femea.jpg" width="80"> | Conector P2 fêmea (fone) | 1 | 0,65 | [AliExpress](https://s.click.aliexpress.com/e/_c33t8FJD) |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 100 Ω 1/4 W | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
+| <img src="docs/images/parts/placa_perfurada.jpg" width="80"> | Placa perfurada para protótipo | 1 | 3,60 | [AliExpress](https://s.click.aliexpress.com/e/_c4Mju4hZ) |
+| <img src="docs/images/parts/cap_eletrolitico.jpg" width="80"> | Capacitor eletrolítico 10 µF | 1 | 0,65 | [AliExpress](https://s.click.aliexpress.com/e/_c4nclSPH) |
+| <img src="docs/images/parts/cap_ceramico.jpg" width="80"> | Capacitor cerâmico 100 nF (104) | 2 | 0,20 | [AliExpress](https://s.click.aliexpress.com/e/_c3rLTHfD) |
+| <img src="docs/images/parts/alto_falante.jpg" width="80"> | Alto-falante de Game Boy | 1 | 9,00 | [AliExpress](https://s.click.aliexpress.com/e/_c2zU9N9H) |
+
+### Rumble (opcional, PicoGBC)
+
+| Foto | Peça | Qtd | Custo (R$) | Link |
+| :---: | :--- | :---: | ---: | :--- |
+| <img src="docs/images/parts/motor_1034.jpg" width="80"> | Motor de vibração **1034** | 1 | 1,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2y2IqLd) |
+| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3qzqEQ7) |
+| <img src="docs/images/parts/1n4007.jpg" width="80"> | Diodo **1N4007** | 1 | 0,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2QZA2UJ) |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
+
+**Total aproximado por console: R$ 325,78** (com o rumble).
 
 ---
 
@@ -95,7 +143,7 @@ ativo**: cada botão liga o GPIO ao GND.
 | Display MOSI (SDA) | 19 | ✓ | ✓ | |
 | Display DC (RS) | 20 | ✓ | ✓ | |
 | Display RST | 21 | ✓ | ✓ | |
-| Display backlight (LED/BL) | 22 | ✓ | ✓ | apagado no standby |
+| Display backlight (LED/BL) | 22 | ✓ | ✓ | PWM de brilho; na tela nua, via BC337 (ver abaixo) |
 | **microSD** (SPI1) MISO | 12 | ✓ | ✓ | |
 | microSD CS | 13 | ✓ | ✓ | |
 | microSD SCK | 14 | ✓ | ✓ | |
@@ -122,6 +170,32 @@ ativo**: cada botão liga o GPIO ao GND.
 Os pinos configuráveis (`POWER_PIN=`, `BATT_PIN=`, `CHARGE_PIN=`, `RUMBLE=`) são
 opcionais e ficam desligados até a chave correspondente aparecer no `/boot.txt`
 (seção 8).
+
+### Display ST7789 de 10 pinos (montagem de referência)
+
+O display da lista de peças é uma tela nua: o FPC vai direto ao adaptador, sem placa, e o
+backlight (4 LEDs em paralelo, `LEDA`/`LEDK`) não tem driver. O BC337 liga e desliga o
+catodo dos LEDs, e o firmware ajusta o brilho por PWM no GP22.
+
+| Pino do FPC | Sinal | Liga em |
+| :---: | :--- | :--- |
+| 1 | GND | GND |
+| 2 | VCC | 3,3 V |
+| 3 | SDA | GP19 |
+| 4 | SCK | GP18 |
+| 5 | CS | GP17 |
+| 6 | RESET | GP21 |
+| 7 | LEDA | 3,3 V |
+| 8 | LEDK | coletor do BC337 |
+| 9 | NC | sem ligação |
+| 10 | RS (DC) | GP20 |
+
+```
+3,3 V ---------------- LEDA (pino 7)
+                       LEDK (pino 8) --- coletor
+GP22 --- R 1k -------------------------- base     BC337
+                                         emissor --- GND
+```
 
 > **HW15:** o GP23 da RP2350 Plus controla o modo da fonte da placa (SMPS). Não use o
 > GP23 para rumble nessa placa.
@@ -179,14 +253,14 @@ com o USB desconectado ele pode ser puxado para 0 V e dar falso "carregando".
 ### Rumble (PicoGBC, cartuchos MBC5 com vibração)
 
 ```
-GPIO (RUMBLE=) --- R base (1k) --- base   2N2222
+GPIO (RUMBLE=) --- R base (1k) --- base   BC337 (ou 2N2222)
                                    coletor --- motor (-)
                                    emissor --- GND
                      3,3 V ou VSYS --- motor (+)
 ```
 
-Nunca ligue o motor direto no GPIO. Coloque um diodo em antiparalelo com o motor para
-proteger o transistor. Funciona com *Pokémon Pinball*, *Mario Tennis*, *Perfect Dark* e
+Nunca ligue o motor direto no GPIO. Coloque um diodo (1N4007) em antiparalelo com o motor
+para proteger o transistor. Funciona com *Pokémon Pinball*, *Mario Tennis*, *Perfect Dark* e
 outros cartuchos dos tipos `0x1C`, `0x1D` e `0x1E`.
 
 ---
