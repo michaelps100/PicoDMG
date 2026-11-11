@@ -7,6 +7,10 @@ ele. Os 11 emuladores dividem a mesma interface (`shared_menu/`): seletor de ROM
 de pausa, savestates, combos de botões, volume, chave liga/desliga com retomada do jogo
 e indicador de bateria.
 
+O projeto nasceu inspirado no [dodger-one/PicoDMG](https://github.com/dodger-one/PicoDMG).
+A aparência da interface (`shared_menu/`) tem como referência o
+[peterk268/RP2350-GBC](https://github.com/peterk268/RP2350-GBC).
+
 | Tela cheia (`GB_MODE=0`) | Janela da carcaça DMG (`GB_MODE=1`) |
 | :---: | :---: |
 | ![Tela cheia](docs/images/mockup_standard.png) | ![Janela DMG](docs/images/mockup_gbmode.png) |
@@ -531,6 +535,16 @@ Cada pasta mantém a licença do projeto de onde veio. Resumo em
 
 - **PicoSNES** usa o Snes9x, cuja licença **proíbe uso comercial** sem permissão.
 - **PicoWS**: o upstream não declara licença.
+
+### Inspiração e referências
+
+- **Inspiração do projeto:** [dodger-one/PicoDMG](https://github.com/dodger-one/PicoDMG),
+  o emulador de Game Boy em RP2040/RP2350 com display SPI que deu origem a esta ideia
+  (e ao `PicoGBC`).
+- **Aparência da interface (`shared_menu/`):** [peterk268/RP2350-GBC](https://github.com/peterk268/RP2350-GBC),
+  referência visual do seletor de jogos e do menu de pausa no tema claro.
+
+### Emuladores e bootloader
 
 Baseado no trabalho de:
 
