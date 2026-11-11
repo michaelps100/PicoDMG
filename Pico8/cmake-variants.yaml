@@ -1,0 +1,79 @@
+buildType:
+  default: release
+  choices:
+    release:
+      short: DebugRelease
+      long: Optimize generated code and emit debug info
+      buildType: RelWithDebInfo
+      settings:
+        CMAKE_EXPORT_COMPILE_COMMANDS: true
+
+arch:
+  default: desktop
+  choices:
+    desktop:
+      short: Desktop
+      long: Desktop build
+      settings:
+        Y8_ARCH: "desktop"
+    asu:
+      short: PicoPlus2 w/ asu pinout
+      long: Pimoroni Pico Plus 2 based setup
+      identifier: asupico
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "asupico"
+        PICO_BOARD: "asupico"
+        PICO_PLATFORM: "rp2350"
+        PICO_COMPILER: "pico_arm_cortex_m33_gcc"
+    asuclang14:
+      short: PicoPlus2 w/ asu pinout (clang 14)
+      long: Pimoroni Pico Plus 2 based setup
+      identifier: asupico
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "asupico"
+        PICO_BOARD: "asupico"
+        PICO_PLATFORM: "rp2350"
+        PICO_COMPILER: "pico_arm_cortex_m33_clang"
+        PICO_TOOLCHAIN_PATH: "/stor/data/toolchain/llvm-arm/14/"
+    asuclang18:
+      short: PicoPlus2 w/ asu pinout (clang 18)
+      long: Pimoroni Pico Plus 2 based setup
+      identifier: asupico
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "asupico"
+        PICO_BOARD: "asupico"
+        PICO_PLATFORM: "rp2350"
+        PICO_COMPILER: "pico_arm_cortex_m33_clang"
+        PICO_TOOLCHAIN_PATH: "/stor/data/toolchain/llvm-arm/18.1.3/"
+    asuram:
+      short: PicoPlus2 w/ asu pinout (RAM)
+      long: Pimoroni Pico Plus 2 based setup (RAM)
+      identifier: asupico
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "asupico"
+        PICO_BOARD: "asupico"
+        PICO_PLATFORM: "rp2350"
+        PICO_COMPILER: "pico_arm_cortex_m33_gcc"
+        PICO_NO_FLASH: 1
+    asurv:
+      short: PicoPlus2 w/ asu pinout on hazard3
+      long: Pimoroni Pico Plus 2 based setup (RISC-V)
+      identifier: asupico
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "asupico"
+        PICO_BOARD: "asupico"
+        PICO_PLATFORM: "rp2350-riscv"
+        PICO_COMPILER: "pico_riscv_gcc"
+        PICO_TOOLCHAIN_PATH: "/home/sdelang/rv/embecosm/riscv32-embecosm-centos7-gcc13.2.0/"
+    picosystem:
+      short: PicoSystem
+      long: Build for the RP2040-based PicoSystem handheld from Pimoroni
+      settings:
+        Y8_ARCH: "pico"
+        Y8_PLATFORM: "picosystem"
+        # TODO fix

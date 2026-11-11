@@ -1,0 +1,8 @@
+src/arch/pico/main/cartridges/closed/
+
+build/
+build.*/
+
+.cache/
+
+pico8

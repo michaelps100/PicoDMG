@@ -1,0 +1,42 @@
+# Build Pico8 for Waveshare Core2350B (HW_CONFIG 16, RP2350B + 8 MB PSRAM on GP47),
+# targeting the pico-bootLoader partition at 0x10080000.
+
+$ErrorActionPreference = "Continue"
+
+$env:PATH = "C:\Users\Michael\.pico-sdk\picotool\2.3.1\picotool;C:\Users\Michael\.pico-sdk\tools\2.3.1\pioasm;C:\Users\Michael\.pico-sdk\toolchain\15_2_Rel1\bin;C:\Users\Michael\.pico-sdk\cmake\v3.28.6\bin;C:\Users\Michael\.pico-sdk\ninja\v1.12.1;$env:PATH"
+$env:PICO_SDK_PATH = "C:\Users\Michael\.pico-sdk\sdk\2.3.1"
+
+$BuildDir = "build_hw16"
+
+Write-Host "Configurando CMake para Waveshare Core2350B (HW_CONFIG 16)..." -ForegroundColor Cyan
+cmake -S . -B $BuildDir -G Ninja `
+  -DY8_ARCH=pico `
+  -DY8_PLATFORM=picodmg `
+  -DHW_CONFIG=16 `
+  -DBUILD_FOR_BOOTLOADER=ON `
+  -DPICO_PLATFORM=rp2350-arm-s `
+  -DPICO_BOARD=waveshare_core2350b `
+  -DCMAKE_BUILD_TYPE=Release
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERRO] Falha no CMake configure ($LASTEXITCODE)" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Compilando Pico8 (HW16)..." -ForegroundColor Cyan
+ninja -C $BuildDir Pico8
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERRO] Falha na compilacao. Nenhum UF2 novo foi gerado." -ForegroundColor Red
+    exit 1
+}
+
+$Uf2Output = "$BuildDir/Pico8.uf2"
+if (-not (Test-Path $Uf2Output)) {
+    Write-Host "[ERRO] Arquivo UF2 nao encontrado apos compilacao." -ForegroundColor Red
+    exit 1
+}
+
+Copy-Item $Uf2Output -Destination ".\Pico8_hw16.uf2" -Force
+$Size = (Get-Item $Uf2Output).Length
+Write-Host "`n[SUCESSO] Gerado com sucesso: Pico8_hw16.uf2 ($Size bytes)" -ForegroundColor Green
+Write-Host "Copie para /emu/16/Pico8.uf2 no cartao MicroSD." -ForegroundColor Yellow
+
