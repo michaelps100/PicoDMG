@@ -1,0 +1,135 @@
+#ifndef ILI9341_H
+#define ILI9341_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "hardware/spi.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef ILI9341_SPI
+#define ILI9341_SPI      spi0
+#endif
+
+#ifndef ILI9341_PIN_CS
+#define ILI9341_PIN_CS   17
+#endif
+#ifndef ILI9341_PIN_SCK
+#define ILI9341_PIN_SCK  18
+#endif
+#ifndef ILI9341_PIN_MOSI
+#define ILI9341_PIN_MOSI 19
+#endif
+#ifndef ILI9341_PIN_DC
+#define ILI9341_PIN_DC   20
+#endif
+#ifndef ILI9341_PIN_RST
+#define ILI9341_PIN_RST  21
+#endif
+#ifndef ILI9341_PIN_BL
+#define ILI9341_PIN_BL   22
+#endif
+
+#define ILI9341_WIDTH    320
+#define ILI9341_HEIGHT   240
+
+/* Basic LCD controls */
+void ili9341_init(void);
+void ili9341_set_backlight(bool on);
+void ili9341_set_rotation(uint8_t rotation);
+void ili9341_clear_black(void);
+
+/* Framebuffer access (RGB565, 320x240) */
+uint16_t *ili9341_get_framebuffer(void);
+uint16_t *ili9341_get_draw_buffer(void);
+
+/* Synchronous / Direct flush */
+void ili9341_flush(bool wait);
+void ili9341_flush_rows(int y_start, int y_end);
+void ili9341_flush_buffer(const uint16_t *buffer, bool wait);
+
+/* Multicore (Core 1) background display pipeline */
+typedef void (*ili9341_task_fn)(void);
+void ili9341_set_background_task(ili9341_task_fn task);
+void ili9341_core1_start(void);
+void ili9341_submit_frame(void);
+void ili9341_wait_frame_done(void);
+bool ili9341_is_frame_busy(void);
+
+/* Per-scanline streaming blitter (interlaced full-screen scaling on Core 1) */
+void ili9341_stream_nes_line(int line, const uint16_t *rgb555_256);
+void ili9341_stream_nes_frame_end(void);
+void ili9341_pce_set_geometry(int width, int height);
+void ili9341_stream_pce_line(int line, const uint8_t *indexed_pce, const uint16_t *palette_rgb565);
+void ili9341_stream_pce_frame_end(void);
+void ili9341_md_set_geometry(int width, int height);
+bool ili9341_is_active_md_line(int line, int height);
+void ili9341_stream_md_line(int line, const uint16_t *rgb565_line, int width, int height);
+void ili9341_stream_md_frame_end(void);
+void ili9341_stream_ngp_line(int line, const uint16_t *ngp_line_160);
+bool ili9341_is_active_ngp_line(int line);
+void ili9341_stream_ngp_frame_end(void);
+void ili9341_set_grid_effect(bool enable);
+bool ili9341_get_grid_effect(void);
+void ili9341_set_interleave(bool enable);
+bool ili9341_get_interleave(void);
+void ili9341_set_fast_forward(bool enable);
+bool ili9341_get_fast_forward(void);
+
+/* On-screen profiler. Drawn at 2x so it is readable on the 2.6" reflective
+ * panel. Counters live in the NeoPop core (src/neopop/ngp_prof.h); they are
+ * declared extern here rather than through a shared header so the driver does
+ * not need src/neopop on its include path. */
+#ifndef NGP_PROFILE
+#define NGP_PROFILE 0
+#endif
+#if NGP_PROFILE
+void ili9341_prof_enable(bool on);
+void ili9341_prof_feed(uint32_t fps, uint32_t frame_us, uint32_t emu_us);
+extern volatile unsigned int ngp_prof_blocks;
+extern volatile unsigned int ngp_prof_ins;
+extern volatile unsigned int ngp_prof_trun;
+extern volatile unsigned int ngp_prof_z80on;
+extern volatile unsigned int ngp_prof_z80;
+extern volatile unsigned int ngp_prof_gfx;
+extern volatile unsigned int ngp_prof_lines;
+extern volatile unsigned int ngp_prof_emu_us;
+extern volatile unsigned int ngp_prof_timers;
+extern volatile unsigned int ngp_prof_stall_us;
+extern volatile unsigned int ngp_prof_gfx_us;
+extern volatile unsigned int ngp_prof_z80_us;
+#endif
+void ili9341_blitter_start(void);
+void ili9341_blitter_stop(void);
+void ili9341_set_scanlines(bool enable);
+bool ili9341_get_scanlines(void);
+void ili9341_set_shimmerless(bool enable);
+bool ili9341_get_shimmerless(void);
+void ili9341_set_fps_overlay(bool enable, const char *fps_str);
+bool ili9341_get_fps_overlay(void);
+
+/* Scale modes */
+typedef enum {
+    SCALE_FIT = 0,     /* Proportional 4:3 centered */
+    SCALE_STRETCH = 1, /* Full screen 320x240 stretched */
+    SCALE_INTEGER = 2  /* 1:1 Pixel Native centered */
+} ili9341_scale_mode_t;
+
+void ili9341_set_scale_mode(ili9341_scale_mode_t mode);
+ili9341_scale_mode_t ili9341_get_scale_mode(void);
+
+/* Graphics and UI primitives */
+void ili9341_fill_screen(uint16_t color);
+void ili9341_fill_rect(int x, int y, int w, int h, uint16_t color);
+void ili9341_write_rect_565(int x, int y, int w, int h, const uint16_t *px);
+void ili9341_draw_char(char c, uint16_t x, uint16_t y, uint16_t fg, uint16_t bg);
+void ili9341_text(const char *str, uint16_t x, uint16_t y, uint16_t fg, uint16_t bg);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ILI9341_H */
