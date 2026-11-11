@@ -1,0 +1,56 @@
+# /boot.txt -- configuracao do PicoDMG (raiz do cartao SD).
+#
+# Linhas com # ou ; sao comentarios. Uma chave por linha, CHAVE=valor.
+# O bootloader recusa o arquivo inteiro se encontrar uma chave desconhecida
+# ou repetida (tela BOOT.TXT INVALID), entao apague o que nao usar.
+# O bootloader so reescreve GUI=, THEME= e VOLUME=; o resto fica como esta.
+
+# ---- Menu do bootloader -------------------------------------------------
+# 0 = menu em texto, 1 = menu grafico (SELECT alterna).
+GUI=1
+# Tema de arte 0..9 (UP/DOWN no modo grafico).
+THEME=0
+# Protetor de tela: BLOCKS ou STARFIELD.
+#SCREENSAVER=STARFIELD
+# Pasta dos emuladores e arquivo de indice (opcionais).
+#BASEDIR=/emu
+#INDEX=index.txt
+
+# ---- Tela ---------------------------------------------------------------
+# 0 = 320x240 tela cheia; 1 = janela 266x240 da carcaca Game Boy DMG (x=45..310).
+GB_MODE=0
+# Painel: 0 = ILI9341 (HW15), 1 = ST7789 (HW16 / Core2350B).
+ST7789=0
+# 0 = paisagem, 1 = 180 graus.
+ROTATE=0
+# Inversao de cores do painel (0/1).
+INVERT=0
+# MADCTL explicito (hex) tem precedencia sobre ROTATE. So use se souber o valor.
+#MADCTL=0x60
+# Deslocamento da GRAM no ST7789, se a imagem sair cortada.
+#ST7789_XOFF=0
+#ST7789_YOFF=0
+
+# ---- Audio --------------------------------------------------------------
+# 0 = mudo, 1..5. SELECT+UP/DOWN muda em qualquer emulador.
+VOLUME=3
+
+# ---- Chave liga/desliga -------------------------------------------------
+POWER_SWITCH=0
+POWER_PIN=10
+# RESUME = salva o jogo e volta no mesmo ponto; REBOOT = reinicia no menu.
+POWER_BEHAVIOR=RESUME
+# 1 = GND e ON, aberto e OFF.
+POWER_ACTIVE_LOW=1
+
+# ---- Bateria (HW16) -----------------------------------------------------
+# ADC do divisor 100k/100k no B+ (RP2350B: GP40..GP46). 0 = desligado.
+#BATT_PIN=40
+# Deteccao do carregador (5 V do TP4056 por divisor). 0 = desligado.
+#CHARGE_PIN=41
+
+# ---- Recursos de cartucho (PicoGBC) -------------------------------------
+# GPIO do motor de rumble (via transistor). 0 = desligado. GP0..GP9 recusados.
+#RUMBLE=23
+# Data e hora iniciais do RTC do MBC3 (lido so no primeiro boot).
+#RTC_EPOCH=2026-10-01 19:30:00

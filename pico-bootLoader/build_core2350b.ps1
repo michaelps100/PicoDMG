@@ -17,12 +17,12 @@
 # on $LASTEXITCODE instead.
 $ErrorActionPreference = "Continue"
 
-$env:PATH = "C:\Users\Michael\.pico-sdk\picotool\2.3.1\picotool;C:\Users\Michael\.pico-sdk\tools\2.3.1\pioasm;C:\Users\Michael\.pico-sdk\toolchain\15_2_Rel1\bin;C:\Users\Michael\.pico-sdk\cmake\v3.28.6\bin;C:\Users\Michael\.pico-sdk\ninja\v1.12.1;$env:PATH"
-$env:PICO_SDK_PATH = "C:\Users\Michael\.pico-sdk\sdk\2.3.1"
+$env:PATH = "$env:USERPROFILE\.pico-sdk\picotool\2.3.1\picotool;$env:USERPROFILE\.pico-sdk\tools\2.3.1\pioasm;$env:USERPROFILE\.pico-sdk\toolchain\15_2_Rel1\bin;$env:USERPROFILE\.pico-sdk\cmake\v3.28.6\bin;$env:USERPROFILE\.pico-sdk\ninja\v1.12.1;$env:PATH"
+$env:PICO_SDK_PATH = "$env:USERPROFILE\.pico-sdk\sdk\2.3.1"
 
-$buildDir = "C:\dev\PicoDMG-Temp\pico-bootLoader\build_hw16"
+$buildDir = "$PSScriptRoot\build_hw16"
 
-cmake -S "C:\dev\PicoDMG-Temp\pico-bootLoader" -B $buildDir -G Ninja `
+cmake -S "$PSScriptRoot" -B $buildDir -G Ninja `
     -DUSE_ILI9341=1 `
     -DHW_CONFIG=16 `
     -DDEFAULT_PANEL_ST7789=1

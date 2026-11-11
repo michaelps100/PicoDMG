@@ -6,7 +6,7 @@
 # to cover the target and centre-cropped (aspect is kept, nothing is stretched).
 #
 # Usage:
-#   powershell -File tools\img_to_565.ps1 -InDir C:\dev\PicoDMG-Temp\NewIMG -OutDir I:\emu\assets\themes\0
+#   powershell -File tools\img_to_565.ps1 -InDir docs\images\themes -OutDir I:\emu\assets\themes\0
 param(
     [Parameter(Mandatory)] [string] $InDir,
     [Parameter(Mandatory)] [string] $OutDir,
