@@ -1,0 +1,41 @@
+# Build
+build*/
+_deps/
+CMakeFiles/
+CMakeCache.txt
+.ninja*
+*.o
+*.obj
+*.elf
+*.map
+*.dis
+
+# Binarios vao para os GitHub Releases
+*.uf2
+
+# Nunca versionar ROMs, BIOS ou saves
+roms/
+saves/
+bios/
+*.nes
+*.fds
+*.sfc
+*.smc
+*.gb
+*.gbc
+*.gen
+*.smd
+*.sms
+*.gg
+*.pce
+*.sgx
+*.ws
+*.wsc
+*.ngp
+*.ngc
+*.lnx
+*.a26
+*.chd
+*.cue
+*.sav
+*.ss
