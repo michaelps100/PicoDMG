@@ -42,3 +42,6 @@ bios/
 
 # Relatorio de hashes gerado pelos scripts do PicoPCE
 *.hashes.json
+
+# Pacotes de release (vao para o GitHub Releases)
+dist/

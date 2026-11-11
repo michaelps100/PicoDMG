@@ -14,6 +14,8 @@ cmake -S . -B $BuildDir -G Ninja `
   -DY8_PLATFORM=picodmg `
   -DHW_CONFIG=15 `
   -DBUILD_FOR_BOOTLOADER=ON `
+  -DY8_EXPERIMENTAL_GENGC=ON `
+  -DY8_LUA_REPL=ON `
   -DPICO_PLATFORM=rp2350-arm-s `
   -DPICO_BOARD=waveshare_rp2350_plus_16mb `
   -DCMAKE_BUILD_TYPE=Release
