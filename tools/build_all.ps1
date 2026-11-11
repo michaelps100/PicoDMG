@@ -17,7 +17,13 @@ $targets = @(
     "pico-bootLoader", "Pico8", "PicoA26", "PicoGBC", "PicoLINX", "PicoMD",
     "PicoNES", "PicoNGP", "PicoPCE", "PicoSMS", "PicoSNES", "PicoWS"
 )
-if ($Only) { $targets = $targets | Where-Object { $Only -contains $_ } }
+# Via "powershell -File", "-Only A,B" chega como um unico texto "A,B".
+if ($Only) {
+    $Only = $Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $unknown = $Only | Where-Object { $targets -notcontains $_ }
+    if ($unknown) { Write-Host "Alvo desconhecido: $($unknown -join ', ')" -ForegroundColor Red; exit 1 }
+    $targets = $targets | Where-Object { $Only -contains $_ }
+}
 
 $boards = if ($Board -eq "All") { @("HW15", "HW16") } else { @($Board) }
 $results = [ordered]@{}

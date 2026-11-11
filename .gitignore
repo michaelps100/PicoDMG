@@ -39,3 +39,6 @@ bios/
 *.cue
 *.sav
 *.ss
+
+# Relatorio de hashes gerado pelos scripts do PicoPCE
+*.hashes.json
