@@ -1,0 +1,235 @@
+4DD40: push ds
+4DD41: xor ax, ax
+4DD43: out 0x88, ax
+4DD45: out 0x8a, ax
+4DD47: mov es, ax
+4DD49: mov di, 0x100
+4DD4C: mov cx, 0x100
+4DD4F: cld 
+4DD50: rep stosw word ptr es:[di], ax
+4DD52: dec al
+4DD54: mov byte ptr es:[0x10c], al
+4DD58: mov byte ptr es:[0x164], al
+4DD5C: mov byte ptr es:[0x1bc], al
+4DD60: mov byte ptr es:[0x214], al
+4DD64: mov al, 0x2f
+4DD66: out 0x90, al
+4DD68: mov al, 0xb
+4DD6A: out 0x91, al
+4DD6C: xor ax, ax
+4DD6E: mov es, ax
+4DD70: mov di, 0x280
+4DD73: mov ax, 0x5000
+4DD76: mov ds, ax
+4DD78: mov si, word ptr [0]
+4DD7C: mov cx, 0x20
+4DD7F: cld 
+4DD80: rep movsw word ptr es:[di], word ptr [si]
+4DD82: mov al, 0xa
+4DD84: out 0x8f, al
+4DD86: mov si, 0x260
+4DD89: mov word ptr es:[si + 0xc], 0x100
+4DD8F: mov word ptr es:[si + 0xe], 0x302
+4DD95: pop ds
+4DD96: ret 
+4DD97: push bx
+4DD98: push es
+4DD99: push si
+4DD9A: mov bx, ax
+4DD9C: shl ax, 1
+4DD9E: add bx, ax
+4DDA0: mov ax, 0x5000
+4DDA3: mov es, ax
+4DDA5: mov al, byte ptr es:[bx + 8]
+4DDA9: and al, 0xf
+4DDAB: mov ah, 0x58
+4DDAD: mul ah
+4DDAF: mov si, ax
+4DDB1: mov al, byte ptr es:[bx + 8]
+4DDB5: cmp al, byte ptr [si + 0x10c]
+4DDB9: ja 0x4ddd9
+4DDBB: mov byte ptr [si + 0x10c], al
+4DDBF: mov ax, word ptr es:[bx + 9]
+4DDC3: mov word ptr [si + 0x100], ax
+4DDC7: xor ax, ax
+4DDC9: mov word ptr [si + 0x106], ax
+4DDCD: mov word ptr [si + 0x108], ax
+4DDD1: mov word ptr [si + 0x10a], ax
+4DDD5: mov byte ptr [si + 0x102], al
+4DDD9: pop si
+4DDDA: pop es
+4DDDB: pop bx
+4DDDC: ret 
+4DDDD: push bx
+4DDDE: push es
+4DDDF: push dx
+4DDE0: mov bx, ax
+4DDE2: shl ax, 1
+4DDE4: add bx, ax
+4DDE6: mov ax, 0x5000
+4DDE9: mov es, ax
+4DDEB: mov al, byte ptr es:[bx + 8]
+4DDEF: mov ah, 0x58
+4DDF1: mul ah
+4DDF3: mov bx, 0x100
+4DDF6: add bx, ax
+4DDF8: xor ax, ax
+4DDFA: test byte ptr [bx + 2], 0x20
+4DDFE: je 0x4de03
+4DE00: call 0x4de28
+4DE03: mov word ptr [bx], ax
+4DE05: mov byte ptr [bx + 2], al
+4DE08: mov byte ptr [bx + 0xc], 0xff
+4DE0C: mov dx, 0x88
+4DE0F: mov ah, byte ptr [bx + 3]
+4DE12: mov byte ptr [bx + 3], al
+4DE15: shl ah, 1
+4DE17: jae 0x4de1d
+4DE19: mov byte ptr [bx + 0x10], al
+4DE1C: out dx, al
+4DE1D: je 0x4de24
+4DE1F: inc bx
+4DE20: inc dx
+4DE21: jmp 0x4de15
+4DE24: pop dx
+4DE25: pop es
+4DE26: pop bx
+4DE27: ret 
+4DE28: out 0x94, al
+4DE2A: mov byte ptr [bx + 4], al
+4DE2D: in al, 0x90
+4DE2F: and al, 0xdd
+4DE31: out 0x90, al
+4DE33: and byte ptr [bx + 0x11], al
+4DE36: ret 
+4DE37: xor al, al
+4DE39: mov al, al
+4DE3B: out 0x94, al
+4DE3D: mov byte ptr [0x264], al
+4DE40: in al, 0x90
+4DE42: and al, 0xdd
+4DE44: out 0x90, al
+4DE46: and byte ptr [0x271], al
+4DE4A: in al, 0xb2
+4DE4C: and al, 0x7f
+4DE4E: out 0xb2, al
+4DE50: ret 
+4DE51: push ax
+4DE52: xor ax, ax
+4DE54: out 0x88, ax
+4DE56: out 0x8a, ax
+4DE58: mov ds, ax
+4DE5A: mov word ptr [0x100], ax
+4DE5D: mov byte ptr [0x103], al
+4DE60: mov word ptr [0x158], ax
+4DE63: mov byte ptr [0x15b], al
+4DE66: mov word ptr [0x1b0], ax
+4DE69: mov byte ptr [0x1b3], al
+4DE6C: mov word ptr [0x208], ax
+4DE6F: mov byte ptr [0x20b], al
+4DE72: out 0x8e, al
+4DE74: mov word ptr [0x274], ax
+4DE77: mov byte ptr [0x276], al
+4DE7A: dec al
+4DE7C: mov byte ptr [0x10c], al
+4DE7F: mov byte ptr [0x164], al
+4DE82: mov byte ptr [0x1bc], al
+4DE85: mov byte ptr [0x214], al
+4DE88: call 0x4de37
+4DE8B: pop ax
+4DE8C: ret 
+4DE8D: xor ax, ax
+4DE8F: mov es, ax
+4DE91: mov si, 0x260
+4DE94: test byte ptr es:[si + 2], 0x80
+4DE99: je 0x4debf
+4DE9B: test byte ptr es:[si + 2], 1
+4DEA0: jne 0x4deb4
+4DEA2: in al, 0x90
+4DEA4: mov byte ptr es:[si + 0x17], al
+4DEA8: xor al, al
+4DEAA: out 0x90, al
+4DEAC: mov byte ptr es:[si + 2], 0x82
+4DEB1: jmp 0x4debf
+4DEB4: mov al, byte ptr es:[si + 0x17]
+4DEB8: out 0x90, al
+4DEBA: mov byte ptr es:[si + 2], 0
+4DEBF: push ds
+4DEC0: mov ax, 0x5000
+4DEC3: mov ds, ax
+4DEC5: mov byte ptr es:[si + 3], al
+4DEC9: mov byte ptr es:[si + 0x11], al
+4DECD: mov bx, 0x100
+4DED0: mov ax, word ptr es:[bx]
+4DED3: or ax, ax
+4DED5: jne 0x4df12
+4DED7: cmp byte ptr es:[si + 2], 0
+4DEDC: jne 0x4dee7
+4DEDE: add bx, 0x58
+4DEE1: cmp bx, 0x260
+4DEE5: jne 0x4ded0
+4DEE7: mov al, byte ptr es:[si + 0x11]
+4DEEB: out 0x90, al
+4DEED: pop ds
+4DEEE: ret 
+4DEEF: mov si, 0x260
+4DEF2: mov ah, byte ptr es:[si + 3]
+4DEF6: mov dx, 0x88
+4DEF9: not ah
+4DEFB: and ah, byte ptr es:[bx + 3]
+4DEFF: shl ah, 1
+4DF01: jae 0x4df0b
+4DF03: mov byte ptr es:[bx + 0x10], 0
+4DF08: xor al, al
+4DF0A: out dx, al
+4DF0B: je 0x4ded7
+4DF0D: inc bx
+4DF0E: inc dx
+4DF0F: jmp 0x4deff
+4DF12: mov word ptr es:[si], bx
+4DF15: mov al, byte ptr es:[si + 0x14]
+4DF19: or al, al
+4DF1B: je 0x4df28
+4DF1D: xor ah, ah
+4DF1F: shl al, 1
+4DF21: mov bp, ax
+4DF23: jmp word ptr cs:[bp - 0x1968]
+4DF28: cmp byte ptr es:[bx + 6], 0
+4DF2D: je 0x4df47
+4DF2F: mov al, byte ptr es:[bx + 4]
+4DF33: mul byte ptr es:[bx + 5]
+4DF37: cmp ax, word ptr es:[bx + 6]
+4DF3B: je 0x4df47
+4DF3D: call 0x4e2cf
+4DF40: inc word ptr es:[bx + 6]
+4DF44: jmp 0x4ded7
+4DF47: mov di, word ptr es:[bx]
+4DF4A: mov al, byte ptr [di]
+4DF4C: inc di
+4DF4D: mov dl, al
+4DF4F: xor dh, dh
+4DF51: and ax, 0xf
+4DF54: je 0x4df7d
+4DF56: shl al, 1
+4DF58: mov bp, ax
+4DF5A: jmp word ptr cs:[bp - 0x20a1]
+4DF5F: stosb byte ptr es:[di], al
+4DF60: fistp word ptr [bp + si - 0xa20]
+4DF64: loopne 0x4df7e
+4DF66: loope 0x4df9a
+4DF68: loope 0x4dfb6
+4DF6A: loope 0x4dfd2
+4DF6C: loope 0x4deee
+4DF6E: loope 0x4df47
+4DF70: loope 0x4df0c
+4DF72: loope 0x4df28
+4DF74: loope 0x4df2a
+4DF76: loope 0x4df2c
+4DF78: loope 0x4dff7
+4DF7A: fcompi st(1)
+4DF7C: loope 0x4df4e
+4DF7E: ljmp 0xead0:0xead0
+4DF83: mov bp, dx
+4DF85: jmp word ptr cs:[bp - 0x2076]
+4DF8A: stosb byte ptr es:[di], al
+4DF8B: fbstp tbyte ptr [si - 0x4121]
