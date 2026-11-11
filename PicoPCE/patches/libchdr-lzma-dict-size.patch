@@ -1,0 +1,31 @@
+diff --git a/src/libchdr_codec_lzma.c b/src/libchdr_codec_lzma.c
+index 4cb49be..22185d8 100644
+--- a/src/libchdr_codec_lzma.c
++++ b/src/libchdr_codec_lzma.c
+@@ -161,13 +161,19 @@ static uint32_t lzma_compute_aligned_dictionary_size(uint32_t hunkbytes)
+ 			(uint32_t)1 << (level + 20) :
+ 			(uint32_t)1 << (sizeof(size_t) / 2 + 24);
+ 
+-	if (dictSize > reduceSize)
+-	{
+-		const uint32_t kReduceMin = (uint32_t)1 << 12;
+-		const uint32_t max = MIN(kReduceMin, reduceSize);
+-
+-		dictSize = MAX(max, dictSize);
+-	}
++	/* The decoder here only ever inflates one hunk at a time, so the dictionary
++	 * has to cover that hunk -- and nothing beyond it.
++	 *
++	 * Leaving the level-9 default in place asks LzmaDec_Allocate() for
++	 * 1 << (sizeof(size_t)/2 + 24): 256 MB on a 64-bit host, 64 MB on the 32-bit
++	 * RP2350. A host hides that behind Linux overcommit; the console cannot,
++	 * since its whole PSRAM pool is 8 MB, so mounting any .chd failed.
++	 *
++	 * Clamping to kReduceMin (4 KB) instead is too small: an LZMA
++	 * back-reference inside a hunk can reach anywhere in that hunk, and
++	 * decoding then fails with a decompression error. One hunk is the exact
++	 * bound we want. */
++	dictSize = reduceSize;
+ 
+ 	/* LzmaEnc_SetProps */
+ 	dictSize = MIN((uint32_t)15 << 28, dictSize); /* kLzmaMaxHistorySize */
