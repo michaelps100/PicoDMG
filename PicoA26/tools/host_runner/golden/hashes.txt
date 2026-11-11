@@ -1,0 +1,6 @@
+pitfall frames=1500 total_hash=5f4cf0bb samples=1106837 wav=8aa922e5
+enduro frames=1500 total_hash=f0d66804 samples=1106958 wav=1f05a02a
+riverraid frames=1500 total_hash=06cc9afb samples=1106848 wav=8366c3b7
+freeway frames=1500 total_hash=f7dabc1d samples=1106842 wav=95f4c5f1
+spaceinv frames=1500 total_hash=4d77d90a samples=1103325 wav=61ba94f2
+combat frames=1500 total_hash=4c717119 samples=1107494 wav=85e2ebcd
