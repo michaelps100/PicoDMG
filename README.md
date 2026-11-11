@@ -1,85 +1,543 @@
 # PicoDMG
 
-Console portátil com emuladores para o **Raspberry Pi RP2350**. Um bootloader no SD
-lista os emuladores, grava o escolhido na flash e entrega o controle a ele. Todos
-compartilham o mesmo seletor de ROMs, o menu in-game, os combos, o controle de volume,
-a chave liga/desliga com savestate e o indicador de bateria (`shared_menu/`).
+Console portátil de emulação baseado no **Raspberry Pi RP2350**, feito para caber numa
+carcaça de Game Boy clássico (DMG) ou em um console próprio. Um **bootloader** residente
+lê os emuladores do cartão microSD, grava o escolhido na flash e entrega o controle a
+ele. Os 11 emuladores dividem a mesma interface (`shared_menu/`): seletor de ROMs, menu
+de pausa, savestates, combos de botões, volume, chave liga/desliga com retomada do jogo
+e indicador de bateria.
 
-## Placas
+| Tela cheia (`GB_MODE=0`) | Janela da carcaça DMG (`GB_MODE=1`) |
+| :---: | :---: |
+| ![Tela cheia](docs/images/mockup_standard.png) | ![Janela DMG](docs/images/mockup_gbmode.png) |
 
-| Nome no código | Placa | Display | Script de build |
+---
+
+## Sumário
+
+1. [Hardware compatível](#1-hardware-compatível)
+2. [Lista de peças](#2-lista-de-peças)
+3. [Pinagem](#3-pinagem)
+4. [Ligações opcionais](#4-ligações-opcionais-chave-bateria-carregador-rumble)
+5. [Telas](#5-telas)
+6. [Emuladores](#6-emuladores)
+7. [Cartão microSD](#7-cartão-microsd)
+8. [Configuração: `/boot.txt`](#8-configuração-boottxt)
+9. [Como usar](#9-como-usar)
+10. [Compilar e gravar](#10-compilar-e-gravar)
+11. [Como funciona por dentro](#11-como-funciona-por-dentro)
+12. [Estrutura do repositório](#12-estrutura-do-repositório)
+13. [Licenças e créditos](#13-licenças-e-créditos)
+
+---
+
+## 1. Hardware compatível
+
+O firmware é compilado para duas placas. No código elas se chamam `HW_CONFIG 15` e
+`HW_CONFIG 16`. A pinagem principal é a mesma nas duas.
+
+| | **HW15** | **HW16** |
+| :--- | :--- | :--- |
+| Placa | Waveshare **RP2350 Plus 16 MB** | Waveshare **Core2350B** |
+| Microcontrolador | RP2350A (GPIO 0..29) | RP2350B (GPIO 0..47) |
+| Flash | 16 MB | 16 MB |
+| PSRAM | não tem | **8 MB** (CS em GP47, detectada automaticamente) |
+| Display de referência | **ILI9341** 320x240 SPI | **ST7789** 320x240 SPI |
+| LED da placa | GP25 | GP39 |
+| `PICO_BOARD` | `waveshare_rp2350_plus_16mb` | `waveshare_core2350b` |
+| Script de build | `build_for_bootloader.ps1` | `build_core2350b.ps1` |
+| Sufixo do UF2 | `PicoNES.uf2` | `PicoNES_hw16.uf2` |
+
+**O que só a HW16 tem**, por causa da PSRAM e dos GPIOs extras:
+- jogos de **PC Engine CD** (`.cue` / `.chd`);
+- ROMs carregadas na PSRAM em vez de gravadas na flash (NES, SMS/GG, MD, PCE, SNES, NGP
+  e WS), o que deixa a troca de jogo mais rápida;
+- **indicador de bateria e detecção do carregador**: o RP2350B tem ADC em GP40..GP46,
+  enquanto no RP2350A os pinos de ADC (GP26..GP28) estão ocupados pelo áudio;
+- pinos acima de GP29 para a chave liga/desliga (ex.: `POWER_PIN=32`).
+
+O painel é escolhido **em tempo de execução** pelo `/boot.txt` (`ST7789=0/1`). Os dois
+painéis funcionam nas duas placas; a coluna "Display de referência" é só a combinação
+testada.
+
+---
+
+## 2. Lista de peças
+
+| Peça | Observação |
+| :--- | :--- |
+| Waveshare RP2350 Plus 16 MB **ou** Waveshare Core2350B | ver seção 1 |
+| Display TFT SPI 320x240, **ILI9341** ou **ST7789** | ligado por SPI, sem toque |
+| Módulo microSD (SPI) | cartão FAT32 |
+| Amplificador I2S **MAX98357A** + alto-falante 8 Ω | áudio mono |
+| 8 botões táteis | D-pad, A, B, SELECT, START |
+| Chave deslizante **SPDT** (opcional) | liga/desliga com retomada do jogo |
+| Módulo **TP4056 com proteção** (DW01) + célula Li-ion 1S (opcional) | alimentação por bateria |
+| 2 resistores 100 kΩ 1 % + capacitor 100 nF (opcional) | leitura da bateria (HW16) |
+| 2 resistores 10 kΩ a 100 kΩ, iguais (opcional) | detecção do carregador (HW16) |
+| Motor de vibração + transistor 2N2222 + resistor de base (opcional) | rumble de cartucho (PicoGBC) |
+
+---
+
+## 3. Pinagem
+
+Todos os botões são lidos direto no GPIO, com **pull-up interno** e **nível baixo
+ativo**: cada botão liga o GPIO ao GND.
+
+| Função | GPIO | HW15 | HW16 | Observação |
+| :--- | :---: | :---: | :---: | :--- |
+| **Display** (SPI0) CS | 17 | ✓ | ✓ | |
+| Display SCK | 18 | ✓ | ✓ | |
+| Display MOSI (SDA) | 19 | ✓ | ✓ | |
+| Display DC (RS) | 20 | ✓ | ✓ | |
+| Display RST | 21 | ✓ | ✓ | |
+| Display backlight (LED/BL) | 22 | ✓ | ✓ | apagado no standby |
+| **microSD** (SPI1) MISO | 12 | ✓ | ✓ | |
+| microSD CS | 13 | ✓ | ✓ | |
+| microSD SCK | 14 | ✓ | ✓ | |
+| microSD MOSI | 15 | ✓ | ✓ | |
+| **Áudio I2S** DIN | 26 | ✓ | ✓ | MAX98357A, PIO0 |
+| Áudio BCLK | 27 | ✓ | ✓ | |
+| Áudio LRCLK | 28 | ✓ | ✓ | |
+| **UP** | 2 | ✓ | ✓ | |
+| **DOWN** | 3 | ✓ | ✓ | |
+| **LEFT** | 4 | ✓ | ✓ | |
+| **RIGHT** | 5 | ✓ | ✓ | |
+| **A** | 6 | ✓ | ✓ | |
+| **B** | 7 | ✓ | ✓ | |
+| **SELECT** | 8 | ✓ | ✓ | |
+| **START** | 9 | ✓ | ✓ | |
+| UART0 TX / RX (log de depuração) | 0 / 1 | ✓ | ✓ | 115200 baud |
+| PSRAM CS | 47 | — | ✓ | fixo na placa |
+| LED da placa | 25 / 39 | 25 | 39 | |
+| Chave liga/desliga | `POWER_PIN=` | 10 (padrão) | ex.: 32 | configurável |
+| Leitura da bateria (ADC) | `BATT_PIN=` | — | 40 | GP40..GP46 |
+| Detecção do carregador | `CHARGE_PIN=` | — | 41 | entrada digital |
+| Motor de rumble | `RUMBLE=` | livre | ex.: 23 | GP0..GP9 são recusados |
+
+Os pinos configuráveis (`POWER_PIN=`, `BATT_PIN=`, `CHARGE_PIN=`, `RUMBLE=`) são
+opcionais e ficam desligados até a chave correspondente aparecer no `/boot.txt`
+(seção 8).
+
+> **HW15:** o GP23 da RP2350 Plus controla o modo da fonte da placa (SMPS). Não use o
+> GP23 para rumble nessa placa.
+
+---
+
+## 4. Ligações opcionais (chave, bateria, carregador, rumble)
+
+### Chave liga/desliga (SPDT)
+
+A chave **não corta a alimentação**. Ela só informa o firmware, que salva o jogo e põe o
+RP2350 em modo DORMANT (0 a 2 mA medidos, contra ~170 mA jogando).
+
+```
+Terminal 1  ---- GND
+Terminal 2  ---- GPIO da chave (POWER_PIN)   <- terminal central (comum)
+Terminal 3  ---- (sem ligação)
+```
+
+Com `POWER_ACTIVE_LOW=1` (padrão): **ON** = GPIO no GND, **OFF** = GPIO em aberto
+(puxado para 3,3 V pelo pull-up interno). Na HW15 o padrão é o **GP10**, que fica ao
+lado de um pino de GND (pinos físicos 14 e 13).
+
+### Leitura da bateria (HW16)
+
+```
+B+ (= OUT+) --- R1 100k 1% ---+--- GP40 (ADC)
+                              |       |
+                          R2 100k   C 100 nF
+                              |       |
+OUT- (GND da placa) ----------+-------+
+```
+
+- O divisor 1/2 leva 4,2 V para 2,1 V no pino. Consumo permanente de ~21 µA.
+- Abaixo de 2,5 V no divisor o firmware entende que **não há célula** (só USB) e esconde o indicador.
+- `B-` é só da célula: nada do console liga ali (o MOSFET de proteção fica entre `B-` e `OUT-`).
+
+### Detecção do carregador (HW16)
+
+```
+IN+ do TP4056 (5 V do USB)
+ |
+ R3 (10k..100k)
+ |
+ +-------- GP41
+ |
+ R4 (igual ao R3)
+ |
+OUT- (GND da placa)
+```
+
+Com o USB ligado, o GP41 fica em ~2,5 V (nível alto). Não use o pino `CHRG` do TP4056:
+com o USB desconectado ele pode ser puxado para 0 V e dar falso "carregando".
+
+### Rumble (PicoGBC, cartuchos MBC5 com vibração)
+
+```
+GPIO (RUMBLE=) --- R base (1k) --- base   2N2222
+                                   coletor --- motor (-)
+                                   emissor --- GND
+                     3,3 V ou VSYS --- motor (+)
+```
+
+Nunca ligue o motor direto no GPIO. Coloque um diodo em antiparalelo com o motor para
+proteger o transistor. Funciona com *Pokémon Pinball*, *Mario Tennis*, *Perfect Dark* e
+outros cartuchos dos tipos `0x1C`, `0x1D` e `0x1E`.
+
+---
+
+## 5. Telas
+
+### Painéis
+
+| Painel | `ST7789=` | Paisagem (`ROTATE=0`) | 180° (`ROTATE=1`) | Varredura |
+| :--- | :---: | :---: | :---: | :--- |
+| **ILI9341** | `0` | MADCTL `0x28` | `0xE8` | padrão do painel |
+| **ST7789** | `1` | MADCTL `0x60` | `0xA0` | **~111 Hz** (overclock) |
+
+- O ST7789 tem a varredura acelerada de 60 Hz para ~111 Hz. Assim a varredura termina
+  antes de o próximo quadro ser escrito, o que elimina o *tearing* em fades e rolagens.
+- `INVERT=1` inverte as cores, para painéis que vêm com a inversão ao contrário.
+- `MADCTL=0x..` força um valor e tem precedência sobre `ROTATE`. Use só se a imagem sair
+  espelhada no seu painel.
+- `ST7789_XOFF` / `ST7789_YOFF` corrigem painéis que mostram a imagem deslocada.
+- Segurar **SELECT** ao ligar abre o calibrador de painel do bootloader.
+
+### Modo de tela (`GB_MODE`)
+
+| | `GB_MODE=0` (padrão) | `GB_MODE=1` |
+| :--- | :--- | :--- |
+| Área usada | 320x240, tela cheia | janela **266x240** em **x = 45..310** |
+| Bordas | — | pretas: 45 px à esquerda, 9 px à direita |
+| Para quê | display solto ou carcaça própria | display dentro da carcaça do Game Boy DMG |
+
+A janela não fica centralizada porque o display não fica centralizado no recorte da
+carcaça do DMG (deslocamento de 18 px). Menus, bootloader, overlays e o jogo respeitam a
+janela.
+
+### Escala da imagem (menu de pausa → `Image >`)
+
+- **Fit**: maior tamanho que cabe mantendo a proporção.
+- **Stretch**: preenche a tela (ou a janela) toda.
+- **Integer**: escala inteira centralizada (1x, 2x...). Com `GB_MODE=1`, some do menu
+  quando a imagem nativa é mais larga que a janela de 266 px (Mega Drive 320x224, PC
+  Engine 320 ou 512 px).
+- **Filter**: `Shimmerless` (padrão; suaviza a borda dos pixels em escalas não inteiras
+  e evita cintilação na rolagem) ou `Sharp` (vizinho mais próximo). Existe em todos os
+  emuladores, menos PicoSNES e Pico8.
+
+---
+
+## 6. Emuladores
+
+| Emulador | Sistema | UF2 | Extensões | ROMs em | Saves em |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `PicoNES` | NES / Famicom Disk System | `PicoNES` | `.nes` `.fds` `.nsf` | `/roms/nes` | `/saves/nes` |
+| `PicoSMS` | Master System / SG-1000 | `PicoSMS` | `.sms` `.sg` `.bin` | `/roms/sms` | `/saves/sms` |
+| `PicoSMS` | Game Gear | `PicoGG` | `.gg` `.bin` | `/roms/gg` | `/saves/gg` |
+| `PicoGBC` | Game Boy Color | `PicoGBC` | `.gb` `.gbc` `.dmg` | `/roms/gbc` | `/saves/gbc` |
+| `PicoGBC` | Game Boy (DMG) | `PicoDMG` | `.gb` `.gbc` `.dmg` | `/roms/gb` | `/saves/gb` |
+| `PicoMD` | Mega Drive / Genesis | `PicoMD` | `.md` `.bin` `.gen` `.smd` | `/roms/md` | `/saves/md` |
+| `PicoPCE` | PC Engine / SuperGrafx | `PicoPCE` | `.pce` `.sgx` (+ `.cue` `.chd` na HW16) | `/roms/pce` | `/saves/pce` |
+| `PicoSNES` | Super Nintendo | `PicoSNES` | `.smc` `.sfc` `.fig` `.bin` | `/roms/snes` | `/saves/snes` |
+| `PicoNGP` | Neo Geo Pocket / Color | `PicoNGP` | `.ngp` `.ngc` `.ngpc` `.npc` `.bin` | `/roms/ngp` | `/saves/ngp` |
+| `PicoWS` | WonderSwan / Color | `PicoWS` | `.ws` `.wsc` | `/roms/ws` | `/saves/ws` |
+| `PicoLINX` | Atari Lynx | `PicoLNX` | `.lnx` `.lyx` `.o` `.com` `.bin` | `/roms/lynx` | `/saves/lynx` |
+| `PicoA26` | Atari 2600 | `PicoA26` | `.a26` `.bin` `.rom` | `/roms/a26` | `/saves/a26` |
+| `Pico8` | PICO-8 (yocto-8) | `Pico8` | `.p8` `.png` | `/roms/p8` | `/saves/p8` |
+
+Destaques:
+- **PicoGBC / PicoDMG**: mesmo código, dois UF2. O PicoDMG procura primeiro em
+  `/roms/gb` e o PicoGBC em `/roms/gbc`. Jogos de Game Boy clássico ganham a colorização
+  automática do GBC, 12 paletas manuais, DMG Green e GB Light (submenu `Palette >` ou
+  SELECT + LEFT/RIGHT). Tem **RTC do MBC3** (relógio de Pokémon Gold/Silver/Crystal,
+  salvo junto ao `.sav`) e **rumble do MBC5**.
+- **PicoPCE**: jogos de CD só na HW16 e só com o **BIOS** no cartão. Ele é procurado
+  primeiro na pasta do `.cue`/`.chd` e depois em `/bios/`. Sem BIOS o jogo não abre.
+- **PicoSMS / PicoGG**: mesmo código, dois UF2.
+- Todo save de bateria (`.sav`/`.srm`) é gravado no cartão, inclusive ao desligar pela chave.
+
+> O repositório **não contém nem distribui ROMs ou BIOS**. Use cópias dos seus
+> próprios cartuchos.
+
+---
+
+## 7. Cartão microSD
+
+FAT32. Estrutura:
+
+```
+/
+├── boot.txt                      configuração (seção 8)
+├── emu/
+│   ├── 15/                       UF2 da HW15 (PicoNES.uf2, PicoGBC.uf2, ...)
+│   ├── 16/                       UF2 da HW16 (renomeie PicoNES_hw16.uf2 -> PicoNES.uf2)
+│   ├── emulators.txt             opcional: nomes de exibição
+│   └── assets/
+│       ├── themes/0..9/          artes do menu gráfico (<NomeDoUF2>.565, 266x240)
+│       └── screensaver/
+├── roms/
+│   ├── nes/  sms/  gg/  gb/  gbc/  md/  pce/  snes/
+│   └── ngp/  ws/  lynx/  a26/  p8/
+├── saves/                        criado pelos emuladores (.sav, .ss, .cfg)
+│   └── <sistema>/
+└── bios/                         BIOS do PC Engine CD
+```
+
+- O bootloader lista os `.uf2` de `/emu/<HW_CONFIG>` (`/emu/15` ou `/emu/16`). Se a pasta
+  não existir ou estiver vazia, usa `/emu`.
+- O `emulators.txt` é opcional: sem ele, o nome vem do próprio UF2.
+- Artes do menu gráfico: formato `.565` (RGB565 com cabeçalho de largura e altura),
+  geradas por `pico-bootLoader/tools/img_to_565.ps1`. As imagens de origem ficam em
+  `docs/images/themes/`.
+
+---
+
+## 8. Configuração: `/boot.txt`
+
+Um arquivo de texto na raiz do cartão, com uma `CHAVE=valor` por linha e `#` ou `;` para
+comentário. Lido pelo bootloader e por todos os emuladores. O exemplo completo e
+comentado está em [`docs/boot.txt.example`](docs/boot.txt.example).
+
+> **Atenção:** o bootloader **recusa o arquivo inteiro** se encontrar uma chave
+> desconhecida ou repetida, e mostra `BOOT.TXT INVALID`. Copie os nomes exatamente.
+
+| Chave | Valores | Padrão | Função |
 | :--- | :--- | :--- | :--- |
-| **HW15** | Waveshare RP2350 Plus 16 MB (carcaça Game Boy DMG) | ILI9341 320x240 | `build_for_bootloader.ps1` |
-| **HW16** | Waveshare Core2350B (PSRAM) | ST7789 320x240 | `build_core2350b.ps1` |
+| `GUI` | `0` / `1` | 1 com temas, 0 sem | menu em texto ou gráfico |
+| `THEME` | `0`..`9` | `0` | tema de arte do menu gráfico |
+| `SCREENSAVER` | `BLOCKS` / `STARFIELD` | `STARFIELD` | protetor de tela do bootloader |
+| `BASEDIR` | caminho | `/emu` | pasta dos UF2 |
+| `INDEX` | nome de arquivo | `emulators.txt` | índice opcional de nomes |
+| `GB_MODE` | `0` / `1` | `0` | tela cheia ou janela DMG |
+| `ST7789` | `0` / `1` | `0` (HW15), `1` (HW16) | painel ILI9341 ou ST7789 |
+| `ROTATE` | `0` / `1` | `0` | paisagem ou 180° |
+| `INVERT` | `0` / `1` | `0` | inversão de cores do painel |
+| `MADCTL` | hex (`0x60`) | — | força o MADCTL do painel |
+| `ST7789_XOFF` / `ST7789_YOFF` | número | `0` | deslocamento da GRAM |
+| `VOLUME` | `0`..`5` | `3` | volume global (0 = mudo) |
+| `POWER_SWITCH` | `0` / `1` | `0` | liga a chave liga/desliga |
+| `POWER_PIN` | GPIO | `10` | pino da chave |
+| `POWER_BEHAVIOR` | `RESUME` / `REBOOT` | `RESUME` | o que fazer ao religar |
+| `POWER_ACTIVE_LOW` | `0` / `1` | `1` | 1 = GND é ON |
+| `BATT_PIN` | GPIO 40..46 | `0` (desligado) | ADC da bateria (HW16) |
+| `CHARGE_PIN` | GPIO | `0` (desligado) | detecção do carregador (HW16) |
+| `RUMBLE` | GPIO | `0` (desligado) | motor do rumble (PicoGBC) |
+| `RTC_EPOCH` | `AAAA-MM-DD hh:mm:ss` | — | hora inicial do RTC (lida só uma vez) |
 
-Áudio I2S por MAX98357A. Controles em GP2..GP9.
+O bootloader só regrava `GUI`, `THEME` e `VOLUME`. O resto do arquivo, inclusive os
+comentários, fica como você escreveu.
 
-## Emuladores
+---
 
-| Pasta | Sistema | Extensões | Upstream |
-| :--- | :--- | :--- | :--- |
-| `PicoA26` | Atari 2600 | `.a26` `.bin` | [xrip/pico-atari2600](https://github.com/xrip/pico-atari2600) |
-| `PicoGBC` | Game Boy / Color (gera PicoGBC e PicoDMG) | `.gb` `.gbc` | [dodger-one/PicoDMG](https://github.com/dodger-one/PicoDMG) |
-| `PicoLINX` | Atari Lynx | `.lnx` `.lyx` `.o` | [xrip/pico-lynx](https://github.com/xrip/pico-lynx) |
-| `PicoMD` | Mega Drive / Genesis | `.md` `.bin` `.gen` `.smd` | [PicoPlus-devel/pico-genesisPlus](https://github.com/PicoPlus-devel/pico-genesisPlus) |
-| `PicoNES` | NES / Famicom Disk System | `.nes` `.fds` `.nsf` | [PicoPlus-devel/pico-infonesPlus](https://github.com/PicoPlus-devel/pico-infonesPlus) |
-| `PicoNGP` | Neo Geo Pocket / Color | `.ngp` `.ngc` | [xrip/pico-neogeo-pocket](https://github.com/xrip/pico-neogeo-pocket) |
-| `PicoPCE` | PC Engine / SuperGrafx (CD via CHD no HW16) | `.pce` `.sgx` `.cue` `.chd` | [PicoPlus-devel/pico-pcePlus](https://github.com/PicoPlus-devel/pico-pcePlus) |
-| `PicoSMS` | Master System / Game Gear (gera PicoSMS e PicoGG) | `.sms` `.gg` `.sg` | [PicoPlus-devel/pico-smsplus](https://github.com/PicoPlus-devel/pico-smsplus) |
-| `PicoSNES` | Super Nintendo | `.smc` `.sfc` `.fig` | [libretro/snes9x2002](https://github.com/libretro/snes9x2002) |
-| `PicoWS` | WonderSwan / Color | `.ws` `.wsc` | [xrip/pico-wonderswan](https://github.com/xrip/pico-wonderswan) |
-| `Pico8` | PICO-8 (yocto-8) | `.p8` `.png` | [yocto-8/yocto-8](https://github.com/yocto-8/yocto-8) |
-| `pico-bootLoader` | Bootloader / lançador | | [PicoPlus-devel/pico-bootLoader](https://github.com/PicoPlus-devel/pico-bootLoader) |
+## 9. Como usar
 
-Cada pasta foi importada com o histórico do upstream (`git log -- PicoNES`). Cada
-emulador tem a sua própria cópia de `pico_shared/` com o driver de display modificado:
-elas **não** são intercambiáveis.
+### Bootloader
 
-## Compilar
+- **D-pad** navega na lista e **A** grava o emulador na flash e o inicia.
+- **SELECT** alterna entre lista em texto e carrossel gráfico. No modo gráfico,
+  **UP/DOWN** troca o tema.
+- O emulador só é regravado quando muda: se ele já está na flash e o UF2 do cartão é o
+  mesmo (mesmo CRC), A inicia direto.
+- **SELECT + UP/DOWN** muda o volume.
 
-Requisitos: a extensão Raspberry Pi Pico do VS Code (ou o mesmo conjunto instalado em
-`%USERPROFILE%\.pico-sdk`): SDK 2.3.1, toolchain Arm 15.2, CMake 3.28, Ninja 1.12,
-picotool 2.3.1.
+### Seletor de jogos (dentro do emulador)
 
-Um emulador, uma placa:
+- **UP/DOWN** move o cursor, **LEFT/RIGHT** troca de página e **A** abre o jogo.
+- **SELECT + START** volta ao bootloader.
+- Ao sair de um jogo, o cursor volta para o jogo que estava aberto.
+
+### Combos durante o jogo
+
+| Combo | Ação | Disparo |
+| :--- | :--- | :--- |
+| **SELECT + START** | sai do jogo (grava o save) e volta ao seletor | segurar **~1 s** |
+| **START + B** | abre o menu de pausa | ao apertar |
+| **START + A** | liga/desliga o contador de FPS | ao apertar |
+| **SELECT + A** | velocidade 1x / 2x | ao apertar |
+| **SELECT + UP / DOWN** | volume (0..5) | ao apertar |
+
+Quando dois combos coincidem, vale a ordem da tabela, de cima para baixo. Os botões
+usados num combo **não chegam ao jogo**: segurar SELECT + START não pausa o Master System
+nem faz o Sonic pular.
+
+Combos específicos de alguns emuladores:
+- **PicoGBC / PicoDMG**: SELECT + LEFT / RIGHT troca a paleta dos jogos de Game Boy clássico.
+- **PicoWS**: soltar SELECT sozinho gira a tela (modo Tate, vertical).
+
+### Menu de pausa (START + B)
+
+| Linha | Ação |
+| :--- | :--- |
+| **Save State** `1 2 3 4` | escolhe o slot com LEFT/RIGHT e salva com A. Se o slot já tem save, pede confirmação. |
+| **Load State** `1 2 3 4` | só os slots com save ficam acesos e selecionáveis. A carrega, depois de confirmar. |
+| **Speed** | 1x / 2x |
+| **Image >** (`Palette >` no GBC, `Display >` no PCE) | escala, filtro, efeito e opções do sistema |
+| **Volume** | Mute, 1..5 |
+| **Brightness** | 1..5 |
+| **Reset** | reinicia o jogo, mantendo o save de bateria |
+| **Exit** | grava o save e volta ao seletor |
+
+**B** fecha o menu. As opções são gravadas em `/saves/<sistema>/<emulador>.cfg` ao abrir
+e ao fechar o menu, e voltam na próxima vez que você abrir um jogo.
+
+Ao mudar o volume aparece um indicador na tela por 1 segundo.
+
+### Chave liga/desliga (`POWER_SWITCH=1`)
+
+| Onde você está | OFF | ON (`RESUME`) |
+| :--- | :--- | :--- |
+| No jogo ou no menu de pausa | salva um savestate de retomada e o save de bateria, depois dorme | logo de abertura e o jogo **volta no mesmo ponto** |
+| No seletor de jogos | dorme | volta ao seletor |
+| No bootloader | dorme | volta ao bootloader |
+
+- Com `POWER_BEHAVIOR=REBOOT`, ligar de novo reinicia no bootloader.
+- O savestate de retomada é um arquivo separado (`<jogo>_R.ss`) e não ocupa os slots 1..4.
+- Se a chave for desligada enquanto o bootloader grava a flash, a gravação termina
+  antes de o console dormir.
+
+### Bateria (HW16, `BATT_PIN` / `CHARGE_PIN`)
+
+- O seletor e o menu de pausa mostram a porcentagem no canto superior direito.
+  Fica **vermelho** em 20 % ou menos e **verde com raio** quando está no carregador.
+- No jogo, com 20 % ou menos e sem carregador, aparece um aviso pequeno no canto da tela.
+- Em **3,3 V** (medido 3 vezes seguidas, sem carregador), o console salva o jogo como a
+  chave faria e dorme. Para voltar, ligue o carregador ou desligue e religue a chave;
+  sem carregador, só volta acima de 3,4 V.
+
+### Modo BOOTSEL (gravar o bootloader sem abrir o console)
+
+Segure **SELECT + START + UP** enquanto liga o console. O PC mostra o drive `RPI-RP2`.
+
+---
+
+## 10. Compilar e gravar
+
+### Requisitos
+
+Windows com a extensão **Raspberry Pi Pico** do VS Code, que instala tudo em
+`%USERPROFILE%\.pico-sdk`. Os scripts usam esses caminhos:
+
+| Ferramenta | Versão |
+| :--- | :--- |
+| Pico SDK | 2.3.1 |
+| Toolchain Arm GNU | 15.2 Rel1 |
+| CMake | 3.28.6 |
+| Ninja | 1.12.1 |
+| picotool | 2.3.1 |
+
+O PicoPCE da HW16 usa o `libchdr`, que já vem no repositório.
+
+### Compilar
+
+Um emulador:
 
 ```powershell
 cd PicoNES
-.\build_for_bootloader.ps1   # HW15 -> PicoNES.uf2
-.\build_core2350b.ps1        # HW16 -> PicoNES_hw16.uf2
+.\build_for_bootloader.ps1      # HW15 -> PicoNES.uf2
+.\build_core2350b.ps1           # HW16 -> PicoNES_hw16.uf2
 ```
 
-Tudo:
+O bootloader:
 
 ```powershell
-.\tools\build_all.ps1 -Board HW16   # ou HW15, ou All
+cd pico-bootLoader
+.\build_ili9341.ps1             # HW15 -> build_hw15\pico-bootLoader.uf2
+.\build_core2350b.ps1           # HW16 -> build_hw16\pico-bootLoader.uf2
 ```
 
-O bootloader: `pico-bootLoader\build_ili9341.ps1` (HW15) e `build_core2350b.ps1` (HW16).
+Tudo de uma vez:
 
-## Cartão SD
-
-```
-0:/boot.txt          configuração (ver docs/boot.txt.example)
-0:/emu/              os .uf2 dos emuladores (HW16 em /emu/16/)
-0:/roms/<sistema>/   suas ROMs
-0:/saves/<sistema>/  saves, savestates e .cfg (criados pelo console)
-0:/bios/             BIOS do PC Engine CD (necessário para .cue/.chd)
+```powershell
+.\tools\build_all.ps1 -Board HW16                 # ou HW15, ou All
+.\tools\build_all.ps1 -Board All -Only PicoNES,PicoSMS
 ```
 
-Este repositório não contém nem distribui ROMs ou BIOS.
+Se você mudar uma opção de CMake, apague o `CMakeCache.txt` da pasta de build: as
+variáveis de placa são de cache e não sobrescrevem um cache existente.
 
-## Binários
+### Gravar
 
-Os `.uf2` prontos ficam nos [Releases](../../releases), não no git.
+1. **Bootloader** (uma vez): segure o botão BOOT da placa (ou SELECT + START + UP com o
+   console já montado) ao ligar no USB e copie o `pico-bootLoader.uf2` para o drive `RPI-RP2`.
+2. **Emuladores**: copie os UF2 para `/emu/15/` ou `/emu/16/` no cartão. Na HW16, tire
+   o sufixo `_hw16` do nome.
+3. Coloque o `/boot.txt` e as ROMs (seção 7) e ligue.
 
-## Documentação
+Os UF2 dos emuladores são compilados para o endereço `0x10080000`. Não grave um deles
+direto pelo `RPI-RP2`: ele só funciona carregado pelo bootloader.
 
-- `AGENTS.md`: arquitetura, decisões e histórico de correções (em português).
-- `docs/core2350b_plan.md`: plano da placa Core2350B.
-- `docs/boot.txt.example`: todas as chaves do `/boot.txt`.
-- `AGENTS.md` dentro de cada emulador: detalhes específicos dele.
+Binários prontos ficam nos [Releases](../../releases).
 
-## Licença
+---
 
-Cada pasta mantém a licença do seu upstream. Ver [LICENSES.md](LICENSES.md).
+## 11. Como funciona por dentro
+
+```
+Flash (16 MB)
+0x10000000  ┌───────────────────────┐
+            │ pico-bootLoader 512 KB│  residente, nunca é sobrescrito
+0x10080000  ├───────────────────────┤
+            │ emulador ativo        │  gravado pelo bootloader a partir do SD
+            │ (+ cache de ROM)      │  na HW15 a ROM também vai para a flash
+0x11000000  └───────────────────────┘
+```
+
+- O bootloader recusa um UF2 com blocos abaixo de `0x10080000` (`WRONG_LINK_ADDR`), para
+  não se sobrescrever.
+- **Handshake** pelos registradores `watchdog_hw->scratch`, que sobrevivem ao reset:
+  `scratch[6] = 0xB007ED01` (iniciado pelo bootloader), `scratch[7] = 0xB007BACE` (voltar
+  ao bootloader), `scratch[5] = 0x5E5A6Axx` (acordar do standby e retomar o jogo).
+- **`shared_menu/`** é a biblioteca comum: cada emulador entrega um descritor
+  (`dmg_emulator_desc_t`) com título, pastas, filtro de ROM e callbacks (save/load state,
+  escala, volume...), e ela cuida de toda a interface.
+- Vídeo: o Core 0 emula e o Core 1 envia as linhas ao display por SPI + DMA. Os overlays
+  (FPS, volume, bateria) são escritos nas linhas antes do envio, sem custo de FPS.
+
+A documentação de projeto completa, com decisões e o histórico de cada correção, está
+no [`AGENTS.md`](AGENTS.md) da raiz e no `AGENTS.md` de cada emulador.
+
+---
+
+## 12. Estrutura do repositório
+
+```
+PicoDMG/
+├── README.md              este arquivo
+├── LICENSES.md            licença de cada pasta
+├── AGENTS.md              documentação técnica e histórico
+├── shared_menu/           interface comum a todos os emuladores
+├── pico-bootLoader/       bootloader / lançador
+├── PicoNES/ PicoSMS/ PicoGBC/ PicoMD/ PicoPCE/ PicoSNES/
+├── PicoNGP/ PicoWS/ PicoLINX/ PicoA26/ Pico8/
+├── docs/
+│   ├── boot.txt.example   todas as chaves do /boot.txt
+│   ├── core2350b_plan.md  plano da placa HW16
+│   └── images/            mockups, logos e artes dos temas
+└── tools/
+    └── build_all.ps1      compila tudo
+```
+
+Cada emulador traz a sua própria cópia de `pico_shared/` (drivers de display, SD e áudio).
+As cópias têm alterações diferentes e **não são intercambiáveis**.
+
+---
+
+## 13. Licenças e créditos
+
+Cada pasta mantém a licença do projeto de onde veio. Resumo em
+[`LICENSES.md`](LICENSES.md). Dois pontos importantes:
+
+- **PicoSNES** usa o Snes9x, cuja licença **proíbe uso comercial** sem permissão.
+- **PicoWS**: o upstream não declara licença.
+
+Baseado no trabalho de:
+
+| Pasta | Upstream |
+| :--- | :--- |
+| `pico-bootLoader`, `PicoNES`, `PicoSMS`, `PicoMD`, `PicoPCE` | [PicoPlus-devel](https://github.com/PicoPlus-devel) (Frank Hoedemakers e colaboradores) |
+| `PicoGBC` | [dodger-one/PicoDMG](https://github.com/dodger-one/PicoDMG) (Peanut-GB) |
+| `PicoA26`, `PicoLINX`, `PicoNGP`, `PicoWS` | [xrip](https://github.com/xrip) |
+| `PicoSNES` | [libretro/snes9x2002](https://github.com/libretro/snes9x2002) |
+| `Pico8` | [yocto-8/yocto-8](https://github.com/yocto-8/yocto-8) |
