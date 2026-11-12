@@ -23,15 +23,16 @@ A aparência da interface (`shared_menu/`) tem como referência o
 2. [Lista de peças](#2-lista-de-peças)
 3. [Pinagem](#3-pinagem)
 4. [Ligações opcionais](#4-ligações-opcionais-chave-bateria-carregador-rumble)
-5. [Telas](#5-telas)
-6. [Emuladores](#6-emuladores)
-7. [Cartão microSD](#7-cartão-microsd)
-8. [Configuração: `/boot.txt`](#8-configuração-boottxt)
-9. [Como usar](#9-como-usar)
-10. [Compilar e gravar](#10-compilar-e-gravar)
-11. [Como funciona por dentro](#11-como-funciona-por-dentro)
-12. [Estrutura do repositório](#12-estrutura-do-repositório)
-13. [Licenças e créditos](#13-licenças-e-créditos)
+5. [Diagrama de ligação](#5-diagrama-de-ligação)
+6. [Telas](#6-telas)
+7. [Emuladores](#7-emuladores)
+8. [Cartão microSD](#8-cartão-microsd)
+9. [Configuração: `/boot.txt`](#9-configuração-boottxt)
+10. [Como usar](#10-como-usar)
+11. [Compilar e gravar](#11-compilar-e-gravar)
+12. [Como funciona por dentro](#12-como-funciona-por-dentro)
+13. [Estrutura do repositório](#13-estrutura-do-repositório)
+14. [Licenças e créditos](#14-licenças-e-créditos)
 
 ---
 
@@ -169,7 +170,7 @@ ativo**: cada botão liga o GPIO ao GND.
 
 Os pinos configuráveis (`POWER_PIN=`, `BATT_PIN=`, `CHARGE_PIN=`, `RUMBLE=`) são
 opcionais e ficam desligados até a chave correspondente aparecer no `/boot.txt`
-(seção 8).
+(seção 9).
 
 ### Display ST7789 de 10 pinos (montagem de referência)
 
@@ -265,7 +266,18 @@ outros cartuchos dos tipos `0x1C`, `0x1D` e `0x1E`.
 
 ---
 
-## 5. Telas
+## 5. Diagrama de ligação
+
+Montagem completa da HW16 (Core2350B): display ST7789 10 pinos, microSD, botões, áudio
+MAX98357A com saída P2, bateria com TP4056, chave liga/desliga e rumble.
+
+![Diagrama de ligação do PicoDMG](docs/diagram/PicoDMG_diagrama.png)
+
+Arquivo editável do Fritzing: [`docs/diagram/PicoDMG_diagrama.fzz`](docs/diagram/PicoDMG_diagrama.fzz).
+
+---
+
+## 6. Telas
 
 ### Painéis
 
@@ -307,7 +319,7 @@ janela.
 
 ---
 
-## 6. Emuladores
+## 7. Emuladores
 
 | Emulador | Sistema | UF2 | Extensões | ROMs em | Saves em |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -341,13 +353,13 @@ Destaques:
 
 ---
 
-## 7. Cartão microSD
+## 8. Cartão microSD
 
 FAT32. Estrutura:
 
 ```
 /
-├── boot.txt                      configuração (seção 8)
+├── boot.txt                      configuração (seção 9)
 ├── emu/
 │   ├── 15/                       UF2 da HW15 (PicoNES.uf2, PicoGBC.uf2, ...)
 │   ├── 16/                       UF2 da HW16 (renomeie PicoNES_hw16.uf2 -> PicoNES.uf2)
@@ -372,7 +384,7 @@ FAT32. Estrutura:
 
 ---
 
-## 8. Configuração: `/boot.txt`
+## 9. Configuração: `/boot.txt`
 
 Um arquivo de texto na raiz do cartão, com uma `CHAVE=valor` por linha e `#` ou `;` para
 comentário. Lido pelo bootloader e por todos os emuladores. O exemplo completo e
@@ -409,7 +421,7 @@ comentários, fica como você escreveu.
 
 ---
 
-## 9. Como usar
+## 10. Como usar
 
 ### Bootloader
 
@@ -490,7 +502,7 @@ Segure **SELECT + START + UP** enquanto liga o console. O PC mostra o drive `RPI
 
 ---
 
-## 10. Compilar e gravar
+## 11. Compilar e gravar
 
 ### Requisitos
 
@@ -541,7 +553,7 @@ variáveis de placa são de cache e não sobrescrevem um cache existente.
    console já montado) ao ligar no USB e copie o `pico-bootLoader.uf2` para o drive `RPI-RP2`.
 2. **Emuladores**: copie os UF2 para `/emu/15/` ou `/emu/16/` no cartão. Na HW16, tire
    o sufixo `_hw16` do nome.
-3. Coloque o `/boot.txt` e as ROMs (seção 7) e ligue.
+3. Coloque o `/boot.txt` e as ROMs (seção 8) e ligue.
 
 Os UF2 dos emuladores são compilados para o endereço `0x10080000`. Não grave um deles
 direto pelo `RPI-RP2`: ele só funciona carregado pelo bootloader.
@@ -550,7 +562,7 @@ Binários prontos ficam nos [Releases](../../releases).
 
 ---
 
-## 11. Como funciona por dentro
+## 12. Como funciona por dentro
 
 ```
 Flash (16 MB)
@@ -578,7 +590,7 @@ no [`AGENTS.md`](AGENTS.md) da raiz e no `AGENTS.md` de cada emulador.
 
 ---
 
-## 12. Estrutura do repositório
+## 13. Estrutura do repositório
 
 ```
 PicoDMG/
@@ -591,6 +603,7 @@ PicoDMG/
 ├── PicoNGP/ PicoWS/ PicoLINX/ PicoA26/ Pico8/
 ├── docs/
 │   ├── boot.txt.example   todas as chaves do /boot.txt
+│   ├── diagram/           diagrama de ligação (PNG e Fritzing .fzz)
 │   ├── core2350b_plan.md  plano da placa HW16
 │   └── images/            mockups, logos e artes dos temas
 └── tools/
@@ -602,7 +615,7 @@ As cópias têm alterações diferentes e **não são intercambiáveis**.
 
 ---
 
-## 13. Licenças e créditos
+## 14. Licenças e créditos
 
 Cada pasta mantém a licença do projeto de onde veio. Resumo em
 [`LICENSES.md`](LICENSES.md). Dois pontos importantes:
