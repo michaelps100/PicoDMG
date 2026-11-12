@@ -83,7 +83,7 @@ referências, não as únicas lojas possíveis.
 | <img src="docs/images/parts/core2350b.jpg" width="80"> | Waveshare **Core2350B** (16 MB flash, 8 MB PSRAM) | 1 | 75,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3trXfVz) |
 | <img src="docs/images/parts/microsd.jpg" width="80"> | Módulo microSD SPI (conector dessoldado do módulo) | 1 | 8,00 | [AliExpress](https://s.click.aliexpress.com/e/_c2RFLYjV) |
 | <img src="docs/images/parts/carcaca.jpg" width="80"> | Carcaça completa de Game Boy DMG (botões e borrachas) | 1 | 57,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3BhMIHD) |
-| <img src="docs/images/parts/pcb_botoes.jpg" width="80"> | PCB de botões para Game Boy | 1 | 20,00 | [AliExpress](https://pt.aliexpress.com/item/1005013330054567.html) |
+| <img src="docs/images/parts/pcb_botoes.jpg" width="80"> | PCB de botões para Game Boy | 1 | 20,00 | [AliExpress](https://s.click.aliexpress.com/e/_c3zKr3Gj) · [AliExpress](https://s.click.aliexpress.com/e/_c3Knseyn) · [AliExpress](https://pt.aliexpress.com/item/1005013330054567.html) |
 | <img src="docs/images/parts/chave_ss12f44.jpg" width="80"> | Chave liga/desliga SPDT **SS-12F44** | 1 | 1,00 | [AliExpress](https://s.click.aliexpress.com/e/_c45qh875) |
 | <img src="docs/images/parts/fios_silicone.jpg" width="80"> | Fios de silicone 28/30 AWG | 1 | 30,00 | [AliExpress](https://s.click.aliexpress.com/e/_c42nnaaF) |
 
@@ -122,7 +122,7 @@ referências, não as únicas lojas possíveis.
 
 | Foto | Peça | Qtd | Custo (R$) | Link |
 | :---: | :--- | :---: | ---: | :--- |
-| <img src="docs/images/parts/motor_1034.jpg" width="80"> | Motor de vibração **1034** | 1 | 1,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2y2IqLd) |
+| <img src="docs/images/parts/motor_1034.jpg" width="80"> | Motor de vibração **1034** | 1 | 1,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2y2IqLd) · [AliExpress](https://s.click.aliexpress.com/e/_c3UgI5mx) |
 | <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3qzqEQ7) |
 | <img src="docs/images/parts/1n4007.jpg" width="80"> | Diodo **1N4007** | 1 | 0,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2QZA2UJ) |
 | <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
