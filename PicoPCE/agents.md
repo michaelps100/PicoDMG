@@ -970,3 +970,41 @@ O diagnostico (`pce_diag.cpp`, `PCE_DIAGNOSTICS`) guarda o rastro do quadro em
 ### Status
 Validado em hardware (Core2350B) pelo usuario em 2026-11-05: OFF no jogo, no menu
 de pausa e no seletor; volta no mesmo ponto, com som e FPS normais.
+
+---
+
+## BRAM do CD em `0:/saves/pce/bram.sav` (fim da pasta `/SAVESTATES`) (2026-11-12)
+
+### Sintoma
+Jogar um `.cue`/`.chd` criava `I:\SAVESTATES\PCE\<CRC>\bram.sav` na raiz do cartao,
+fora do padrao `0:/saves/pce/`.
+
+### Causa
+1. O caminho do BRAM (memoria de backup de 2 KB do CD, onde os jogos de CD gravam o
+   progresso) veio do pico-pcePlus: `SAVESTATEDIR "/%s/%08X/bram.sav"` (`menu.h:33`),
+   em tres pontos do `main.cpp` (load ao abrir, save ao sair, `pce_flush_saves()` no standby).
+2. `<CRC>` vinha de `Frens::getCrcOfLoadedRom()`, que so e definido nos carregadores de
+   HuCard. No CD ele era o CRC do **ultimo HuCard jogado desde que o console ligou**,
+   ou `00000000` logo apos ligar/resume. O save do CD aparecia e sumia conforme o jogo
+   anterior. No cartao havia `FDE08D6D/bram.sav` (com dados) e `00000000/bram.sav` (vazio).
+
+### Correcao
+- Um unico `PCE_BRAM_PATH = "0:/saves/pce/bram.sav"`, compartilhado por todos os jogos de
+  CD, como no console real (o BRAM fica na unidade de CD, nao no disco).
+- `pce_bram_save()`: cria `0:/saves/pce` e grava; usado na saida do jogo e no standby.
+- Arquivo ausente -> `cd_bram_load()` formata um BRAM vazio (comportamento inalterado).
+- Nada mais do PicoPCE cria `/SAVESTATES` (o `showSaveStateMenu()` legado so existe no
+  caminho DVI). Confirmado nos dois ELFs: string nova presente, formato antigo ausente.
+- Migracao no cartao: `I:\SAVESTATES\PCE\FDE08D6D\bram.sav` copiado para
+  `I:\saves\pce\bram.sav`. A pasta antiga nao foi apagada.
+
+### Binarios
+| Alvo | Arquivo | Tamanho |
+| :--- | :--- | ---: |
+| **HW15** | `PicoPCE.uf2` | 786.432 B |
+| **HW16** | `PicoPCE_hw16.uf2` | 1.275.904 B |
+
+### Pendente de Validacao em Hardware
+1. Abrir um jogo de CD com save (ex.: Rondo) e confirmar que o progresso aparece.
+2. Salvar no jogo, sair, e conferir que `/SAVESTATES` nao foi recriada.
+3. Jogar um HuCard e depois o CD: o save do CD tem de continuar o mesmo.

@@ -920,19 +920,24 @@ static void pce_audio_restore(void) {
  * exit branch writes it, and a standby never takes that branch. HuCards have
  * no battery save in this emulator. */
 static bool s_cd_running = false;
+
+/* CD backup RAM: ONE file shared by every CD game, like the real console,
+ * where the 2 KB BRAM lives in the CD interface unit and not in the disc.
+ * The upstream path was /SAVESTATES/PCE/<CRC>/bram.sav, but the CD branch
+ * never sets the loaded-ROM CRC: <CRC> was whatever HuCard ran last since
+ * power-on (or 00000000), so the save came and went with the previous game. */
+#define PCE_BRAM_PATH "0:/saves/pce/bram.sav"
+
+static void pce_bram_save(void) {
+    f_mkdir("0:/saves");
+    f_mkdir("0:/saves/pce");
+    if (cd_bram_save(PCE_BRAM_PATH) != 0)
+        printf("BRAM: save to %s failed\n", PCE_BRAM_PATH);
+}
+
 static void pce_flush_saves(void) {
     if (!s_cd_running) return;
-    char bramPath[50];
-    snprintf(bramPath, sizeof(bramPath), SAVESTATEDIR);
-    f_mkdir(bramPath);
-    snprintf(bramPath, sizeof(bramPath), SAVESTATEDIR "/%s", FrensSettings::getEmulatorTypeString());
-    f_mkdir(bramPath);
-    snprintf(bramPath, sizeof(bramPath), SAVESTATEDIR "/%s/%08X",
-             FrensSettings::getEmulatorTypeString(), Frens::getCrcOfLoadedRom());
-    f_mkdir(bramPath);
-    snprintf(bramPath, sizeof(bramPath), SAVESTATEDIR "/%s/%08X/bram.sav",
-             FrensSettings::getEmulatorTypeString(), Frens::getCrcOfLoadedRom());
-    cd_bram_save(bramPath);
+    pce_bram_save();
 }
 
 static const dmg_emulator_desc_t s_pce_desc = {
@@ -2305,12 +2310,7 @@ int main()
             }
 
             if (isCDGame) {
-                char bramPath[50];
-                snprintf(bramPath, sizeof(bramPath),
-                         SAVESTATEDIR "/%s/%08X/bram.sav",
-                         FrensSettings::getEmulatorTypeString(),
-                         Frens::getCrcOfLoadedRom());
-                cd_bram_load(bramPath);
+                cd_bram_load(PCE_BRAM_PATH);   /* missing file -> formatted empty BRAM */
             }
 
             printf("Starting game\n");
@@ -2377,23 +2377,7 @@ int main()
 #else
                 Frens::setVSyncWaitTask(nullptr);
 #endif
-                char bramPath[50];
-                snprintf(bramPath, sizeof(bramPath), SAVESTATEDIR);
-                f_mkdir(bramPath);
-                snprintf(bramPath, sizeof(bramPath),
-                         SAVESTATEDIR "/%s",
-                         FrensSettings::getEmulatorTypeString());
-                f_mkdir(bramPath);
-                snprintf(bramPath, sizeof(bramPath),
-                         SAVESTATEDIR "/%s/%08X",
-                         FrensSettings::getEmulatorTypeString(),
-                         Frens::getCrcOfLoadedRom());
-                f_mkdir(bramPath);
-                snprintf(bramPath, sizeof(bramPath),
-                         SAVESTATEDIR "/%s/%08X/bram.sav",
-                         FrensSettings::getEmulatorTypeString(),
-                         Frens::getCrcOfLoadedRom());
-                cd_bram_save(bramPath);
+                pce_bram_save();
                 cd_close();
                 free(cd_audio_buffer);
                 cd_audio_buffer = nullptr;
