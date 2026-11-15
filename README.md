@@ -105,7 +105,8 @@ referências, não as únicas lojas possíveis.
 | <img src="docs/images/parts/tp4056.jpg" width="80"> | Carregador **TP4056** com proteção (DW01) | 1 | 7,00 | [AliExpress](https://s.click.aliexpress.com/e/_c4rRAGrH) |
 | <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 100 kΩ 1/4 W (divisor da bateria + detecção do carregador) | 4 | 0,48 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
 | <img src="docs/images/parts/bateria_103450.jpg" width="80"> | Bateria Li-ion **103450** 3,7 V (2 ou 3 fios) | 1 | 40,00 | [AliExpress](https://s.click.aliexpress.com/e/_c4q03Fjt) · [Mercado Livre](https://meli.la/1UC4TuF) · [Mercado Livre](https://meli.la/1vGwxQq) |
-| <img src="docs/images/parts/jst20.jpg" width="80"> | Kit de conectores JST 2,0 mm (reto) | 1 | 21,00 | [AliExpress](https://s.click.aliexpress.com/e/_c453kUDt) |
+| <img src="docs/images/parts/jst20.jpg" width="80"> | Conector JST 2,0 mm reto, 1 macho + 1 fêmea (de um kit de 150) | 2 | 0,28 | [AliExpress](https://s.click.aliexpress.com/e/_c453kUDt) |
+| <img src="docs/images/parts/botao_6x6.jpg" width="80"> | Botão tátil 6x6 mm SMD (reset, S2 no diagrama de alimentação) | 1 | 0,70 | [AliExpress](https://s.click.aliexpress.com/e/_c4DRObRT) |
 
 ### Áudio
 
@@ -124,11 +125,12 @@ referências, não as únicas lojas possíveis.
 | Foto | Peça | Qtd | Custo (R$) | Link |
 | :---: | :--- | :---: | ---: | :--- |
 | <img src="docs/images/parts/motor_1034.jpg" width="80"> | Motor de vibração **1034** | 1 | 1,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2y2IqLd) · [AliExpress](https://s.click.aliexpress.com/e/_c3UgI5mx) |
-| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3qzqEQ7) |
+| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,12 | mesmo pacote do Display, não precisa comprar de novo |
 | <img src="docs/images/parts/1n4007.jpg" width="80"> | Diodo **1N4007** | 1 | 0,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2QZA2UJ) |
-| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,12 | [AliExpress](https://s.click.aliexpress.com/e/_c3kkHdyb) |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,12 | mesmo pacote do Display, não precisa comprar de novo |
+| <img src="docs/images/parts/placa_perfurada.jpg" width="80"> | Placa perfurada para protótipo | 1 | 3,60 | mesmo pacote do Áudio, não precisa comprar de novo |
 
-**Total aproximado por console: R$ 325,78** (com o rumble).
+**Total aproximado por console: R$ 309,36** (com o rumble).
 
 ---
 
@@ -280,7 +282,7 @@ OUT- (GND da placa)
 Com o USB ligado, o GP41 fica em ~2,5 V (nível alto). Não use o pino `CHRG` do TP4056:
 com o USB desconectado ele pode ser puxado para 0 V e dar falso "carregando".
 
-Chave, bateria, TP4056, USB-C, divisor da bateria e detecção do carregador juntos:
+Chave, botão de reset, bateria, TP4056, USB-C, divisor da bateria e detecção do carregador juntos:
 
 ![Ligação da alimentação](docs/diagram/Energia_bb.png)
 
