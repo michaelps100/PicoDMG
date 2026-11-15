@@ -125,12 +125,19 @@ referências, não as únicas lojas possíveis.
 | Foto | Peça | Qtd | Custo (R$) | Link |
 | :---: | :--- | :---: | ---: | :--- |
 | <img src="docs/images/parts/motor_1034.jpg" width="80"> | Motor de vibração **1034** | 1 | 1,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2y2IqLd) · [AliExpress](https://s.click.aliexpress.com/e/_c3UgI5mx) |
-| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,12 | mesmo pacote do Display, não precisa comprar de novo |
+| <img src="docs/images/parts/bc337.jpg" width="80"> | Transistor **BC337-25** | 1 | 0,00 | mesmo pacote do Display, não precisa comprar de novo |
 | <img src="docs/images/parts/1n4007.jpg" width="80"> | Diodo **1N4007** | 1 | 0,80 | [AliExpress](https://s.click.aliexpress.com/e/_c2QZA2UJ) |
-| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,12 | mesmo pacote do Display, não precisa comprar de novo |
-| <img src="docs/images/parts/placa_perfurada.jpg" width="80"> | Placa perfurada para protótipo | 1 | 3,60 | mesmo pacote do Áudio, não precisa comprar de novo |
+| <img src="docs/images/parts/resistor.jpg" width="80"> | Resistor 1 kΩ 1/4 W | 1 | 0,00 | mesmo pacote do Display, não precisa comprar de novo |
+| <img src="docs/images/parts/placa_perfurada.jpg" width="80"> | Placa perfurada para protótipo | 1 | 0,00 | mesmo pacote do Áudio, não precisa comprar de novo |
 
-**Total aproximado por console: R$ 309,36** (com o rumble).
+| Total (com o rumble) | R$ |
+| :--- | ---: |
+| **Por console**: só a fração usada de cada pacote | **305,52** |
+| **Compra completa**: todos os pacotes inteiros, para quem não tem nenhum componente | **490,00** |
+
+Na compra completa sobra material: a maioria dos componentes pequenos (resistores,
+transistores, capacitores, conectores) vem em pacotes de 10 a 150 unidades. Os itens marcados
+como "mesmo pacote" entram uma vez só na compra completa.
 
 ---
 
