@@ -172,6 +172,31 @@ Os pinos configuráveis (`POWER_PIN=`, `BATT_PIN=`, `CHARGE_PIN=`, `RUMBLE=`) s�
 opcionais e ficam desligados até a chave correspondente aparecer no `/boot.txt`
 (seção 9).
 
+### Botões
+
+Cada botão liga o seu GPIO (GP2..GP9) ao GND.
+
+![Ligação dos botões](docs/diagram/Controles_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/Controles.fzz`](docs/diagram/Controles.fzz).
+
+### microSD
+
+Módulo microSD no SPI1 (GP12..GP15), alimentado em 3,3 V.
+
+![Ligação do microSD](docs/diagram/MicroSD_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/MicroSD.fzz`](docs/diagram/MicroSD.fzz).
+
+### Áudio (MAX98357A e saída P2)
+
+Amplificador I2S nos GP26/27/28, com capacitores de 100 nF e 10 µF na alimentação e
+saída P2 para fone com resistor de 100 Ω.
+
+![Ligação do áudio](docs/diagram/Audio_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/Audio.fzz`](docs/diagram/Audio.fzz).
+
 ### Display ST7789 de 10 pinos (montagem de referência)
 
 O display da lista de peças é uma tela nua: o FPC vai direto ao adaptador, sem placa, e o
@@ -197,6 +222,10 @@ catodo dos LEDs, e o firmware ajusta o brilho por PWM no GP22.
 GP22 --- R 1k -------------------------- base     BC337
                                          emissor --- GND
 ```
+
+![Ligação do display ST7789](docs/diagram/Display_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/Display.fzz`](docs/diagram/Display.fzz).
 
 > **HW15:** o GP23 da RP2350 Plus controla o modo da fonte da placa (SMPS). Não use o
 > GP23 para rumble nessa placa.
@@ -251,6 +280,12 @@ OUT- (GND da placa)
 Com o USB ligado, o GP41 fica em ~2,5 V (nível alto). Não use o pino `CHRG` do TP4056:
 com o USB desconectado ele pode ser puxado para 0 V e dar falso "carregando".
 
+Chave, bateria, TP4056, USB-C, divisor da bateria e detecção do carregador juntos:
+
+![Ligação da alimentação](docs/diagram/Energia_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/Energia.fzz`](docs/diagram/Energia.fzz).
+
 ### Rumble (PicoGBC, cartuchos MBC5 com vibração)
 
 ```
@@ -264,6 +299,10 @@ Nunca ligue o motor direto no GPIO. Coloque um diodo (1N4007) em antiparalelo co
 para proteger o transistor. Funciona com *Pokémon Pinball*, *Mario Tennis*, *Perfect Dark* e
 outros cartuchos dos tipos `0x1C`, `0x1D` e `0x1E`.
 
+![Ligação do rumble](docs/diagram/Rumble_bb.png)
+
+Arquivo do Fritzing: [`docs/diagram/Rumble.fzz`](docs/diagram/Rumble.fzz).
+
 ---
 
 ## 5. Diagrama de ligação
@@ -274,6 +313,9 @@ MAX98357A com saída P2, bateria com TP4056, chave liga/desliga e rumble.
 ![Diagrama de ligação do PicoDMG](docs/diagram/PicoDMG_diagrama.png)
 
 Arquivo editável do Fritzing: [`docs/diagram/PicoDMG_diagrama.fzz`](docs/diagram/PicoDMG_diagrama.fzz).
+
+Para montar por etapas, cada parte tem o seu diagrama nas seções 3 e 4 (botões, microSD,
+áudio, display, alimentação e rumble).
 
 ---
 
