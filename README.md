@@ -319,7 +319,7 @@ Arquivo do Fritzing: [`docs/diagram/Rumble.fzz`](docs/diagram/Rumble.fzz).
 Montagem completa da HW16 (Core2350B): display ST7789 10 pinos, microSD, botões, áudio
 MAX98357A com saída P2, bateria com TP4056, chave liga/desliga e rumble.
 
-![Diagrama de ligação do PicoDMG](docs/diagram/PicoDMG_diagrama.png)
+![Diagrama de ligação do PicoDMG](docs/diagram/PicoDMG_diagrama_bb.png)
 
 Arquivo editável do Fritzing: [`docs/diagram/PicoDMG_diagrama.fzz`](docs/diagram/PicoDMG_diagrama.fzz).
 
